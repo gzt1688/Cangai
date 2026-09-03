@@ -19,6 +19,15 @@ def _rotate(p: Point, cx: float, cy: float, cosA: float, sinA: float) -> Point:
     return (cx + dx * cosA - dy * sinA, cy + dx * sinA + dy * cosA)
 
 
+def _reflectAcrossLine(p: Point, linePt: Point, t: Point) -> Point:
+    """把点 p 关于过 linePt、方向为 t（单位向量）的直线做轴反射：v' = 2(v·t)t − v。
+    切向分量保持、法向分量翻转（用于文字沿曲线的“镜像”：翻到曲线另一侧）。"""
+    vx, vy = p[0] - linePt[0], p[1] - linePt[1]
+    vt = vx * t[0] + vy * t[1]
+    return (linePt[0] + 2.0 * vt * t[0] - vx,
+            linePt[1] + 2.0 * vt * t[1] - vy)
+
+
 def _transformGlyph(g: GlyphData, scale: float, tx: float, ty: float,
                     rotDeg: float, origin: Optional[Point] = None) -> CharPaths:
     """缩放→平移→绕 origin 旋转（origin 为 None 时绕字墨迹中心）。"""
@@ -211,8 +220,10 @@ def layoutOnCurve(text: str, font: FontData, curvePts: List[Point],
             paths.append(transformed)
 
         if mirror:
-            cosA, sinA = math.cos(math.pi), math.sin(math.pi)
-            paths = [[_rotate(p, pt[0], pt[1], cosA, sinA) for p in path]
+            # 镜像 = 字形关于曲线在该处的切线做轴反射（翻到曲线另一侧，
+            # 切向分量保持、法向分量翻转，位置沿曲线不变）；
+            # 旧实现用 180° 旋转实为绕点反射，结果上下颠倒且反向
+            paths = [[_reflectAcrossLine(p, pt, tan) for p in path]
                      for path in paths]
         if rotation != 0.0:
             rad = math.radians(rotation)

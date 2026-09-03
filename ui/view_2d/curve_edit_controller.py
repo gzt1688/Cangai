@@ -225,6 +225,8 @@ class CurveEditController(QObject):
             if self._convertTarget([Point3D(anchor.x, anchor.y, anchor.z)]):
                 idx = next(iter(self._sel)) if self._sel else -1
                 if idx < 0:
+                    # 转换后无有效控制点：结束会话再退出，避免撤销事务悬挂
+                    self._doc.endEdit()
                     return False
         if mods & Qt.ControlModifier:
             if idx in self._sel:
