@@ -19,6 +19,7 @@ class CommandManager(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._factories: Dict[str, Callable[[], CommandInstance]] = {}
+        self._meta: Dict[str, dict] = {}   # 命令元数据（命令清单/AI 工具表用）
         self._active: Optional[CommandInstance] = None
         self._lastCommandName = ""
         self._doc = None
@@ -34,8 +35,34 @@ class CommandManager(QObject):
         self._doc = doc
         self._view = view
 
-    def register(self, name: str, factory: Callable[[], CommandInstance]) -> None:
+    def register(self, name: str, factory: Callable[[], CommandInstance],
+                 meta: Optional[dict] = None) -> None:
+        """注册命令工厂；meta 为可选元数据（title/description/group 等），
+        供命令清单（AI 工具表）与插件管理使用。"""
         self._factories[name] = factory
+        if meta:
+            self._meta[name] = dict(meta)
+
+    def unregister(self, name: str) -> bool:
+        """注销命令（插件停用用）；活动命令为该命令时先取消。返回是否删除。"""
+        existed = self._factories.pop(name, None) is not None
+        self._meta.pop(name, None)
+        if existed and self._active is not None and self._active.name() == name:
+            self.cancelActive()
+        return existed
+
+    def commandMeta(self, name: str) -> dict:
+        """命令元数据；未注册返回 None。"""
+        return self._meta.get(name)
+
+    def listCommands(self) -> list:
+        """已注册命令清单（name + meta），按名称排序——AI 工具表数据源。"""
+        out = []
+        for name in sorted(self._factories):
+            m = dict(self._meta.get(name, {}))
+            m["name"] = name
+            out.append(m)
+        return out
 
     def notifyResult(self, text: str) -> None:
         """发布操作结果反馈（由视图左下角悬浮提示区显示）。"""

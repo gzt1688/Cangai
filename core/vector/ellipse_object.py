@@ -106,24 +106,34 @@ class EllipseObject(BaseObject):
             self._minorAxis *= f
 
     def toPolycurve(self):
-        """转为闭合采样曲线：8 个椭圆周控制点（含旋转），Catmull-Rom 平滑。"""
+        """转为闭合采样曲线：椭圆参数公式精确采样（首尾重合），控制点仍为 8 等分点。
+
+        不经 catmullRom 逼近——catmullRom 是开放曲线端点处理（首段 p0、末段
+        p3 用重复端点），对首尾重合的闭合椭圆会在接缝处切线方向错误、采样点
+        形成尖角（偏移/浮雕后首尾点凸起）。精确采样保证每点严格落在椭圆周上。
+        """
         from .poly_curve_object import PolyCurveObject
-        from core.spline_utils import catmullRom
-        from core.vector.geometry_types import Point3D
         poly = PolyCurveObject()
         c = math.cos(self._rotation)
         s = math.sin(self._rotation)
-        cps = []
-        n = 8
-        for i in range(n + 1):
-            t = 2.0 * math.pi * i / n
+        # 外观采样：椭圆周 n_sample 等分精确点（闭合，首尾重合）
+        n_sample = 128
+        pts = []
+        for i in range(n_sample + 1):
+            t = 2.0 * math.pi * i / n_sample
             ex = self._majorAxis * math.cos(t)
             ey = self._minorAxis * math.sin(t)
-            cps.append(Point3D(self._cx + ex * c - ey * s,
-                               self._cy + ex * s + ey * c, self._cz))
-        pts = catmullRom(cps, 20)
-        poly.addSegment({"points": [[p.x, p.y, p.z] for p in pts],
-                         "inputPoints": [[p.x, p.y, p.z] for p in cps]})
+            pts.append([self._cx + ex * c - ey * s,
+                        self._cy + ex * s + ey * c, self._cz])
+        # 编辑控制点：8 椭圆周等分点（首尾重合，与 controlPointCount 一致）
+        cps = []
+        for i in range(8 + 1):
+            t = 2.0 * math.pi * i / 8
+            ex = self._majorAxis * math.cos(t)
+            ey = self._minorAxis * math.sin(t)
+            cps.append([self._cx + ex * c - ey * s,
+                        self._cy + ex * s + ey * c, self._cz])
+        poly.addSegment({"points": pts, "inputPoints": cps})
         return poly
 
     def getSupportedSnapTypes(self):

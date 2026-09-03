@@ -4126,7 +4126,12 @@ class OffsetCommand(CommandInstance):
             o._color = obj._color; o._lineWidth = obj._lineWidth
             return o
         if t == "ARC":
-            r = obj.radius() - dist
+            # 圆弧偏移方向需考虑绕向：span 原始符号即绕向（+逆时针/-顺时针，
+            # setThreePoints 保证 span∈(-2π,2π)，不可归一化否则大弧绕向翻转）；
+            # 逆时针左法线指向圆心，顺时针指向外，需翻转 dist 使方向与鼠标侧一致
+            span = obj.endAngle() - obj.startAngle()
+            d = -dist if span < 0 else dist
+            r = obj.radius() - d
             if r < 1e-6:
                 return None
             c = obj.center()
@@ -4251,6 +4256,8 @@ class OffsetCommand(CommandInstance):
     def _isClosed(obj) -> bool:
         t = obj.type().name
         if t == "CIRCLE":
+            return True
+        if t == "ELLIPSE":
             return True
         if t == "LINE":
             if obj.isClosed():

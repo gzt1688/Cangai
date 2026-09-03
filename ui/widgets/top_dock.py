@@ -90,9 +90,11 @@ class TopDock(QWidget):
 
         self._toolStack = QStackedWidget()
         self._toolStack.setFixedHeight(50)
+        # 组名 → 该页的 FlowLayout：内置分类用 CATEGORIES 构建，插件组运行时追加
+        self._groupFlows: dict = {}
         for name, items in CATEGORIES:
             self._navBar.addTab(name)
-            self._toolStack.addWidget(self._buildPage(items))
+            self._toolStack.addWidget(self._buildPage(items, self._groupFlows))
         bl.addWidget(self._toolStack)
 
         self._quickBar = QuickAccessBar()
@@ -104,12 +106,41 @@ class TopDock(QWidget):
 
         self.setFixedHeight(bottom.sizeHint().height())
 
-    def _buildPage(self, items) -> QWidget:
+    def _buildPage(self, items, flows: dict | None = None) -> QWidget:
         page = QWidget()
         flow = FlowLayout(page, margin=1, spacing=3)
         for key, text in items:
             flow.addWidget(self._makeButton(key, text))
+        if flows is not None:
+            flows[self._navBar.tabText(self._navBar.count() - 1)] = flow
         return page
+
+    def addToolButton(self, group: str, key: str, label: str, tooltip: str = "",
+                      icon: str = "", action=None) -> None:
+        """运行时追加按钮（插件 API 入口）：group 分类页不存在则自动新建标签页。
+        action 为 None 时点击发 commandRequested(key)（执行同名命令/动作），
+        否则直接调用 action 回调。"""
+        group = group or "插件"
+        flow = self._groupFlows.get(group)
+        if flow is None:
+            page = QWidget()
+            flow = FlowLayout(page, margin=1, spacing=3)
+            self._groupFlows[group] = flow
+            self._navBar.addTab(group)
+            self._toolStack.addWidget(page)
+        btn = QPushButton(label)
+        btn.setFixedSize(48, 48)
+        btn.setToolTip(tooltip or label)
+        if icon:
+            from PySide6.QtGui import QIcon
+            btn.setIcon(QIcon(icon))
+            btn.setIconSize(QSize(44, 44))
+            btn.setText("")
+        if action is not None:
+            btn.clicked.connect(lambda _=False, cb=action: cb())
+        else:
+            btn.clicked.connect(lambda _=False, k=key: self.commandRequested.emit(k))
+        flow.addWidget(btn)
 
     def refreshStyle(self) -> None:
         """按全局字体大小等比放大导航标签字体与宽度（设置改字体时调用）。"""
