@@ -185,3 +185,51 @@ class ImageObject(BaseObject):
         b64 = data.get("image", "")
         if b64:
             self.setImageData(base64.b64decode(b64))
+
+    # ---------------- 撤销快照（图片字节原样引用，免 base64 编码） ----------------
+
+    def snapshot(self) -> dict:
+        d = super().serialize()
+        d.update({
+            "center": [self._center.x, self._center.y, self._center.z],
+            "width": self._width,
+            "height": self._height,
+            "rotation": self._rotation,
+            "format": self._format,
+            "pixels": [self._pixelW, self._pixelH],
+            # bytes 不可变：快照直接共享引用（零拷贝），撤销栈持有不会失效
+            "image_raw": self._data,
+        })
+        return d
+
+    def restoreSnapshot(self, snap: dict) -> None:
+        super().deserialize(snap)
+        c = snap.get("center", [0.0, 0.0, 0.0])
+        self._center = Point3D(float(c[0]), float(c[1]), float(c[2]))
+        self._width = max(float(snap.get("width", 100.0)), 1e-6)
+        self._height = max(float(snap.get("height", 100.0)), 1e-6)
+        self._rotation = float(snap.get("rotation", 0.0))
+        self._format = snap.get("format", "")
+        raw = snap.get("image_raw")
+        # 快照里的字节是最初 QImage 解码成功的数据，直接采用（免重新解码）
+        px = snap.get("pixels") or [0, 0]
+        self._data = raw if raw else b""
+        self._pixelW, self._pixelH = int(px[0]), int(px[1])
+        self._pixmap = None
+        self._b64 = None
+
+    def matchesSnapshot(self, snap: dict) -> bool:
+        if "image_raw" not in snap:
+            return self.serialize() == snap
+        c = snap.get("center", [0.0, 0.0, 0.0])
+        px = snap.get("pixels") or [0, 0]
+        return (self._data == snap.get("image_raw")
+                and self._center.x == c[0] and self._center.y == c[1]
+                and self._center.z == c[2]
+                and self._width == snap.get("width")
+                and self._height == snap.get("height")
+                and self._rotation == snap.get("rotation")
+                and self._pixelW == px[0] and self._pixelH == px[1])
+
+    def snapshotSize(self, snap: dict) -> int:
+        return len(self._data) + 4096

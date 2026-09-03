@@ -1,4 +1,4 @@
-﻿"""命令调度中心：维护活动命令、上下文与提示信号。"""
+"""命令调度中心：维护活动命令、上下文与提示信号。"""
 from __future__ import annotations
 from typing import Dict, Optional, Callable
 from PySide6.QtCore import QObject, Signal

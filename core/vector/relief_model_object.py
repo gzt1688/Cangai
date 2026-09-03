@@ -319,9 +319,10 @@ class ReliefModelObject(BaseObject):
         o._maskStamp = self._maskStamp
         return o
 
-    # ---------------- 序列化 ----------------
+    # ---------------- 序列化 / 撤销快照 ----------------
 
-    def serialize(self) -> dict:
+    def _commonDict(self) -> dict:
+        """文件与撤销快照共用的元数据字段（基础属性 + 网格/显示参数）。"""
         d = super().serialize()
         hf = self._hf
         d["origin"] = [hf.origin[0], hf.origin[1]]
@@ -332,6 +333,11 @@ class ReliefModelObject(BaseObject):
                         "altitude": self._lightAltitude, "zexag": self._zExaggeration,
                         "gridDivisions": self._gridDivisions,
                         "mode3d": self._display3DMode, "material": self._material}
+        return d
+
+    def serialize(self) -> dict:
+        d = self._commonDict()
+        hf = self._hf
         raw = np.ascontiguousarray(hf.data, dtype=np.float32).tobytes()
         d["grid"] = base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
         # 色号蒙版（区域划分）：稀疏（多为 0）→ zlib 压缩极小；全空/形状不符则省略
@@ -340,6 +346,87 @@ class ReliefModelObject(BaseObject):
             d["colorMask"] = base64.b64encode(zlib.compress(
                 np.ascontiguousarray(cm, dtype=np.uint8).tobytes(), 6)).decode("ascii")
         return d
+
+    def snapshot(self) -> dict:
+        """撤销快照：字段与 serialize 相同，但网格/蒙版存原始字节（免 zlib/base64，
+        各一次 memcpy）。内容比较走 matchesSnapshot 的 stamp 签名（O(1)），
+        本方法只在撤销项真正入栈时调用。"""
+        d = self._commonDict()
+        hf = self._hf
+        # 签名字段放前面：endEdit 的字典全等比较在内容变化时先在这些键上快速失败
+        d["hfStamp"] = hf.stamp
+        d["version"] = self._version
+        d["maskStamp"] = self._maskStamp
+        d["grid_raw"] = np.ascontiguousarray(hf.data, dtype=np.float32).tobytes()
+        cm = self._colorMask
+        if cm is not None and cm.shape == (hf.ny, hf.nx) and bool(cm.any()):
+            d["colorMask_raw"] = np.ascontiguousarray(cm, dtype=np.uint8).tobytes()
+        return d
+
+    def restoreSnapshot(self, snap: dict) -> None:
+        """由 snapshot() 恢复（原始字节路径，免 zlib/base64 解码）。"""
+        origin, sp, nx, ny = self._restoreMetadata(snap)
+        raw = snap.get("grid_raw")
+        if raw:
+            arr = np.frombuffer(raw, dtype=np.float32).reshape((ny, nx)).copy()
+        else:
+            arr = np.zeros((ny, nx), dtype=np.float32)
+        self._hf = HeightField(arr, origin, sp)
+        cm = snap.get("colorMask_raw")
+        if cm:
+            self._colorMask = np.frombuffer(cm, dtype=np.uint8).reshape((ny, nx)).copy()
+        else:
+            self._colorMask = None
+        self._finishRestore()
+
+    def matchesSnapshot(self, snap: dict) -> bool:
+        """O(1) 快照比较：母场 stamp + 内容 version + 蒙版 stamp + 放置阵。
+        （撤销快照按引用持有旧数组，内容编辑走 setData/commitRoi 推进 stamp，
+        显示/蒙版/放置各有计数或逐一比较，覆盖全部可撤销变更路径。）"""
+        if "hfStamp" not in snap:
+            return self.serialize() == snap
+        return (self._hf.stamp == snap.get("hfStamp")
+                and self._version == snap.get("version")
+                and self._maskStamp == snap.get("maskStamp")
+                and np.array_equal(
+                    self._place,
+                    np.asarray(snap.get("place"), dtype=np.float64)))
+
+    def snapshotSize(self, snap: dict) -> int:
+        return int(self._hf.data.nbytes) + \
+            (int(self._colorMask.nbytes) if self._colorMask is not None else 0) + 4096
+
+    def _restoreMetadata(self, data: dict) -> tuple:
+        """应用基础属性与元数据（origin/spacing/dims/place/display）。
+        返回 (origin, spacing, nx, ny) 供建场。"""
+        super().deserialize(data)
+        o = data.get("origin", [0.0, 0.0])
+        sp = float(data.get("spacing", 1.0))
+        dims = data.get("dims", [2, 2])
+        nx, ny = int(dims[0]), int(dims[1])
+        pl = data.get("place")
+        self._place = np.array(pl, dtype=np.float64) if pl else np.eye(3, dtype=np.float64)
+        disp = data.get("display", {}) or {}
+        self._displayMode = disp.get("mode", self._displayMode)
+        if self._displayMode not in DISPLAY_MODES:
+            self._displayMode = "contour"
+        self._lightAzimuth = float(disp.get("azimuth", self._lightAzimuth))
+        self._lightAltitude = float(disp.get("altitude", self._lightAltitude))
+        self._zExaggeration = float(disp.get("zexag", self._zExaggeration))
+        self._gridDivisions = int(disp.get("gridDivisions", self._gridDivisions))
+        self._display3DMode = disp.get("mode3d", self._display3DMode)
+        if self._display3DMode not in DISPLAY_3D_MODES:
+            self._display3DMode = "material"
+        self._material = disp.get("material", self._material)
+        if self._material not in MATERIALS:
+            self._material = "clay"
+        return (float(o[0]), float(o[1])), sp, nx, ny
+
+    def _finishRestore(self) -> None:
+        """重建蒙版/几何缓存计数（与 deserialize 收尾一致）。"""
+        self._maskStamp += 1
+        self._lodMaskCache.clear()
+        self.bumpVersion()
 
     def summaryDict(self) -> dict:
         """属性面板用的轻量摘要（不含网格 blob，避免刷屏）。"""
@@ -357,40 +444,18 @@ class ReliefModelObject(BaseObject):
         return d
 
     def deserialize(self, data: dict) -> None:
-        super().deserialize(data)
-        o = data.get("origin", [0.0, 0.0])
-        sp = float(data.get("spacing", 1.0))
-        dims = data.get("dims", [2, 2])
-        nx, ny = int(dims[0]), int(dims[1])
+        origin, sp, nx, ny = self._restoreMetadata(data)
         g = data.get("grid")
         if g:
             raw = zlib.decompress(base64.b64decode(g))
             arr = np.frombuffer(raw, dtype=np.float32).reshape((ny, nx)).copy()
         else:
             arr = np.zeros((ny, nx), dtype=np.float32)
-        self._hf = HeightField(arr, (float(o[0]), float(o[1])), sp)
-        pl = data.get("place")
-        self._place = np.array(pl, dtype=np.float64) if pl else np.eye(3, dtype=np.float64)
-        disp = data.get("display", {}) or {}
-        self._displayMode = disp.get("mode", self._displayMode)
-        if self._displayMode not in DISPLAY_MODES:
-            self._displayMode = "contour"
-        self._lightAzimuth = float(disp.get("azimuth", self._lightAzimuth))
-        self._lightAltitude = float(disp.get("altitude", self._lightAltitude))
-        self._zExaggeration = float(disp.get("zexag", self._zExaggeration))
-        self._gridDivisions = int(disp.get("gridDivisions", self._gridDivisions))
-        self._display3DMode = disp.get("mode3d", self._display3DMode)
-        if self._display3DMode not in DISPLAY_3D_MODES:
-            self._display3DMode = "material"
-        self._material = disp.get("material", self._material)
-        if self._material not in MATERIALS:
-            self._material = "clay"
+        self._hf = HeightField(arr, origin, sp)
         cm = data.get("colorMask")
         if cm:
             raw = zlib.decompress(base64.b64decode(cm))
             self._colorMask = np.frombuffer(raw, dtype=np.uint8).reshape((ny, nx)).copy()
         else:
             self._colorMask = None
-        self._maskStamp += 1
-        self._lodMaskCache.clear()
-        self.bumpVersion()
+        self._finishRestore()

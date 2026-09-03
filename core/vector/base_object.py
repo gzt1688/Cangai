@@ -161,3 +161,27 @@ class BaseObject(ABC):
         self._color = tuple(d.get("color", (255, 100, 0)))
         self._lineWidth = d.get("lineWidth", 1.0)
         self._group = d.get("group", "")
+
+    # ---------------- 撤销快照协议 ----------------
+    # 默认实现 = serialize/deserialize；持有大数据的对象（浮雕网格/位图）
+    # 应成对覆写 snapshot/restoreSnapshot（免压缩/免编码）与 matchesSnapshot
+    # （O(1) 签名比较）与 snapshotSize（按原始字节计内存）。
+
+    def snapshot(self) -> dict:
+        """撤销快照：捕获对象全部可撤销内容（默认=完整 serialize）。"""
+        return self.serialize()
+
+    def restoreSnapshot(self, snap: dict) -> None:
+        """由 snapshot() 产生的快照恢复内容（须与 snapshot 成对覆写）。"""
+        self.deserialize(snap)
+
+    def matchesSnapshot(self, snap: dict) -> bool:
+        """当前内容是否与快照一致（撤销恢复时跳过未变对象，避免无谓重建）。
+        默认重新 serialize 做全等比较；大对象覆写为廉价签名比较。"""
+        return self.serialize() == snap
+
+    def snapshotSize(self, snap: dict) -> int:
+        """快照近似内存占用（字节）：撤销历史按内存预算淘汰旧项时计费。
+        普通曲线/点/文字对象按 0 计（由撤销深度上限兜底）；
+        大对象（浮雕网格/位图）覆写为按原始字节数计。"""
+        return 0

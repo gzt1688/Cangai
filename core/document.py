@@ -568,11 +568,18 @@ class Document(QObject):
 
         曲线/浮雕两套历史各存各的快照：撤销某一套时只重建对应域的对象，
         另一域对象与其历史互不干扰，保证“不能混合、相互独立”。
+        走对象级 snapshot() 协议（默认=serialize；浮雕网格/位图为免压缩的
+        原始字节快照），每项同时记录对象级内存计费供预算淘汰。
         """
         objs = sorted((o for o in self._objects.values()
                        if self._domainOf(o) == kind), key=lambda o: o.id())
+        entries = []
+        for o in objs:
+            snap = o.snapshot()
+            entries.append({"id": o.id(), "snap": snap,
+                            "size": o.snapshotSize(snap)})
         return {
-            "objects": [o.serialize() for o in objs],
+            "objects": entries,
             "selected": [o.id() for o in objs if o.isSelected()],
         }
 
@@ -592,28 +599,54 @@ class Document(QObject):
         - 一个会话若同时改了曲线与模型，两套历史各记一项；
         - 快照无变化则忽略（不产生空撤销项）。
         - 压栈只清空本域的“重做”，另一域的重做/撤销不受影响。
+        - 压栈后按内存预算（设置-渲染性能-撤销历史内存预算）从最旧开始淘汰。
         """
         if self._editBefore is None:
             return
         before = self._editBefore
-        changed = False
+        changedKinds = []
         for kind in _HISTORY_DOMAINS:
             after = self._snapshotDomain(kind)
             if after != before[kind]:
+                size = (self._historyEntrySize(before[kind]) +
+                        self._historyEntrySize(after))
                 self._undoHistory[kind].append(
-                    (before[kind], after, self._nextSeq()))
+                    (before[kind], after, self._nextSeq(), size))
                 if len(self._undoHistory[kind]) > self._undoDepth:
                     self._undoHistory[kind].pop(0)
                 self._redoHistory[kind].clear()
-                changed = True
+                changedKinds.append(kind)
         self._editBefore = None
-        if changed:
+        if changedKinds:
+            for kind in changedKinds:
+                self._enforceHistoryBudget(kind)
             self._setDirty(True)   # 多文件系统：内容有变即标记未保存
             self._emitHistoryState()
 
+    @staticmethod
+    def _historyEntrySize(snap: dict) -> int:
+        """撤销项内存计费：累加快照内各对象的 snapshotSize（大对象按原始字节）。"""
+        total = 512
+        for e in snap.get("objects", []):
+            total += int(e.get("size", 0))
+        return total
+
+    def _enforceHistoryBudget(self, kind: str) -> None:
+        """按“撤销历史内存预算”从最旧开始淘汰浮雕/位图大快照（至少保留一项）。"""
+        try:
+            from . import app_settings
+            budget = app_settings.undo_memory_budget_bytes()
+        except Exception:
+            return
+        st = self._undoHistory[kind]
+        total = sum(e[3] for e in st)
+        while total > budget and len(st) > 1:
+            _, _, _, sz = st.pop(0)
+            total -= sz
+
     def _restoreDomain(self, kind: str, snap: dict) -> None:
         """把 kind 域的对象恢复为快照状态；另一域对象与图层等文档状态保持不变。"""
-        target = {d["id"]: d for d in snap["objects"]}
+        target = {e["id"]: e for e in snap["objects"]}
         snap_sel = set(snap.get("selected", []))
         # 1) 移除快照中已不存在的该域对象
         for oid in [oid for oid, o in self._objects.items()
@@ -621,16 +654,21 @@ class Document(QObject):
             if oid not in target:
                 self._objects.pop(oid)
                 self.objectRemoved.emit(oid)
-        # 2) 序列化有差异的对象按快照重建（同 id 先移除再添加，驱动场景/视口刷新）；
-        #    状态未变的对象保留原实例，避免无谓重建（尤其浮雕模型网格缓存）。
-        for oid, data in target.items():
+        # 2) 与快照有差异的对象按快照重建（同 id 先移除再添加，驱动场景/视口刷新）；
+        #    matchesSnapshot 未变（浮雕按 stamp/version O(1) 签名、其余按快照全等）
+        #    的对象保留原实例，避免无谓重建（尤其浮雕模型网格缓存）。
+        for oid, entry in target.items():
             cur = self._objects.get(oid)
             if cur is not None:
-                if cur.serialize() == data:
+                try:
+                    same = cur.matchesSnapshot(entry["snap"])
+                except Exception:
+                    same = False
+                if same:
                     continue
                 self._objects.pop(oid)
                 self.objectRemoved.emit(oid)
-            obj = objectFromDict(data)
+            obj = self._objectFromSnapshot(entry["snap"])
             if obj is None:
                 continue
             self._objects[oid] = obj
@@ -651,12 +689,22 @@ class Document(QObject):
         # 撤销/重做重建后对齐绑定标注：源对象几何回到快照状态，标注跟随刷新
         self._syncBoundDimensions()
 
+    def _objectFromSnapshot(self, snap: dict) -> Optional[BaseObject]:
+        """由撤销快照重建对象：类型工厂 + restoreSnapshot（默认=deserialize，
+        与 snapshot()/serialize 数据兼容）。未知类型返回 None。"""
+        factory = _TYPE_FACTORY.get(snap.get("type"))
+        if factory is None:
+            return None
+        obj = factory()
+        obj.restoreSnapshot(snap)
+        return obj
+
     def _undoOne(self, kind: str) -> None:
         st = self._undoHistory[kind]
         if not st:
             return
-        before, after, _ = st.pop()
-        self._redoHistory[kind].append((before, after, self._nextSeq()))
+        before, after, _, _sz = st.pop()
+        self._redoHistory[kind].append((before, after, self._nextSeq(), _sz))
         self._restoreDomain(kind, before)
         self._emitHistoryState()
 
@@ -664,8 +712,8 @@ class Document(QObject):
         st = self._redoHistory[kind]
         if not st:
             return
-        before, after, _ = st.pop()
-        self._undoHistory[kind].append((before, after, self._nextSeq()))
+        before, after, _, sz = st.pop()
+        self._undoHistory[kind].append((before, after, self._nextSeq(), sz))
         if len(self._undoHistory[kind]) > self._undoDepth:
             self._undoHistory[kind].pop(0)
         self._restoreDomain(kind, after)
