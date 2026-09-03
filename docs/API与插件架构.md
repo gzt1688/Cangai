@@ -91,7 +91,21 @@ def unregister(api):
     ...
 ```
 
-### 2.4 事件主题
+### 2.4 事件订阅
+
+处理器签名自适应（订阅时自动探测）——两种写法都可以：
+
+```python
+def on_added(oid):            # 标准约定：载荷恒传入
+    print("新增对象", oid)
+
+def on_selection():           # 零参也可以：无载荷主题/不需要载荷时更省事
+    print("选择集变化")
+
+api.events.subscribe("document.added", on_added)
+un = api.events.subscribe("document.selectionChanged", on_selection)
+un()   # 退订
+```
 
 | 主题 | 载荷 | 时机 |
 |------|------|------|

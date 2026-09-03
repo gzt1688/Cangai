@@ -40,7 +40,8 @@ def register(api) -> None:
         pluginId="example_tools")
 
     # ---- 3) 事件订阅：感知选区/命令变化（保存退订闭包，停用时调用） ----
-    def on_selection_changed() -> None:
+    # 约定：处理器统一收到一个位置参数 payload（无载荷的主题传 None）。
+    def on_selection_changed(payload=None) -> None:
         globals()["_selCount"] = len(api.selectedObjects())
 
     globals()["_unsubscribe_selection"] = \

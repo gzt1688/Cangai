@@ -39,6 +39,23 @@ def run():
     bus.emit("t2", "x")
     check("订阅者异常被隔离", got2 == ["x"])
 
+    # 签名自适应：零参处理器（无载荷主题）与带载荷/默认参处理器混用
+    got3 = []
+    bus.subscribe("t3", lambda: got3.append("zero"))
+    bus.subscribe("t3", lambda p: got3.append(("payload", p)))
+
+    def handler_with_default(payload=None):
+        got3.append(("default", payload))
+    bus.subscribe("t3", handler_with_default)
+    bus.emit("t3")
+    check("零参/带载荷/默认参处理器自适应",
+          got3 == ["zero", ("payload", None), ("default", None)])
+
+    # 退订（按原处理器对象）
+    bus.unsubscribe("t3", handler_with_default)
+    bus.emit("t3")
+    check("按对象退订后不再触发", len(got3) == 5)
+
     # ---- 2) API 门面（无宿主独立驱动 core 文档）----
     api = CangaiAPI()
     oid = api.addPolyline([(0, 0), (10, 0), (10, 10)], closed=True)
