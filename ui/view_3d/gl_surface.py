@@ -149,6 +149,24 @@ class GLSurface:
         self.vao: moderngl.VertexArray | None = None
         self._pos = self._nrm = self._base = self._idx = None
         self._key = None
+        # CPU 侧类型转换缓存：视口按 surfKey 稳定缓存输入数组（同一对象反复传入，
+        # id 在被引用期间稳定），f4/u4 转换结果直接复用，省去每帧 ~3MB 的重复拷贝。
+        # 上限防泄漏：surfKey 变化后旧数组被视口释放，此处引用需定期让路。
+        self._convCache: dict = {}
+
+    def _asUpload(self, arr: np.ndarray, dtype) -> np.ndarray:
+        """转成可上传的连续 dtype 数组；已是目标类型则原样返回（零拷贝）。"""
+        if arr.dtype == dtype and arr.flags["C_CONTIGUOUS"]:
+            return arr
+        k = id(arr)
+        hit = self._convCache.get(k)
+        if hit is not None:
+            return hit
+        out = np.ascontiguousarray(arr, dtype=dtype)
+        if len(self._convCache) >= 8:
+            self._convCache.clear()
+        self._convCache[k] = out
+        return out
 
     def ensure(self) -> moderngl.Context:
         if self.ctx is None:
@@ -171,6 +189,8 @@ class GLSurface:
 
         ``opacity < 1`` 时开启混合（半透明 X-Ray：浮雕编辑态下让参考曲线透过
         模型清晰可见），否则按不透明渲染。
+        ``fbo`` 仅为兼容调用方签名保留：渲染目标是 Qt 当前绑定的 FBO，
+        本方法不做绑定。
         """
         self.ensure()
         ctx = self.ctx
@@ -188,17 +208,18 @@ class GLSurface:
         # 每帧重建 GPU 缓冲/VAO：本机 Qt(QOpenGLWidget)+ModernGL+MSAA 组合下，
         # 跨帧复用同一 VAO 时 render() 会访问违例闪退；而“同帧新建再渲染”始终稳定
         # （见 render_debug.log：REBUILD 帧 post-render OK，REUSE 帧崩在 render）。
-        # CPU 侧网格/顶点色已由视口缓存，这里只做 ~3MB/帧的缓冲上传（独显无压力）。
+        # CPU 侧网格/顶点色已由视口缓存，这里只做缓冲上传（经 _asUpload 复用
+        # 转换结果，常规旋转帧无多余拷贝）。
         if self.vao is not None:
             self.vao.release()
             self.vao = None
         for _b in (self._pos, self._nrm, self._base, self._idx):
             if _b is not None:
                 _b.release()
-        self._pos = ctx.buffer(np.ascontiguousarray(pos.astype("f4")))
-        self._nrm = ctx.buffer(np.ascontiguousarray(nrm.astype("f4")))
-        self._base = ctx.buffer(np.ascontiguousarray(base.astype("f4")))
-        self._idx = ctx.buffer(np.ascontiguousarray(idx.astype("u4")))
+        self._pos = ctx.buffer(self._asUpload(pos, "f4"))
+        self._nrm = ctx.buffer(self._asUpload(nrm, "f4"))
+        self._base = ctx.buffer(self._asUpload(base, "f4"))
+        self._idx = ctx.buffer(self._asUpload(idx, "u4"))
         self.vao = ctx.vertex_array(
             self.prog,
             [
@@ -232,3 +253,4 @@ class GLSurface:
                 _b.release()
         self._pos = self._nrm = self._base = self._idx = None
         self._key = None
+        self._convCache.clear()

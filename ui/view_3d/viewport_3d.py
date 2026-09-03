@@ -198,8 +198,9 @@ class Viewport3D(QOpenGLWidget):
 
     # ---------------- 文档 / 命令 ----------------
     def setDocument(self, doc) -> None:
-        """绑定/换绑文档（多文件切换）：换绑时断开旧文档的重绘信号。"""
-        if self._doc is not None and doc is not self._doc:
+        """绑定/换绑文档（多文件切换）：先按引用断开旧绑定（含同一文档重复
+        绑定的场景，避免旧 lambda 泄漏、同一信号触发多份槽），再接新文档。"""
+        if self._doc is not None:
             try:
                 self._doc.objectAdded.disconnect(self._onDocAdded)
                 self._doc.objectRemoved.disconnect(self._onDocRemoved)
@@ -208,6 +209,9 @@ class Viewport3D(QOpenGLWidget):
                 self._doc.selectionChanged.disconnect(self._onDocSelChanged)
             except (RuntimeError, TypeError):
                 pass
+        if doc is None:
+            self._doc = None
+            return
         self._doc = doc
         # 槽保存为实例属性，保证换绑时可按引用精确断开
         self._onDocAdded = lambda *_: self.update()
