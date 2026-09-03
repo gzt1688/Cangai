@@ -81,6 +81,14 @@ MSAA_CHOICES = (0, 2, 4, 8)
 async_compute = True
 
 
+# ==================== 文件保存设置（自动保存 / 备份） ====================
+# 自动保存：开启后按间隔把"有文件路径且未保存"的文档另存为 <路径>.autosave 恢复
+# 副本（不改动未保存标记）；备份：保存覆盖已有文件前先复制 <路径>.bak。
+autosave_enabled = False
+autosave_interval_min = 5
+backup_on_save = True
+
+
 def max_field_pixels() -> int:
     """当前母场像素上限（每边上限²），供 HeightField.grid_size 钳制用。"""
     side = max(64, int(max_field_pixels_side))
@@ -93,7 +101,7 @@ def undo_memory_budget_bytes() -> int:
 
 
 def perf_snapshot() -> dict:
-    """渲染/性能设置快照（供设置对话框取消时回滚）。"""
+    """渲染/性能与文件设置快照（供设置对话框取消时回滚）。"""
     return {
         "max_field_pixels_side": max_field_pixels_side,
         "undo_memory_budget_mb": undo_memory_budget_mb,
@@ -103,14 +111,18 @@ def perf_snapshot() -> dict:
         "preview_max_dim": preview_max_dim,
         "msaa_samples": msaa_samples,
         "async_compute": async_compute,
+        "autosave_enabled": autosave_enabled,
+        "autosave_interval_min": autosave_interval_min,
+        "backup_on_save": backup_on_save,
     }
 
 
 def perf_restore(snap: dict) -> None:
-    """从快照回滚渲染/性能设置。"""
+    """从快照回滚渲染/性能与文件设置。"""
     global max_field_pixels_side, undo_memory_budget_mb, gpu_accelerated
     global mesh_max_dim_gpu, mesh_max_dim_cpu, preview_max_dim
     global msaa_samples, async_compute
+    global autosave_enabled, autosave_interval_min, backup_on_save
     max_field_pixels_side = snap.get("max_field_pixels_side", max_field_pixels_side)
     undo_memory_budget_mb = snap.get("undo_memory_budget_mb", undo_memory_budget_mb)
     gpu_accelerated = snap.get("gpu_accelerated", gpu_accelerated)
@@ -119,6 +131,9 @@ def perf_restore(snap: dict) -> None:
     preview_max_dim = snap.get("preview_max_dim", preview_max_dim)
     msaa_samples = snap.get("msaa_samples", msaa_samples)
     async_compute = snap.get("async_compute", async_compute)
+    autosave_enabled = bool(snap.get("autosave_enabled", autosave_enabled))
+    autosave_interval_min = int(snap.get("autosave_interval_min", autosave_interval_min))
+    backup_on_save = bool(snap.get("backup_on_save", backup_on_save))
 
 
 def system_info() -> dict:
@@ -151,18 +166,19 @@ def system_info() -> dict:
     return info
 
 
-# ==================== 渲染/性能设置持久化 ====================
-# 仅持久化渲染性能项（高配用户上调后重启不丢）；语言/主题等沿用现有内存态约定。
+# ==================== 渲染性能/文件设置持久化 ====================
+# 持久化渲染性能与文件保存项（上调后/开启后重启不丢）；语言/主题等沿用现有内存态约定。
 # 文件损坏/缺失时自愈为默认值，不影响启动。
 _PERF_KEYS = (
     "max_field_pixels_side", "undo_memory_budget_mb", "gpu_accelerated",
     "mesh_max_dim_gpu", "mesh_max_dim_cpu", "preview_max_dim",
     "msaa_samples", "async_compute",
+    "autosave_enabled", "autosave_interval_min", "backup_on_save",
 )
 
 
 def perf_config_path() -> str:
-    """渲染设置 JSON 路径：%APPDATA%/Cangai/render_settings.json（非 Windows 用 ~）。"""
+    """设置 JSON 路径：%APPDATA%/Cangai/render_settings.json（非 Windows 用 ~）。"""
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
     d = os.path.join(base, "Cangai")
     try:
@@ -173,7 +189,7 @@ def perf_config_path() -> str:
 
 
 def load_perf(path: str | None = None) -> None:
-    """从磁盘加载渲染设置（启动时调用）；缺失/损坏则保持默认。"""
+    """从磁盘加载设置（启动时调用）；缺失/损坏则保持默认。"""
     p = path or perf_config_path()
     try:
         with open(p, "r", encoding="utf-8") as f:
