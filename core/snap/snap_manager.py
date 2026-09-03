@@ -85,7 +85,9 @@ class SnapManager:
             SnapType.TANGENT, SnapType.QUARTER, SnapType.VERTEX,
         }
         self._snapRadius: float = 12.0
-        self._sampleCache = {}   # id(obj) → 采样折线（每次 snap 调用清空）
+        # 解析对象（圆/弧/椭圆/直线）→ 采样折线缓存：键为几何签名（内容变化即换键），
+        # 超上限整体清空；非解析对象不走此缓存（显示点列由对象自身缓存）
+        self._sampleCache = {}
 
     @classmethod
     def instance(cls) -> "SnapManager":
@@ -119,7 +121,6 @@ class SnapManager:
 
     def snap(self, worldPos: Point3D, objects: List, viewRadius: float,
              refPoint: Optional[Point3D] = None) -> SnapResult:
-        self._sampleCache.clear()   # 采样缓存按次刷新（几何可能已变化）
         candidates: List[SnapResult] = []
         # 单对象捕捉
         for obj in objects:
@@ -428,13 +429,25 @@ class SnapManager:
         pts: List[Point3D] = []
         if ta == ObjectType.LINE and tb == ObjectType.LINE:
             # 闭合折线（矩形/多边形）点列补齐收尾副本后再求交
-            pa = self._samplePointsOf(a)
-            pb = self._samplePointsOf(b)
-            for i in range(len(pa) - 1):
-                for k in range(len(pb) - 1):
-                    p = _segSegIntersect(pa[i], pa[i + 1], pb[k], pb[k + 1])
-                    if p:
-                        pts.append(p)
+            pa = self._cachedSamples(a)
+            pb = self._cachedSamples(b)
+            if len(pa) >= 2 and len(pb) >= 2:
+                # 包围盒快速排除（无交则整对跳过，避免 O(n·m) 全量弦求交）
+                if not _bboxOverlap(_bboxOf(pa), _bboxOf(pb)):
+                    return []
+                if wp is not None and viewRadius > 0 and \
+                        (len(pa) > 32 or len(pb) > 32):
+                    # 多段折线：只保留经过鼠标附近（捕捉半径内）的弦，控制组合数
+                    nearA = self._chordsNear(pa, wp, viewRadius)
+                    nearB = self._chordsNear(pb, wp, viewRadius)
+                else:
+                    nearA = list(zip(pa, pa[1:]))
+                    nearB = list(zip(pb, pb[1:]))
+                for a1, a2 in nearA:
+                    for b1, b2 in nearB:
+                        p = _segSegIntersect(a1, a2, b1, b2)
+                        if p:
+                            pts.append(p)
         elif ta == ObjectType.LINE and tb in (ObjectType.CIRCLE, ObjectType.ARC):
             pts.extend(self._lineCircle(a, b))
         elif tb == ObjectType.LINE and ta in (ObjectType.CIRCLE, ObjectType.ARC):
@@ -467,11 +480,45 @@ class SnapManager:
                             pts.append(p)
         return pts
 
+    def _geomKey(self, obj):
+        """解析对象的几何签名：内容变化 → 键变化 → 采样缓存自然失效。
+        非解析对象（曲线/多段线等）返回 None，不走采样缓存。"""
+        t = obj.type()
+        try:
+            if t == ObjectType.CIRCLE:
+                c, r = obj.center(), obj.radius()
+                return (t, round(c.x, 9), round(c.y, 9), round(c.z, 9), round(r, 9))
+            if t == ObjectType.ARC:
+                c, r = obj.center(), obj.radius()
+                return (t, round(c.x, 9), round(c.y, 9), round(c.z, 9), round(r, 9),
+                        round(obj.startAngle(), 9), round(obj.endAngle(), 9))
+            if t == ObjectType.ELLIPSE:
+                c = obj.center()
+                return (t, round(c.x, 9), round(c.y, 9), round(c.z, 9),
+                        round(obj.majorAxis(), 9), round(obj.minorAxis(), 9),
+                        round(obj.rotation(), 9))
+            if t == ObjectType.LINE:
+                pts = obj.points()
+                return (t, tuple((round(p.x, 9), round(p.y, 9), round(p.z, 9))
+                                 for p in pts),
+                        bool(getattr(obj, "isClosed", lambda: False)()))
+        except Exception:
+            return None
+        return None
+
     def _cachedSamples(self, obj) -> List[Point3D]:
-        key = id(obj)
-        if key not in self._sampleCache:
-            self._sampleCache[key] = self._samplePointsOf(obj)
-        return self._sampleCache[key]
+        """对象显示采样折线：解析对象按几何签名缓存（移动/改参数即换键），
+        其余类型直接取（Curve/Nurbs 的 getSampledPoints 有对象级缓存）。"""
+        key = self._geomKey(obj)
+        if key is None:
+            return self._samplePointsOf(obj)
+        hit = self._sampleCache.get(key)
+        if hit is None:
+            hit = self._samplePointsOf(obj)
+            if len(self._sampleCache) > 256:
+                self._sampleCache.clear()
+            self._sampleCache[key] = hit
+        return hit
 
     def _samplePointsOf(self, obj) -> List[Point3D]:
         """对象的显示采样折线（交点/最近点等通用求交的数据源）。
@@ -537,7 +584,7 @@ class SnapManager:
     def _lineCircle(self, lineObj, circObj) -> List[Point3D]:
         c = circObj.center(); r = circObj.radius()
         # 闭合折线（矩形/多边形）补齐收尾副本，保证收尾边也参与求交
-        pts = self._samplePointsOf(lineObj)
+        pts = self._cachedSamples(lineObj)
         out = []
         for i in range(len(pts) - 1):
             a, b = pts[i], pts[i + 1]

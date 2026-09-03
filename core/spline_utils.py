@@ -132,7 +132,12 @@ def bernsteinPoly(n: int, i: int, t: float) -> float:
     return math.comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
 
 
-def evaluateNurbsBasis(degree: int, knots: Sequence[float], i: int, t: float) -> float:
+def nurbsBasisVector(degree: int, knots: Sequence[float], t: float) -> List[float]:
+    """t 处的完整 B 样条基函数向量（de Boor 递推），长度 n = len(knots)-degree-1。
+
+    采样时每个 t 只需调用一次；旧实现递推范围截断为 range(n-d)，在
+    控制点数 = 阶数+1（贝塞尔段）时基函数相对权重错误、曲线失真。
+    """
     n = len(knots) - degree - 1
     N = [0.0] * n
     for j in range(n):
@@ -140,13 +145,23 @@ def evaluateNurbsBasis(degree: int, knots: Sequence[float], i: int, t: float) ->
             N[j] = 1.0
     for d in range(1, degree + 1):
         Nn = [0.0] * n
-        for j in range(n - d):
+        for j in range(n):
             denom1 = knots[j + d] - knots[j]
-            denom2 = knots[j + d + 1] - knots[j + 1]
             a = (t - knots[j]) / denom1 if denom1 != 0 else 0.0
-            b = (knots[j + d + 1] - t) / denom2 if denom2 != 0 else 0.0
-            Nn[j] = a * N[j] + b * N[j + 1]
+            acc = a * N[j]
+            if j + 1 < n:
+                # N_{j+1,d-1} 越出存储范围（j+1 = n）时数学上恒为 0（t 在域内）
+                denom2 = knots[j + d + 1] - knots[j + 1]
+                if denom2 != 0:
+                    acc += ((knots[j + d + 1] - t) / denom2) * N[j + 1]
+            Nn[j] = acc
         N = Nn
+    return N
+
+
+def evaluateNurbsBasis(degree: int, knots: Sequence[float], i: int, t: float) -> float:
+    """t 处第 i 个基函数值（保留旧接口；批量采样请用 nurbsBasisVector）。"""
+    N = nurbsBasisVector(degree, knots, t)
     return N[i] if 0 <= i < len(N) else 0.0
 
 
@@ -160,11 +175,14 @@ def sampleNurbs(degree: int, controlPoints: Sequence[Point3D],
     tmin, tmax = knots[degree], knots[n]
     for s in range(samples):
         t = tmin + (tmax - tmin) * s / (samples - 1) if samples > 1 else tmin
+        N = nurbsBasisVector(degree, knots, t)
         num = Point3D()
         den = 0.0
         for i in range(n):
-            b = evaluateNurbsBasis(degree, knots, i, t)
+            b = N[i] if 0 <= i < len(N) else 0.0
             w = weights[i] * b
+            if w == 0.0:
+                continue
             num = num + controlPoints[i] * w
             den += w
         if abs(den) > 1e-12:

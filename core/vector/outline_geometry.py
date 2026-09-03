@@ -389,19 +389,26 @@ def simplifyPolyline(pts: List[Point3D], tolerance: float) -> List[Point3D]:
         return pts
 
     if closed:
-        # 闭合多边形：取相距最远的两个顶点切成两段，分别 RDP（保证公共端点保留）
-        i0, i1 = 0, 0
+        # 闭合多边形：取相距最远的两个顶点切成两段，分别 RDP（保证公共端点保留）。
+        # 精确最远对是 O(n²)（n 上限 8000 时约 3200 万次距离计算会冻结 UI），
+        # 改用两遍扫描近似：距首点最远点 A、距 A 最远点 B（直径的 ≥2/3），
+        # 作为分段锚点足够——与图片转线稿的闭合简化策略一致。
+        iA = 0
+        best = -1.0
+        for i in range(1, n):
+            d = _dist2d(work[i], work[0])
+            if d > best:
+                best, iA = d, i
+        iB = 0
         best = -1.0
         for i in range(n):
-            for j in range(i + 1, n):
-                d = _dist2d(work[i], work[j])
-                if d > best:
-                    best = d
-                    i0, i1 = i, j
-        if i1 < i0:
-            i0, i1 = i1, i0
-        seg1 = work[i0:i1 + 1]
-        seg2 = work[i1:] + work[:i0 + 1]
+            d = _dist2d(work[i], work[iA])
+            if d > best:
+                best, iB = d, i
+        if iB < iA:
+            iA, iB = iB, iA
+        seg1 = work[iA:iB + 1]
+        seg2 = work[iB:] + work[:iA + 1]
         out = _rdp(seg1, tolerance)[:-1] + _rdp(seg2, tolerance)[:-1]
     else:
         out = _rdp(work, tolerance)
@@ -418,28 +425,37 @@ def _dist2d(a: Point3D, b: Point3D) -> float:
 
 
 def _rdp(pts: List[Point3D], tol: float) -> List[Point3D]:
-    """开放点列的 Douglas-Peucker 递归抽稀（首末点必保留）。"""
+    """开放点列的 Douglas-Peucker 抽稀（显式栈迭代，首末点必保留；
+    避免极端输入下递归深度失控）。"""
     n = len(pts)
     if n < 3:
         return list(pts)
-    a, b = pts[0], pts[-1]
-    dx, dy = b.x - a.x, b.y - a.y
-    L = math.hypot(dx, dy)
-    idx, dmax = -1, -1.0
-    if L < 1e-12:
-        # 首末重合：取离首点最远的点
-        for i in range(1, n - 1):
-            d = _dist2d(pts[i], a)
-            if d > dmax:
-                dmax, idx = d, i
-    else:
-        for i in range(1, n - 1):
-            p = pts[i]
-            d = abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / L
-            if d > dmax:
-                dmax, idx = d, i
-    if dmax <= tol or idx < 0:
-        return [a, b]
-    left = _rdp(pts[:idx + 1], tol)
-    right = _rdp(pts[idx:], tol)
-    return left[:-1] + right
+    keep = [False] * n
+    keep[0] = keep[n - 1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        first, last = stack.pop()
+        if last - first < 2:
+            continue
+        a, b = pts[first], pts[last]
+        dx, dy = b.x - a.x, b.y - a.y
+        L = math.hypot(dx, dy)
+        idx, dmax = -1, -1.0
+        if L < 1e-12:
+            # 首末重合：取离首点最远的点
+            for i in range(first + 1, last):
+                d = _dist2d(pts[i], a)
+                if d > dmax:
+                    dmax, idx = d, i
+        else:
+            for i in range(first + 1, last):
+                p = pts[i]
+                d = abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / L
+                if d > dmax:
+                    dmax, idx = d, i
+        if dmax <= tol or idx < 0:
+            continue
+        keep[idx] = True
+        stack.append((first, idx))
+        stack.append((idx, last))
+    return [pts[i] for i in range(n) if keep[i]]

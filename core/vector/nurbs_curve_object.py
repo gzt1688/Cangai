@@ -33,6 +33,8 @@ class NurbsCurveObject(BaseObject):
         super().__init__(ObjectType.NURBS_CURVE)
         self._segments: List[NurbsSegment] = []
         self._closed: bool = False
+        self._sampleCache: Optional[List[Point3D]] = None   # 采样缓存（内容变更即失效）
+        self._sampleCachePerSeg: int = -1
 
     @staticmethod
     def create(degree: int, controlPoints: List[Point3D],
@@ -59,17 +61,27 @@ class NurbsCurveObject(BaseObject):
         self._closed = c
 
     def getSampledPoints(self, samplesPerSeg: int = 100) -> List[Point3D]:
+        """采样折线（按内容缓存：包围盒/路径长度/图元重建每次调用不再全量重算）。"""
+        if self._sampleCache is not None and self._sampleCachePerSeg == samplesPerSeg:
+            return self._sampleCache
         out: List[Point3D] = []
         for seg in self._segments:
             cps = [cp.toPoint3D() for cp in seg.controlPoints]
             w = [cp.weight for cp in seg.controlPoints]
             out.extend(sampleNurbs(seg.degree, cps, w, seg.knotVector, samplesPerSeg))
+        self._sampleCache = out
+        self._sampleCachePerSeg = samplesPerSeg
         return out
+
+    def _invalidateSampleCache(self) -> None:
+        self._sampleCache = None
+        self._sampleCachePerSeg = -1
 
     def translate(self, dx: float, dy: float, dz: float) -> None:
         for seg in self._segments:
             seg.controlPoints = [ControlPoint(cp.x + dx, cp.y + dy, cp.z + dz, cp.weight)
                                  for cp in seg.controlPoints]
+        self._invalidateSampleCache()
 
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
         c, s = math.cos(angle), math.sin(angle)
@@ -77,11 +89,13 @@ class NurbsCurveObject(BaseObject):
             for seg in self._segments:
                 seg.controlPoints = [ControlPoint(cp.x * c - cp.y * s, cp.x * s + cp.y * c, cp.z, cp.weight)
                                      for cp in seg.controlPoints]
+            self._invalidateSampleCache()
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
         for seg in self._segments:
             seg.controlPoints = [ControlPoint(cp.x * sx, cp.y * sy, cp.z * sz, cp.weight)
                                  for cp in seg.controlPoints]
+        self._invalidateSampleCache()
 
     def getBoundingBox(self) -> BoundingBox3D:
         bb = BoundingBox3D()
