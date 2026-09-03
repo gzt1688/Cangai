@@ -57,7 +57,12 @@ class EllipseObject(BaseObject):
         self._cx += dx; self._cy += dy; self._cz += dz
 
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
+        """绕原点旋转（rotateAround 先平移到基准点再调此处）：转中心位置 +
+        累加自转角（与 ImageObject.rotate 同范式）。"""
         if (ax, ay, az) == (0, 0, 1):
+            c, s = math.cos(angle), math.sin(angle)
+            self._cx, self._cy = (self._cx * c - self._cy * s,
+                                  self._cx * s + self._cy * c)
             self._rotation += angle
 
     def scale(self, sx: float, sy: float, sz: float) -> None:

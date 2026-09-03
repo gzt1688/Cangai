@@ -773,13 +773,16 @@ class MirrorCommand(CommandInstance):
             if self._manager is not None:
                 self._manager.promptChanged.emit(self.prompt())
             return
-        # 第二点 → 立即执行
-        self._p2 = wp
+        # 第二点 → 立即执行（受正交约束）
+        self._p2 = self._orthoPoint(wp, self._p1)
         self._executeMirror()
 
     def onMouseMove(self, wp: Point3D, mods) -> None:
         if self._panel is not None:
             self._panel.setXYZ(wp.x, wp.y, wp.z)
+        if self._p1 is not None:
+            # 镜像轴第二点受正交约束（水平/垂直）
+            wp = self._orthoPoint(wp, self._p1)
         self._cursor = wp
         if self._p1 is None:
             return
@@ -788,8 +791,8 @@ class MirrorCommand(CommandInstance):
 
     def onRightClick(self, wp: Point3D) -> bool:
         if self._p1 is not None and self._p2 is None:
-            # 已点第一点、未确认：用当前光标位置作为第二点执行
-            self._p2 = wp
+            # 已点第一点、未确认：用当前光标位置作为第二点执行（受正交约束）
+            self._p2 = self._orthoPoint(wp, self._p1)
             self._executeMirror()
             return True
         self.finish()

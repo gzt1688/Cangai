@@ -24,11 +24,12 @@ class SettingsDialog(QDialog):
     renderSettingsChanged = Signal()
     dimensionSettingsChanged = Signal()   # 标注样式（字体/字号/单位）变更
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, pluginManager=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setMinimumSize(560, 480)
         self.setStyleSheet(f"background: {theme.BG_PANEL};")
+        self._pluginManager = pluginManager
 
         self._renderDirty = False   # 渲染性能页有改动（应用/确认时才广播）
         self._dimDirty = False      # 标注样式页有改动（应用/确认时才广播）
@@ -45,7 +46,7 @@ class SettingsDialog(QDialog):
         self._nav = QListWidget()
         self._nav.setFixedWidth(140)
         self._applyNavStyle()
-        for name in ["外观样式", "渲染性能", "通用", "文件", "键盘", "其他"]:
+        for name in ["外观样式", "渲染性能", "通用", "文件", "键盘", "插件", "其他"]:
             self._nav.addItem(name)
         self._nav.setCurrentRow(0)
         self._nav.currentRowChanged.connect(self._onNavChanged)
@@ -57,6 +58,7 @@ class SettingsDialog(QDialog):
         self._stack.addWidget(self._buildGeneralPage())
         self._stack.addWidget(self._buildFilePage())
         self._stack.addWidget(self._buildKeyboardPage())
+        self._stack.addWidget(self._buildPluginsPage())
         self._stack.addWidget(self._buildOtherPage())
         outer.addWidget(self._stack, 1)
         root.addLayout(outer, 1)
@@ -765,6 +767,83 @@ class SettingsDialog(QDialog):
 
         layout.addStretch()
         return page
+
+    def _buildPluginsPage(self) -> QWidget:
+        """插件页：列出已发现插件，勾选启用/禁用（立即生效），可重新扫描。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        hint = QLabel("插件目录：软件目录 plugins\\ 与 %APPDATA%\\Cangai\\plugins\\"
+                      "（把含 plugin.json 的文件夹或 .py 放入即可）")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
+
+        if self._pluginManager is None:
+            tip = QLabel("（当前环境未接入插件管理器）")
+            tip.setStyleSheet("color: #999;")
+            layout.addWidget(tip)
+            layout.addStretch()
+            return page
+
+        self._pluginRows = QWidget()
+        self._pluginRowsLayout = QVBoxLayout(self._pluginRows)
+        self._pluginRowsLayout.setContentsMargins(0, 0, 0, 0)
+        self._pluginRowsLayout.setSpacing(4)
+        layout.addWidget(self._pluginRows)
+
+        btnRow = QHBoxLayout()
+        btnRow.setSpacing(8)
+        rescan = QPushButton("重新扫描并装载")
+        rescan.clicked.connect(self._onRescanPlugins)
+        btnRow.addWidget(rescan)
+        btnRow.addStretch()
+        layout.addLayout(btnRow)
+        layout.addStretch()
+
+        self._refreshPluginRows()
+        return page
+
+    def _refreshPluginRows(self) -> None:
+        pm = self._pluginManager
+        if pm is None:
+            return
+        while self._pluginRowsLayout.count():
+            item = self._pluginRowsLayout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for info in pm.infos():
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            chk = QCheckBox(f"{info.name}  v{info.version}")
+            chk.setChecked(info.enabled)
+            chk.toggled.connect(lambda on, i=info.pluginId: self._onPluginEnabled(i, on))
+            rl.addWidget(chk)
+            statusColor = {"已装载": "#27ae60", "出错": "#e74c3c"}.get(info.status, "#999")
+            st = QLabel(f"[{info.status}]" + (f" {info.error}" if info.error else ""))
+            st.setStyleSheet(f"color: {statusColor}; font-size: 11px;")
+            rl.addWidget(st, 1)
+            if info.description:
+                desc = QLabel(info.description)
+                desc.setStyleSheet("color: #888; font-size: 11px;")
+                rl.addWidget(desc, 2)
+            self._pluginRowsLayout.addWidget(row)
+
+    def _onPluginEnabled(self, pluginId: str, on: bool) -> None:
+        if self._pluginManager is not None:
+            self._pluginManager.setEnabled(pluginId, bool(on))
+            self._refreshPluginRows()
+
+    def _onRescanPlugins(self) -> None:
+        if self._pluginManager is not None:
+            self._pluginManager.discover()
+            self._pluginManager.loadAll()
+            self._refreshPluginRows()
 
     def _onFontChanged(self, val: int) -> None:
         theme.FONT_SIZE = val

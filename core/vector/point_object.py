@@ -38,7 +38,10 @@ class PointObject(BaseObject):
         self._x += dx; self._y += dy; self._z += dz
 
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
-        pass
+        """绕原点旋转（rotateAround 先平移到基准点再调此处）：只转位置。"""
+        if (ax, ay, az) == (0, 0, 1):
+            c, s = math.cos(angle), math.sin(angle)
+            self._x, self._y = self._x * c - self._y * s, self._x * s + self._y * c
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
         self._x *= sx; self._y *= sy; self._z *= sz

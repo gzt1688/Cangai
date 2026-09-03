@@ -42,7 +42,12 @@ class CircleObject(BaseObject):
         self._cx += dx; self._cy += dy; self._cz += dz
 
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
-        pass
+        """绕原点旋转（rotateAround 先平移到基准点再调此处）：只转圆心位置，
+        圆周形状旋转不变（与 ImageObject.rotate 同范式）。"""
+        if (ax, ay, az) == (0, 0, 1):
+            c, s = math.cos(angle), math.sin(angle)
+            self._cx, self._cy = (self._cx * c - self._cy * s,
+                                  self._cx * s + self._cy * c)
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
         self._cx *= sx; self._cy *= sy; self._cz *= sz

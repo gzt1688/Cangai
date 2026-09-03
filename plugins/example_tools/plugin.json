@@ -1,0 +1,8 @@
+{
+  "id": "example_tools",
+  "name": "示例工具",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "演示插件 API：注册动作按钮、速建几何、订阅事件、插件设置",
+  "entry": "main.py"
+}

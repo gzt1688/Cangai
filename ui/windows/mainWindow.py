@@ -9,7 +9,8 @@ import math
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                                QStackedWidget, QFileDialog, QMessageBox,
                                QScrollArea)
-from PySide6.QtCore import Qt, QCoreApplication, QTimer, QEvent
+from PySide6.QtCore import (Qt, QCoreApplication, QTimer, QEvent, QObject,
+                            Signal)
 from PySide6.QtGui import QShowEvent, QKeyEvent, QTransform
 
 from PySide6QtAds import (CDockManager, CDockWidget, CDockAreaWidget,
@@ -36,6 +37,9 @@ from ui.commands.concrete.text_command import registerAll as registerText
 from ui.commands.concrete.relief_commands import registerAll as registerRelief
 from ui.commands.concrete.image_command import ImagePlaceCommand
 from ui.commands.concrete.image_trace_command import ImageTraceCommand
+from ui.commands.concrete.plugin_action_command import PluginActionCommand
+from core.api import CangaiAPI
+from core.plugin_manager import PluginManager
 from ui.commands.concrete.dimension_commands import registerAll as registerDims
 from ui.commands.concrete.dimension_commands import TEXT_TO_OBJ_GAP
 from core.vector.dimension_object import DimensionObject
@@ -62,6 +66,26 @@ _SNAP_KEY_MAP = {
     "perpendicular": SnapType.PERPENDICULAR, "tangent": SnapType.TANGENT,
     "quarter": SnapType.QUARTER, "vertex": SnapType.VERTEX,
 }
+
+
+class _MainThreadInvoker(QObject):
+    """工作线程 → 主线程任务投递（跨线程信号自动排队到宿主所在线程）。
+    插件/AI 的工作线程经 api.runOnMainThread(fn) 安全改动 Qt 界面。"""
+    taskQueued = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.taskQueued.connect(self._run)
+
+    def post(self, fn) -> None:
+        self.taskQueued.emit(fn)
+
+    def _run(self, fn) -> None:
+        try:
+            fn()
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
 
 class MainWindow(QMainWindow):
@@ -129,6 +153,16 @@ class MainWindow(QMainWindow):
         self._autosaveTimer.timeout.connect(self._onAutosaveTimeout)
         self._restartAutosaveTimer()
 
+        # 开放平台：API 门面 + 插件装载（UI 就绪后挂宿主，插件按钮/命令即刻生效）
+        self._api = CangaiAPI()
+        self._mainThreadInvoker = _MainThreadInvoker(self)
+        self._plugins = PluginManager(self._api)
+        self._api.attachHost(self)
+        self._plugins.discover()
+        self._plugins.loadAll()
+        self._api.events.emit("app.ready", {
+            "plugins": [p.pluginId for p in self._plugins.infos() if p.loaded]})
+
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         if not getattr(self, "_dockAdjusted", False):
@@ -181,6 +215,77 @@ class MainWindow(QMainWindow):
         sizes[index] = target
         splitter.setSizes(sizes)
 
+
+    # ---------------- 开放平台：API 宿主钩子（协议见 core/api.py） ----------------
+
+    def registerActionCommand(self, name: str, fn, meta: dict) -> None:
+        """插件瞬时动作 → 包装成命令进入命令系统（撤销分组/历史/重复执行）。"""
+        self._cm.register(name, lambda: PluginActionCommand(name, fn, meta), meta)
+
+    def registerInteractiveCommand(self, name: str, factory, meta: dict) -> None:
+        self._cm.register(name, factory, meta)
+
+    def unregisterCommand(self, name: str) -> None:
+        self._cm.unregister(name)
+
+    def commandMetaList(self) -> list:
+        """全部内置+插件命令的元数据清单（API 命令清单数据源）。"""
+        return self._cm.listCommands()
+
+    def addToolButton(self, spec) -> None:
+        self._topDock.addToolButton(spec.group, spec.key, spec.label,
+                                    spec.tooltip, spec.icon,
+                                    pluginId=spec.pluginId)
+
+    def removeToolButtons(self, keys) -> int:
+        return self._topDock.removeToolButtons(keys)
+
+    def notify(self, text: str) -> None:
+        self._cm.notifyResult(text)
+
+    def setStatus(self, text: str, timeoutMs: int = 4000) -> None:
+        self._statusBar.showMessage(text, timeoutMs)
+
+    def appendHistory(self, text: str) -> None:
+        self._topDock.appendHistory(text)
+
+    def executeCommand(self, name: str, *args) -> bool:
+        if self._cm.hasActive():
+            return False
+        ok = self._cm.executeCommand(name, *args)
+        if ok:
+            self._topDock.appendHistory(f"执行: {name}")
+        return ok
+
+    def cancelActiveCommand(self) -> None:
+        if self._cm.hasActive():
+            self._cm.cancelActive()
+
+    def activeDocument(self):
+        return self._doc
+
+    def documents(self) -> list:
+        return list(self._openDocs)
+
+    def openDocument(self, path: str):
+        self._newDocument(path)
+        return self._doc
+
+    def newDocument(self):
+        self._newDocument()
+        return self._doc
+
+    def wireApiEvents(self, bus) -> None:
+        """把命令生命周期与当前文档信号接入事件总线（文档切换时经
+        relayDocumentEvents 重绑）。"""
+        self._cm.commandFinished.connect(
+            lambda name: bus.emit("command.finished", name))
+        self._cm.activeCommandChanged.connect(
+            lambda name: bus.emit("command.started" if name else "command.ended", name))
+        self._api.relayDocumentEvents(self._doc)
+
+    def runOnMainThread(self, fn) -> None:
+        self._mainThreadInvoker.post(fn)
 
     def _setupGizmo(self) -> None:
         """操作轴（复刻原项目）：选中对象后显示，拖动移动/旋转/缩放；
@@ -1021,7 +1126,7 @@ class MainWindow(QMainWindow):
         self._viewport3D.update()
 
     def _onShowSettings(self) -> None:
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(self, self._plugins)
         dlg.appearanceChanged.connect(self._refreshStyle)
         dlg.gridVisibleChanged.connect(self._scene.setGridVisible)
         dlg.axisVisibleChanged.connect(self._scene.setAxisVisible)
@@ -1103,6 +1208,9 @@ class MainWindow(QMainWindow):
         quickBar.setRedoEnabled(doc.canCurveRedo())
         quickBar.setReliefUndoEnabled(doc.canReliefUndo())
         quickBar.setReliefRedoEnabled(doc.canReliefRedo())
+        # 开放平台：把当前文档信号接入 API 事件总线（多文件切换自动重绑）
+        if getattr(self, "_api", None) is not None:
+            self._api.relayDocumentEvents(doc)
         self._boundDoc = doc
 
     def _onDocDirtyChanged(self, dirty: bool) -> None:

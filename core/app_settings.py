@@ -88,6 +88,10 @@ autosave_enabled = False
 autosave_interval_min = 5
 backup_on_save = True
 
+# ==================== 插件启停状态 ====================
+# 插件 id → 是否启用（缺省视为启用，用户禁用后记 False，重启保持）。
+plugin_state: dict = {}
+
 
 def max_field_pixels() -> int:
     """当前母场像素上限（每边上限²），供 HeightField.grid_size 钳制用。"""
@@ -114,6 +118,7 @@ def perf_snapshot() -> dict:
         "autosave_enabled": autosave_enabled,
         "autosave_interval_min": autosave_interval_min,
         "backup_on_save": backup_on_save,
+        "plugin_state": dict(plugin_state),
     }
 
 
@@ -134,6 +139,10 @@ def perf_restore(snap: dict) -> None:
     autosave_enabled = bool(snap.get("autosave_enabled", autosave_enabled))
     autosave_interval_min = int(snap.get("autosave_interval_min", autosave_interval_min))
     backup_on_save = bool(snap.get("backup_on_save", backup_on_save))
+    ps = snap.get("plugin_state")
+    if isinstance(ps, dict):
+        plugin_state.clear()
+        plugin_state.update(ps)
 
 
 def system_info() -> dict:
@@ -174,6 +183,7 @@ _PERF_KEYS = (
     "mesh_max_dim_gpu", "mesh_max_dim_cpu", "preview_max_dim",
     "msaa_samples", "async_compute",
     "autosave_enabled", "autosave_interval_min", "backup_on_save",
+    "plugin_state",
 )
 
 

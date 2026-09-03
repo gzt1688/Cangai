@@ -182,6 +182,7 @@ class CangaiAPI:
         if self._fallbackDoc is None:
             self._fallbackDoc = Document()
             self._fallbackDoc.setTitle("无头文档")
+            self.relayDocumentEvents(self._fallbackDoc)   # 无宿主也走事件总线
         return self._fallbackDoc
 
     def documents(self) -> List[Document]:
@@ -336,19 +337,32 @@ class CangaiAPI:
 
     def commandManifest(self) -> List[dict]:
         """输出全部可执行动作/命令的元数据清单——AI 自动化的工具表。
-        字段：name / kind / title / description / group。"""
+        字段：name / kind / title / description / group。
+        含门面注册的插件项与宿主命令系统的内置命令。"""
         out: List[dict] = []
+        seen = set()
         for name, e in self._actions.items():
+            seen.add(name)
             out.append({"name": name, "kind": "action",
                         "title": e.meta.get("title", name),
                         "description": e.meta.get("description", ""),
                         "group": e.meta.get("group", "")})
         for name, e in self._commands.items():
+            seen.add(name)
             m = e["meta"]
             out.append({"name": name, "kind": "command",
                         "title": m.get("title", name),
                         "description": m.get("description", ""),
                         "group": m.get("group", "")})
+        if self._host is not None:
+            for m in self._host.commandMetaList():
+                if m["name"] in seen:
+                    continue
+                seen.add(m["name"])
+                out.append({"name": m["name"], "kind": "command",
+                            "title": m.get("title", m["name"]),
+                            "description": m.get("description", ""),
+                            "group": m.get("group", "")})
         out.sort(key=lambda d: (d["group"], d["name"]))
         return out
 

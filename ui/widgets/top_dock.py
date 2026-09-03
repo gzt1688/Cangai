@@ -92,6 +92,8 @@ class TopDock(QWidget):
         self._toolStack.setFixedHeight(50)
         # 组名 → 该页的 FlowLayout：内置分类用 CATEGORIES 构建，插件组运行时追加
         self._groupFlows: dict = {}
+        # 插件按钮登记：key → (按钮, pluginId)（插件停用时移除）
+        self._pluginButtons: dict = {}
         for name, items in CATEGORIES:
             self._navBar.addTab(name)
             self._toolStack.addWidget(self._buildPage(items, self._groupFlows))
@@ -116,10 +118,10 @@ class TopDock(QWidget):
         return page
 
     def addToolButton(self, group: str, key: str, label: str, tooltip: str = "",
-                      icon: str = "", action=None) -> None:
+                      icon: str = "", action=None, pluginId: str = "") -> None:
         """运行时追加按钮（插件 API 入口）：group 分类页不存在则自动新建标签页。
         action 为 None 时点击发 commandRequested(key)（执行同名命令/动作），
-        否则直接调用 action 回调。"""
+        否则直接调用 action 回调。pluginId 记录归属（插件停用时按它移除）。"""
         group = group or "插件"
         flow = self._groupFlows.get(group)
         if flow is None:
@@ -141,6 +143,21 @@ class TopDock(QWidget):
         else:
             btn.clicked.connect(lambda _=False, k=key: self.commandRequested.emit(k))
         flow.addWidget(btn)
+        self._pluginButtons[key] = (btn, pluginId)
+
+    def removeToolButtons(self, keys) -> int:
+        """移除指定 key 的插件按钮（插件停用时调用），返回移除数。"""
+        removed = 0
+        for key in keys:
+            entry = self._pluginButtons.pop(key, None)
+            if entry is None:
+                continue
+            btn, _pid = entry
+            btn.parentWidget().layout().removeWidget(btn)
+            btn.hide()
+            btn.deleteLater()
+            removed += 1
+        return removed
 
     def refreshStyle(self) -> None:
         """按全局字体大小等比放大导航标签字体与宽度（设置改字体时调用）。"""

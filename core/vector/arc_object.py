@@ -101,7 +101,15 @@ class ArcObject(BaseObject):
         self._cx += dx; self._cy += dy; self._cz += dz
 
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
-        pass
+        """绕原点旋转（rotateAround 先平移到基准点再调此处）：转圆心位置，
+        起止角同步旋转（绕 Z）；三点缓存失效置空。"""
+        if (ax, ay, az) == (0, 0, 1):
+            c, s = math.cos(angle), math.sin(angle)
+            self._cx, self._cy = (self._cx * c - self._cy * s,
+                                  self._cx * s + self._cy * c)
+            self._startAngle += angle
+            self._endAngle += angle
+            self._p1 = self._p2 = self._p3 = None
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
         self._cx *= sx; self._cy *= sy; self._cz *= sz
