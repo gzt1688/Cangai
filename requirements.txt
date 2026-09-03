@@ -1,0 +1,13 @@
+# Cangai-Relief 运行时依赖
+# 环境基线：Python 3.12.x（moderngl/glcontext 在 3.13+/3.14 无稳定 wheel，勿升级基线）
+PySide6==6.11.1
+PySide6-QtAds==5.0.0.2
+numpy==2.5.2
+moderngl==5.12.0
+glcontext==3.0.0
+
+# 可选：NURBS/样条高精度求值（spline_utils 中延迟导入，不装也能运行）
+scipy==1.18.1
+
+# 文字功能：TTF/OTF 字体解析（字形轮廓提取）
+fonttools==4.59.2

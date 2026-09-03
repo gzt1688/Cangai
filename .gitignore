@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 运行期产物
+*.log
+crash.log
+
+# 调试/临时脚本与截图（下划线开头的本地试验产物）
+_*.png
+_dbg*.py
+_t_*.py
+_test_*.png
+
+# 编辑器
+.vscode/
+.idea/

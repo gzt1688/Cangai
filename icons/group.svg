@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <defs>
+    <mask id="gap">
+      <rect width="24" height="24" fill="#ffffff"/>
+      <path d="M 11.3636 12.3082 A 5.5200 5.5200 0 0 1 7.4612 9.9666
+               M 12.0001 13.5295 A 5.5200 5.5200 0 0 1 12.0001 17.3705
+               M 16.5388 9.9666 A 5.5200 5.5200 0 0 1 12.6364 12.3082"
+            fill="none" stroke="#000000" stroke-width="1" stroke-linecap="round"/>
+    </mask>
+  </defs>
+  <g mask="url(#gap)" fill="#ffffff">
+    <circle cx="12" cy="6.825" r="5.52"/>
+    <circle cx="6.825" cy="15.45" r="5.52"/>
+    <circle cx="17.175" cy="15.45" r="5.52"/>
+  </g>
+</svg>
