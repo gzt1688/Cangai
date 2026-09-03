@@ -30,6 +30,8 @@ class SettingsDialog(QDialog):
         self.setMinimumSize(560, 480)
         self.setStyleSheet(f"background: {theme.BG_PANEL};")
 
+        self._renderDirty = False   # 渲染性能页有改动（应用/确认时才广播）
+        self._dimDirty = False      # 标注样式页有改动（应用/确认时才广播）
         self._snapshot = self._takeSnapshot()
 
         root = QVBoxLayout(self)
@@ -100,6 +102,9 @@ class SettingsDialog(QDialog):
             "file_save_slots": copy.deepcopy(app_settings.file_save_slots),
             "PRIMARY": theme.PRIMARY,
             "FONT_SIZE": theme.FONT_SIZE,
+            "QUICK_GROUP_COLORS": list(theme.QUICK_GROUP_COLORS),
+            "SELECTION_CURVE": theme.SELECTION_CURVE,
+            "SELECTION_MESH": theme.SELECTION_MESH,
             "perf": app_settings.perf_snapshot(),
             "dim_font": app_settings.dim_font,
             "dim_text_px": app_settings.dim_text_px,
@@ -115,28 +120,47 @@ class SettingsDialog(QDialog):
         app_settings.file_save_slots = s["file_save_slots"]
         theme.PRIMARY = s["PRIMARY"]
         theme.FONT_SIZE = s["FONT_SIZE"]
+        # 原地写回：其他模块可能持有列表引用
+        theme.QUICK_GROUP_COLORS[:] = s["QUICK_GROUP_COLORS"]
+        theme.SELECTION_CURVE = s["SELECTION_CURVE"]
+        theme.SELECTION_MESH = s["SELECTION_MESH"]
         app_settings.perf_restore(s.get("perf", {}))
         app_settings.dim_font = s.get("dim_font", app_settings.dim_font)
         app_settings.dim_text_px = s.get("dim_text_px", app_settings.dim_text_px)
         app_settings.dim_unit = s.get("dim_unit", app_settings.dim_unit)
 
+    # ---- 类别脏判定：应用/确认只对实际改动的类别发信号，避免全量广播 ----
+
+    def _appearanceDirty(self) -> bool:
+        s = self._snapshot
+        return (theme.PRIMARY != s["PRIMARY"]
+                or theme.FONT_SIZE != s["FONT_SIZE"]
+                or list(theme.QUICK_GROUP_COLORS) != list(s["QUICK_GROUP_COLORS"])
+                or theme.SELECTION_CURVE != s["SELECTION_CURVE"]
+                or theme.SELECTION_MESH != s["SELECTION_MESH"])
+
+    def _fileSlotsDirty(self) -> bool:
+        return app_settings.file_save_slots != self._snapshot["file_save_slots"]
+
     def _onApply(self) -> None:
         self._saveShortcuts()
         app_settings.save_perf()
-        self.appearanceChanged.emit()
-        self.fileSlotsChanged.emit()
-        self.renderSettingsChanged.emit()
-        self.dimensionSettingsChanged.emit()
+        if self._appearanceDirty():
+            self.appearanceChanged.emit()
+        if self._fileSlotsDirty():
+            self.fileSlotsChanged.emit()
+        if self._renderDirty:
+            self.renderSettingsChanged.emit()
+        if self._dimDirty:
+            self.dimensionSettingsChanged.emit()
 
     def _onOk(self) -> None:
-        self._saveShortcuts()
-        app_settings.save_perf()
-        self.renderSettingsChanged.emit()
-        self.dimensionSettingsChanged.emit()
+        self._onApply()
         self.accept()
 
     def _onCancel(self) -> None:
         self._restoreSnapshot()
+        # 回滚是低频路径：全量广播保证各处按快照状态刷新
         self.appearanceChanged.emit()
         self.fileSlotsChanged.emit()
         self.renderSettingsChanged.emit()
@@ -367,6 +391,7 @@ class SettingsDialog(QDialog):
     # ---- 渲染性能页回调 ----
     def _onGpuToggled(self, on: bool) -> None:
         app_settings.gpu_accelerated = bool(on)
+        self._renderDirty = True
         self.renderSettingsChanged.emit()
 
     def _onAsyncToggled(self, on: bool) -> None:
@@ -374,21 +399,26 @@ class SettingsDialog(QDialog):
 
     def _onMsaaChanged(self, _idx: int) -> None:
         app_settings.msaa_samples = int(self._msaaCombo.currentData())
+        self._renderDirty = True
 
     def _onMeshGpuChanged(self, v: int) -> None:
         app_settings.mesh_max_dim_gpu = int(v)
+        self._renderDirty = True
         self.renderSettingsChanged.emit()
 
     def _onMeshCpuChanged(self, v: int) -> None:
         app_settings.mesh_max_dim_cpu = int(v)
+        self._renderDirty = True
         self.renderSettingsChanged.emit()
 
     def _onPreviewDimChanged(self, v: int) -> None:
         app_settings.preview_max_dim = int(v)
+        self._renderDirty = True
         self.renderSettingsChanged.emit()
 
     def _onFieldSideChanged(self, v: int) -> None:
         app_settings.max_field_pixels_side = int(v)
+        self._renderDirty = True
         self._updateFieldSideHint(int(v))
         self.renderSettingsChanged.emit()
 
@@ -476,7 +506,8 @@ class SettingsDialog(QDialog):
         self._dimUnitEdit.setPlaceholderText("mm")
         self._dimUnitEdit.setToolTip(
             "读数数字后附加的单位（如 mm/cm/in；留空则不显示）")
-        self._dimUnitEdit.textChanged.connect(self._onDimUnitChanged)
+        self._dimUnitEdit.textEdited.connect(self._onDimUnitChanged)
+        self._dimUnitEdit.editingFinished.connect(self.dimensionSettingsChanged.emit)
         fd.addRow("数值单位:", self._dimUnitEdit)
 
         dimHint = QLabel("字体与单位即时作用于全部标注；文字大小仅影响新建标注，\n"
@@ -503,14 +534,17 @@ class SettingsDialog(QDialog):
 
     def _onDimFontChanged(self, font) -> None:
         app_settings.dim_font = font.family()
+        self._dimDirty = True
         self.dimensionSettingsChanged.emit()
 
     def _onDimTextPxChanged(self, v: float) -> None:
         app_settings.dim_text_px = float(v)
+        self._dimDirty = True
 
     def _onDimUnitChanged(self, text: str) -> None:
+        # 打字过程中只写值不广播（每字符全场景重绘代价高），编辑结束才发信号
         app_settings.dim_unit = text.strip()
-        self.dimensionSettingsChanged.emit()
+        self._dimDirty = True
 
     def _buildKeyboardPage(self) -> QWidget:
         from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
@@ -641,14 +675,23 @@ class SettingsDialog(QDialog):
         form = QFormLayout(box)
         form.setSpacing(6)
         self._autosaveCheck = QCheckBox("启用自动保存")
+        self._autosaveCheck.setChecked(bool(app_settings.autosave_enabled))
+        self._autosaveCheck.setToolTip(
+            "开启后每隔设定时间，把“有文件路径且未保存”的文档自动另存为\n"
+            "同目录下 <文件名>.cai.autosave 恢复副本（不改变未保存标记）")
+        self._autosaveCheck.toggled.connect(self._onAutosaveToggled)
         form.addRow(self._autosaveCheck)
         self._intervalSpin = QSpinBox()
         self._intervalSpin.setRange(1, 60)
-        self._intervalSpin.setValue(5)
+        self._intervalSpin.setValue(int(app_settings.autosave_interval_min))
         self._intervalSpin.setSuffix(" 分钟")
+        self._intervalSpin.valueChanged.connect(self._onAutosaveIntervalChanged)
         form.addRow("保存间隔:", self._intervalSpin)
         self._backupCheck = QCheckBox("保存时创建备份")
-        self._backupCheck.setChecked(True)
+        self._backupCheck.setChecked(bool(app_settings.backup_on_save))
+        self._backupCheck.setToolTip(
+            "保存覆盖已有文件前，先把原文件复制为 <文件名>.cai.bak")
+        self._backupCheck.toggled.connect(self._onBackupToggled)
         form.addRow(self._backupCheck)
         layout.addWidget(box)
 
@@ -670,7 +713,8 @@ class SettingsDialog(QDialog):
             nameEdit = QLineEdit(slot["name"])
             nameEdit.setFixedWidth(80)
             nameEdit.setPlaceholderText("名称")
-            nameEdit.textChanged.connect(lambda t, idx=i: self._onSlotNameChanged(idx, t))
+            nameEdit.textEdited.connect(lambda t, idx=i: self._onSlotNameChanged(idx, t))
+            nameEdit.editingFinished.connect(self.fileSlotsChanged.emit)
             self._slotNameEdits.append(nameEdit)
             row.addWidget(nameEdit)
             edit = QLineEdit(slot["path"])
@@ -687,13 +731,23 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return page
 
+    # ---- 文件页回调（自动保存 / 备份 / 保存槽） ----
+    def _onAutosaveToggled(self, on: bool) -> None:
+        app_settings.autosave_enabled = bool(on)
+
+    def _onAutosaveIntervalChanged(self, v: int) -> None:
+        app_settings.autosave_interval_min = int(v)
+
+    def _onBackupToggled(self, on: bool) -> None:
+        app_settings.backup_on_save = bool(on)
+
     def _onSlotEnabled(self, idx: int, on: bool) -> None:
         app_settings.file_save_slots[idx]["enabled"] = on
         self.fileSlotsChanged.emit()
 
     def _onSlotNameChanged(self, idx: int, text: str) -> None:
+        # 打字过程中只写值不广播（每字符全量重建保存面板代价高），编辑结束才发信号
         app_settings.file_save_slots[idx]["name"] = text
-        self.fileSlotsChanged.emit()
 
     def _onSlotPathChanged(self, idx: int, text: str) -> None:
         app_settings.file_save_slots[idx]["path"] = text
@@ -755,33 +809,22 @@ class SettingsDialog(QDialog):
 
 
     def _pickSelectionColor(self, key: str) -> None:
-        from PySide6.QtGui import QColor
         if key == "curve":
             current = theme.SELECTION_CURVE
+            btn = self._selCurveBtn
         else:
             current = theme.SELECTION_MESH
-        dlg = QColorDialog(QColor(current), self)
-        dlg.setStyleSheet(
-            "QDialog { background: white; }"
-            "QPushButton { background: #e6e6e6; color: #333; border: 1px solid #ccc;"
-            " padding: 4px 14px; min-height: 22px; border-radius: 2px; }"
-            "QPushButton:hover { background: #d0d0d0; }"
-            "QPushButton:pressed { background: #b0b0b0; }"
-        )
-        if dlg.exec() == QDialog.Accepted:
-            c = dlg.currentColor()
-            if c.isValid():
-                if key == "curve":
-                    theme.SELECTION_CURVE = c.name()
-                    self._selCurveBtn.setStyleSheet(
-                        f"background: {c.name()}; border: 1px solid #999; border-radius: 2px;"
-                    )
-                else:
-                    theme.SELECTION_MESH = c.name()
-                    self._selMeshBtn.setStyleSheet(
-                        f"background: {c.name()}; border: 1px solid #999; border-radius: 2px;"
-                    )
-                self.appearanceChanged.emit()
+            btn = self._selMeshBtn
+        c = self._openColorDialog(current)
+        if c is not None:
+            if key == "curve":
+                theme.SELECTION_CURVE = c
+            else:
+                theme.SELECTION_MESH = c
+            btn.setStyleSheet(
+                f"background: {c}; border: 1px solid #999; border-radius: 2px;"
+            )
+            self.appearanceChanged.emit()
 
     def _onColorPreset(self, btn) -> None:
         idx = self._colorGroup.id(btn)
@@ -790,29 +833,19 @@ class SettingsDialog(QDialog):
             self.appearanceChanged.emit()
 
     def _pickColor(self) -> None:
-        from PySide6.QtGui import QColor
-        dlg = QColorDialog(QColor(theme.PRIMARY), self)
-        dlg.setStyleSheet(
-            "QDialog { background: white; }"
-            "QPushButton { background: #e6e6e6; color: #333; border: 1px solid #ccc;"
-            " padding: 4px 14px; min-height: 22px; border-radius: 2px; }"
-            "QPushButton:hover { background: #d0d0d0; }"
-            "QPushButton:pressed { background: #b0b0b0; }"
-        )
-        if dlg.exec() == QDialog.Accepted:
-            c = dlg.currentColor()
-            if c.isValid():
-                theme.PRIMARY = c.name()
-                self._customColorBtn.setStyleSheet(
-                    f"background: {c.name()}; border: 1px solid #999; border-radius: 2px;"
-                )
-                self._customColorRb.setStyleSheet(
-                    "QRadioButton::indicator { width: 18px; height: 18px;"
-                    " border-radius: 9px; border: 2px solid #999;"
-                    f" background: {c.name()}; }}"
-                    "QRadioButton::indicator:checked { border: 2px solid #333; }"
-                )
-                self.appearanceChanged.emit()
+        c = self._openColorDialog(theme.PRIMARY)
+        if c is not None:
+            theme.PRIMARY = c
+            self._customColorBtn.setStyleSheet(
+                f"background: {c}; border: 1px solid #999; border-radius: 2px;"
+            )
+            self._customColorRb.setStyleSheet(
+                "QRadioButton::indicator { width: 18px; height: 18px;"
+                " border-radius: 9px; border: 2px solid #999;"
+                f" background: {c}; }}"
+                "QRadioButton::indicator:checked { border: 2px solid #333; }"
+            )
+            self.appearanceChanged.emit()
 
 
 _DEFAULT_SHORTCUTS = [

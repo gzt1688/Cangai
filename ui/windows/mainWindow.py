@@ -124,6 +124,11 @@ class MainWindow(QMainWindow):
         self._statusBar.setLengthArea(0.0, 0.0)
         self._updateFileTabs()   # 初始标签：未命名1
 
+        # 自动保存定时器（设置-文件页开启后按间隔把未保存文档另存恢复副本）
+        self._autosaveTimer = QTimer(self)
+        self._autosaveTimer.timeout.connect(self._onAutosaveTimeout)
+        self._restartAutosaveTimer()
+
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         if not getattr(self, "_dockAdjusted", False):
@@ -1025,6 +1030,34 @@ class MainWindow(QMainWindow):
         # 标注样式（字体/单位）变化：重绘场景让已有标注立即采用新样式
         dlg.dimensionSettingsChanged.connect(self._scene.update)
         dlg.exec()
+        dlg.deleteLater()   # 用完即弃：避免控件树与信号连接随打开次数累积
+        # 文件页设置（自动保存开关/间隔）可能已改变：按新设置重启自动保存定时器
+        self._restartAutosaveTimer()
+
+    def _restartAutosaveTimer(self) -> None:
+        """按文件页设置启动/重启自动保存定时器（未启用则停止）。"""
+        if not hasattr(self, "_autosaveTimer"):
+            return
+        if getattr(app_settings, "autosave_enabled", False):
+            interval = max(1, int(getattr(app_settings, "autosave_interval_min", 5)))
+            self._autosaveTimer.start(interval * 60 * 1000)
+        else:
+            self._autosaveTimer.stop()
+
+    def _onAutosaveTimeout(self) -> None:
+        """自动保存：把“有文件路径且未保存”的文档另存恢复副本。
+
+        副本写到原文件旁的 <文件名>.cai.autosave，不改动文档的未保存标记；
+        原文件保存（_saveTo）成功后删除对应恢复副本。
+        """
+        import os
+        for d in self._openDocs:
+            if not d.isDirty() or not d.filePath():
+                continue
+            try:
+                d.save(d.filePath() + ".autosave")
+            except Exception:
+                continue
 
     def _onRenderSettingsChanged(self) -> None:
         """渲染性能设置变更：3D 视口重建缓存/切换 GPU 路径，并刷新 2D 预览。"""
@@ -1133,6 +1166,31 @@ class MainWindow(QMainWindow):
         self._layerPanel.refreshLater()
         self._updateFileTabs()
         self._topDock.appendHistory(f"切换文件: {self._doc.title()}")
+
+    def closeEvent(self, event) -> None:
+        """关闭软件前检查：有非空且未保存的文档时弹窗提示。
+        - 保存全部：逐个保存（无路径弹另存为），任一取消/失败则中止退出；
+        - 不保存：直接退出，放弃修改；
+        - 取消：返回软件。"""
+        dirty = [d for d in self._openDocs if d.isDirty() and not d.isEmpty()]
+        if not dirty:
+            event.accept()
+            return
+        names = "\n".join(f"  • {d.title()}" for d in dirty)
+        ret = QMessageBox.question(
+            self, "未保存的修改",
+            f"以下 {len(dirty)} 个文件有未保存的修改：\n{names}\n\n"
+            f"是否在退出前保存？",
+            QMessageBox.SaveAll | QMessageBox.Discard | QMessageBox.Cancel)
+        if ret == QMessageBox.Cancel:
+            event.ignore()
+            return
+        if ret == QMessageBox.SaveAll:
+            for d in dirty:
+                if not self._saveDoc(d):
+                    event.ignore()   # 另存为被取消或保存失败：中止退出
+                    return
+        event.accept()
 
     def _closeDocument(self, index: int) -> None:
         """关闭标签：未保存先确认；全部关闭后回到新的未命名文档。
@@ -1270,9 +1328,24 @@ class MainWindow(QMainWindow):
         self._saveTo(path)
 
     def _saveTo(self, path: str) -> None:
+        import os
+        import shutil
+        # 保存前备份：覆盖已有文件前先复制 <文件名>.bak（设置-文件页可关）
+        if getattr(app_settings, "backup_on_save", True) and os.path.exists(path):
+            try:
+                shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
         try:
             self._doc.save(path)
             self._doc.setFilePath(path)
+            # 落盘成功即删除对应的自动保存恢复副本
+            autosave = path + ".autosave"
+            if os.path.exists(autosave):
+                try:
+                    os.remove(autosave)
+                except OSError:
+                    pass
             self._notifyTip(f"已保存: {path}")
             self._updateFileTabs()
         except Exception as e:

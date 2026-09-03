@@ -107,5 +107,7 @@ class FileTabBar(QWidget):
         # 最后一个空文档不可关闭：禁用该项（灰色不可点）
         if index < 0 or index >= len(self._closable) or not self._closable[index]:
             act.setEnabled(False)
-        if menu.exec(globalPos) is act:
+        chosen = menu.exec(globalPos)
+        menu.deleteLater()   # 用完即销毁：避免每次右键累积一个 QMenu
+        if chosen is act:
             self.closeRequested.emit(index)
