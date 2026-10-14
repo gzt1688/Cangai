@@ -223,19 +223,41 @@ def mask_contours(mask: np.ndarray, hf, simplify_mm: float = 0.02
                 4: (top, right),      # 仅 tr
                 5: (top, bottom),     # 左边两点（竖切）
                 6: (top, bottom),     # 右边两点（竖切）
-                7: (top, left),       # 切 tl 角
+                7: (top, left),       # 切 tl 角（仅缺 tl）
                 8: (top, left),       # 仅 tl
                 9: (top, bottom),     # 左边两点（竖切）
                 10: (left, right),    # 对角线 → 横切
-                11: (bottom, right),  # 切 br 角
+                11: (top, right),     # 切 tr 角（仅缺 tr）
                 12: (left, right),    # 上边两点（横切）
-                13: (bottom, right),  # 切 br 角
-                14: (left, bottom),   # 切 bl 角
+                13: (bottom, right),  # 切 br 角（仅缺 br）
+                14: (left, bottom),   # 切 bl 角（仅缺 bl）
             }[code]
             segs.append(pairs)
     if not segs:
         return []
-    # 缝合：端点字典（量化到 1e-6）
+    loops = _stitch_segments(segs)
+    # 栅格浮点 → 世界坐标（衬边偏移 -1），可选简化
+    ox, oy = hf.origin
+    sp = float(hf.spacing)
+    out: List[np.ndarray] = []
+    for pts in loops:
+        arr = np.array([(ox + (p[0] - 1.0) * sp, oy + (p[1] - 1.0) * sp)
+                        for p in pts], dtype=np.float64)
+        if simplify_mm > 0 and len(arr) > 4:
+            arr = _decimate(arr, simplify_mm)
+        if len(arr) >= 3:
+            out.append(arr)
+    return out
+
+
+def _stitch_segments(
+        segs: List[Tuple[Tuple[float, float], Tuple[float, float]]]
+) -> List[List[Tuple[float, float]]]:
+    """把等值线段按端点（量化 1e-6）缝合进闭合环。
+
+    端点互不重合的段（如插值 marching squares 的鞍点分裂）各自成环，
+    不会把相邻两个环粘连成自交多边形。
+    """
     adj: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
     for a, b in segs:
         ka = (round(a[0] * 1e6), round(a[1] * 1e6))
@@ -268,31 +290,167 @@ def mask_contours(mask: np.ndarray, hf, simplify_mm: float = 0.02
         if len(chain) >= 8 and chain[0] == chain[-1]:
             pts = [(p[0] / 1e6, p[1] / 1e6) for p in chain[:-1]]
             loops.append(pts)
-    # 栅格浮点 → 世界坐标（衬边偏移 -1），可选简化
+    return loops
+
+
+def _decimate(poly: np.ndarray, tol: float) -> np.ndarray:
+    """弦高容差抽稀：合并中间点，保证每个被删点到其所在弦的垂距 ≤ tol。
+
+    与"逐点三点垂距"贪心不同，弦高约束给整条折线的几何偏差一个硬上界
+    （三点垂距版在大半径圆弧上会合并出弦高远超 tol 的长弦，放大视图
+    下呈现为多边形）。
+    """
+    n = len(poly)
+    if n < 3:
+        return poly
+    closed = float(np.hypot(*(poly[0] - poly[-1]))) < 1e-9
+    work = np.vstack([poly[:-1], poly[0]]) if closed else poly
+    m = len(work)
+    keep = [0]
+    i = 0
+    while i < m - 1:
+        last = i + 1
+        j = i + 2
+        while j < m:
+            a = work[i]
+            ab = work[j] - a
+            L = float(np.hypot(*ab))
+            mid = work[i + 1:j]
+            if L > 1e-12 and mid.size:
+                d = np.abs(ab[0] * (mid[:, 1] - a[1])
+                           - ab[1] * (mid[:, 0] - a[0])) / L
+                if d.max() <= tol:
+                    last = j
+                    j += 1
+                    continue
+            break
+        keep.append(last)
+        i = last
+        if i >= m - 1:
+            break
+    out = work[keep]
+    if closed and len(out) > 1:
+        out = out[:-1]                    # 去掉显式闭合尾点
+    return out
+
+
+def field_contours(field: np.ndarray, hf, level: float,
+                   simplify_mm: float = 0.02) -> List[np.ndarray]:
+    """标量场等值线（插值 marching squares）→ 世界坐标闭合折线列表。
+
+    与"先阈值成布尔掩码再 :func:`mask_contours`"相比的优势：
+      1. 线性插值取交点，亚格子精度——粗网格模型上的圆不会退化成
+         少数顶点的多边形（布尔掩码 + 边中点在粗网格下正是如此）；
+      2. 鞍点单元（对角双进双出）按四角均值分裂为两段独立小环，
+         两个相邻等值环不再共顶点粘连成自交多边形（"8"字穿插）。
+
+    field 与 hf.data 同形状（行=y、列=x），level 语义与
+    ``field >= level`` 一致；返回每条折线 (N,2) float64 世界坐标。
+    """
+    f = np.asarray(field, dtype=np.float64)
+    if f.ndim != 2 or f.size == 0:
+        return []
+    ny, nx = f.shape
+    inside = f >= float(level)
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    lvl = float(level)
+
+    def _hpt(r: int, c: int) -> Tuple[float, float]:
+        """行 r 上 c~c+1 横边交点（格坐标 x=c+t, y=r）。"""
+        v0, v1 = f[r, c], f[r, c + 1]
+        t = 0.5 if v1 == v0 else (lvl - v0) / (v1 - v0)
+        return (c + float(np.clip(t, 0.0, 1.0)), float(r))
+
+    def _vpt(r: int, c: int) -> Tuple[float, float]:
+        """列 c 上 r~r+1 竖边交点（格坐标 x=c, y=r+t）。"""
+        v0, v1 = f[r, c], f[r + 1, c]
+        t = 0.5 if v1 == v0 else (lvl - v0) / (v1 - v0)
+        return (float(c), r + float(np.clip(t, 0.0, 1.0)))
+
+    for r in range(ny - 1):
+        rt = inside[r]                # 上行（row r）
+        rb = inside[r + 1]            # 下行（row r+1）
+        ft = f[r]
+        fb = f[r + 1]
+        for c in range(nx - 1):
+            tl = bool(rt[c]); tr = bool(rt[c + 1])
+            bl = bool(rb[c]); br = bool(rb[c + 1])
+            code = (tl << 3) | (tr << 2) | (br << 1) | bl
+            if code == 0 or code == 15:
+                continue
+            T = _hpt(r, c)            # top 边（tl-tr）
+            B = _hpt(r + 1, c)        # bottom 边（bl-br）
+            L = _vpt(r, c)            # left 边（tl-bl）
+            R = _vpt(r, c + 1)        # right 边（tr-br）
+            if code == 5 or code == 10:
+                # 鞍点：按四角均值决定连接方式，两段各自独立成环
+                ctr = 0.25 * (ft[c] + ft[c + 1] + fb[c + 1] + fb[c])
+                if (code == 5 and ctr >= lvl) or \
+                        (code == 10 and ctr < lvl):
+                    # tr-bl（5）/ tl-br（10）内部连通：切掉外侧两角
+                    segs.append((T, L))
+                    segs.append((B, R))
+                else:
+                    # 对角两 blob 分离：切掉内侧两角
+                    segs.append((T, R))
+                    segs.append((B, L))
+                continue
+            pairs = {
+                1: (L, B),            # 仅 bl
+                2: (B, R),            # 仅 br
+                3: (L, R),            # 下边两点
+                4: (T, R),            # 仅 tr
+                6: (T, B),            # 右边两点（竖切）
+                7: (T, L),            # 仅缺 tl
+                8: (T, L),            # 仅 tl
+                9: (T, B),            # 左边两点（竖切）
+                11: (T, R),           # 仅缺 tr
+                12: (L, R),           # 上边两点（横切）
+                13: (B, R),           # 仅缺 br
+                14: (L, B),           # 仅缺 bl
+            }[code]
+            segs.append(pairs)
+    if not segs:
+        return []
+    loops = _stitch_segments(segs)
     ox, oy = hf.origin
     sp = float(hf.spacing)
     out: List[np.ndarray] = []
     for pts in loops:
-        arr = np.array([(ox + (p[0] - 1.0) * sp, oy + (p[1] - 1.0) * sp)
-                        for p in pts], dtype=np.float64)
+        arr = np.array([(ox + p[0] * sp, oy + p[1] * sp) for p in pts],
+                       dtype=np.float64)
         if simplify_mm > 0 and len(arr) > 4:
             arr = _decimate(arr, simplify_mm)
+        # 抽稀在大半径圆弧上会把顶点间隔拉到数毫米（弦高偏差远超
+        # tol），渲染直线连接后放大即是"多边形"。按弧长上限补点，
+        # 保证光滑等值线的折线密度（弦高偏差 < 0.01mm 量级）。
+        if len(arr) >= 3:
+            perim = float(np.hypot(*(arr - np.roll(arr, -1, axis=0)).T).sum())
+            max_gap = max(0.3, min(1.0, perim / 144.0))
+            arr = _densify(arr, max_gap)
         if len(arr) >= 3:
             out.append(arr)
     return out
 
 
-def _decimate(poly: np.ndarray, tol: float) -> np.ndarray:
-    """轻量抽稀：移除共线（垂距 < tol）的中间点，保首尾。"""
-    keep = [0]
-    for i in range(1, len(poly) - 1):
-        a, b, c = poly[keep[-1]], poly[i], poly[i + 1]
-        ab, ac = b - a, c - a
-        L = np.hypot(*ac)
-        if L < 1e-12:
+def _densify(poly: np.ndarray, max_gap: float) -> np.ndarray:
+    """按弧长上限补点：相邻点距超过 max_gap 的段线性插值加密（闭环）。"""
+    closed = np.hypot(*(poly[0] - poly[-1])) < 1e-9
+    if closed and len(poly) > 1:
+        pts = np.vstack([poly[:-1], poly[0]])     # 显式闭合段序列
+    else:
+        pts = poly
+    seg = np.hypot(*(np.diff(pts, axis=0)).T)
+    out = [pts[0]]
+    for i, L in enumerate(seg):
+        if L <= 1e-12:
             continue
-        d = abs(ab[0] * ac[1] - ab[1] * ac[0]) / L
-        if d >= tol:
-            keep.append(i)
-    keep.append(len(poly) - 1)
-    return poly[keep]
+        n = int(np.ceil(L / max_gap))
+        if n > 1:
+            tt = np.linspace(0.0, 1.0, n + 1, endpoint=False)[1:]
+            out.append(pts[i] + tt[:, None] * (pts[i + 1] - pts[i]))
+        out.append(pts[i + 1])
+    arr = np.vstack(out)
+    if closed:
+        arr = arr[:-1]                            # 去掉显式闭合尾点
+    return arr

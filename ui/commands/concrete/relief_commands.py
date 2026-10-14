@@ -29,7 +29,7 @@ import math
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPainterPath
 
 from core.vector.geometry_types import BoundingBox3D, ObjectType, Point3D
@@ -57,8 +57,8 @@ from core.relief.smooth import (apply_smooth_stamp, apply_sweep_smooth,
                                 MODES, MODE_LABELS, STRENGTH_STEP)
 from core.relief.textures import KIND_LABELS, apply_texture
 from core.relief.slope_analysis import (ZONE_COLORS, ZONE_NAMES,
-                                        rest_material_mask, mask_contours,
-                                        slope_zone_masks)
+                                        mask_contours, slope_zone_masks,
+                                        field_contours)
 from core.vector.poly_curve_object import PolyCurveObject
 from core.vector.relief_model_object import ReliefModelObject, _paste_aligned
 from ui.widgets.paint_state import PaintState
@@ -75,8 +75,7 @@ from ..param_panels import (NewModelParamPanel, ReconstructParamPanel,
                             RegionSlopeParamPanel,
                             RevolveSlopeParamPanel,
                             ModelScaleParamPanel,
-                            TextureFillParamPanel, SlopeZoneParamPanel,
-                            RestBoundaryParamPanel)
+                            TextureFillParamPanel, SlopeZoneParamPanel)
 
 
 class NewModelCommand(CommandInstance):
@@ -4824,7 +4823,6 @@ def registerAll(manager) -> None:
     manager.register("ModelScale", ModelScaleCommand)
     manager.register("TextureFill", TextureFillCommand)
     manager.register("SlopeZone", SlopeZoneCommand)
-    manager.register("RestBoundary", RestBoundaryCommand)
 
 
 # ============================================================================
@@ -5308,17 +5306,26 @@ class ImageToModelCommand(CommandInstance):
 class TextureFillCommand(CommandInstance):
     """纹理填充：程序化几何纹理叠加到活动浮雕模型。
 
-    复刻精雕 SurfMill 帮助"几何纹理"章节：随机分形 / 腐蚀 / 编织带 /
-    缠绕结 / 填充图案（六边/砖形/菱形/圆环/点阵）/ 矩形网格 / 表面扰动。
-    交互与区域塑形一致：点击闭合曲线 = 仅该曲线区域内填充；面板
-    "应用到整个模型" = 整模型；每次应用独立 beginEdit/endEdit（可 Ctrl+Z）。
+    复刻精雕 SurfMill 帮助"几何纹理"章节：随机分形 / 编织带 / 缠绕 /
+    填充图案（六边/砖形/菱形/圆环/点阵），共 4 种类型。
+    交互：
+      * 4 种类型均实时预览：调参即预览（不进撤销栈），"确认生成"一次性
+        提交（单步撤销），取消/右键/完成 = 还原模型。
+      * 随机/填充点击闭合曲线 = 该区域内直接应用（应用后成为新预览基准）。
+      * 编织(整面)不选曲线；缠绕(沿曲线)单击组内曲线设定路径后预览。
     """
 
     _PICK_PX = 8.0
+    _PREVIEW_MS = 150
 
     def __init__(self) -> None:
         super().__init__()
         self._panel: TextureFillParamPanel | None = None
+        self._preview_snapshot: np.ndarray | None = None
+        self._preview_model_id: str | None = None
+        self._preview_polys: list | None = None   # 缠绕模式的带中心线
+        self._preview_active = False
+        self._preview_timer: QTimer | None = None
 
     def name(self) -> str:
         return "TextureFill"
@@ -5337,7 +5344,16 @@ class TextureFillCommand(CommandInstance):
             self._panel = TextureFillParamPanel()
             self._panel.applyWhole.connect(self._applyWhole)
             self._panel.finished.connect(self.finish)
+            self._panel.paramsChanged.connect(self._schedulePreview)
+            self._panel.refreshPreview.connect(self._doPreview)
+            self._panel.confirmed.connect(self._confirmPreview)
+            self._panel.cancelled.connect(self._cancelPreview)
         return self._panel
+
+    def finish(self) -> None:
+        # 结束命令时未确认的预览一律回滚
+        self._rollbackPreview(silent=True)
+        super().finish()
 
     def _notify(self, text: str) -> None:
         if self._manager is not None:
@@ -5346,7 +5362,152 @@ class TextureFillCommand(CommandInstance):
             except Exception:
                 pass
 
-    def _apply(self, poly=None) -> None:
+    # ---------------- 实时预览（编织带） ----------------
+
+    def _previewModel(self):
+        return self._doc.activeReliefModel() if self._doc is not None else None
+
+    def _refreshModel(self, model) -> None:
+        model.bumpVersion()
+        try:
+            self._doc.notifyObjectChanged(model.id())
+        except Exception:
+            pass
+
+    def _snapshotEnsure(self, model):
+        """取预览基准快照（首次/换模型时建立）。返回 hf 或 None。"""
+        try:
+            if model.hasPendingTransform():
+                model.bake()
+        except Exception:
+            pass
+        hf = model.heightField()
+        mid = None
+        try:
+            mid = model.id()
+        except Exception:
+            mid = str(id(model))
+        if (self._preview_snapshot is None
+                or self._preview_model_id != mid
+                or self._preview_snapshot.shape != hf.data.shape):
+            self._preview_snapshot = hf.data.copy()
+            self._preview_model_id = mid
+            self._preview_polys = None
+        return hf
+
+    def _schedulePreview(self) -> None:
+        if self._panel is None or self._doc is None:
+            return
+        # 4 种类型均实时预览（缠绕需先点曲线组）
+        if self._preview_timer is None:
+            self._preview_timer = QTimer()
+            self._preview_timer.setSingleShot(True)
+            self._preview_timer.setInterval(self._PREVIEW_MS)
+            self._preview_timer.timeout.connect(self._doPreview)
+        self._preview_timer.start()
+
+    def _doPreview(self) -> None:
+        if self._panel is None or self._doc is None:
+            return
+        params = self._panel.params()
+        model = self._previewModel()
+        if model is None:
+            self._notify("请先选中浮雕模型（纹理预览作用于活动模型）")
+            return
+        hf = self._snapshotEnsure(model)
+        if hf is None:
+            return
+        hf.data[:] = self._preview_snapshot          # 从原始状态重算
+        polys = None
+        if params.kind == "wrap":
+            polys = self._preview_polys
+            if not polys:
+                self._refreshModel(model)
+                self._preview_active = True
+                self._notify("缠绕：单击曲线开始预览"
+                             "（单条自相交或多条编组均可）")
+                return
+        try:
+            n = apply_texture(hf, params,
+                              color_mask=model.colorMask(),
+                              color_value=PaintState.instance().currentValue(),
+                              polys=polys)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._notify(f"纹理预览失败：{e}")
+            return
+        self._preview_active = True
+        self._refreshModel(model)
+        if n > 0:
+            self._notify("预览中…调参实时更新，点“确认生成”完成，"
+                         "“取消”还原")
+
+    def _confirmPreview(self) -> None:
+        if self._panel is None or self._doc is None:
+            return
+        params = self._panel.params()
+        model = self._previewModel()
+        if model is None or self._preview_snapshot is None:
+            self._notify("没有可确认的纹理预览")
+            return
+        hf = self._snapshotEnsure(model)
+        if hf is None:
+            return
+        if params.kind == "wrap" and not self._preview_polys:
+            self._notify("缠绕：请先单击曲线（单条自相交或多条编组均可）")
+            return
+        doc = self._doc
+        hf.data[:] = self._preview_snapshot          # 从原始状态一次性生成
+        polys = self._preview_polys if params.kind == "wrap" else None
+        doc.beginEdit()
+        try:
+            n = apply_texture(hf, params,
+                              color_mask=model.colorMask(),
+                              color_value=PaintState.instance().currentValue(),
+                              polys=polys)
+            if n > 0:
+                self._refreshModel(model)
+                self._notify(f"纹理已生成：{n} 个顶点"
+                             f"（{KIND_LABELS.get(params.kind, params.kind)}"
+                             f"，Ctrl+Z 可撤销）")
+            else:
+                self._notify("未生成：确认参数与曲线位置")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._notify(f"纹理生成失败：{e}")
+        finally:
+            try:
+                doc.endEdit()
+            except Exception:
+                pass
+        self._preview_snapshot = None
+        self._preview_polys = None
+        self._preview_active = False
+
+    def _cancelPreview(self) -> None:
+        if self._rollbackPreview(silent=True):
+            self._notify("已取消：模型已还原")
+
+    def _rollbackPreview(self, silent: bool = True) -> bool:
+        if self._preview_snapshot is None:
+            return False
+        model = self._previewModel()
+        if model is not None:
+            try:
+                hf = model.heightField()
+                if hf.data.shape == self._preview_snapshot.shape:
+                    hf.data[:] = self._preview_snapshot
+                    self._refreshModel(model)
+            except Exception:
+                pass
+        self._preview_snapshot = None
+        self._preview_polys = None
+        self._preview_active = False
+        return True
+
+    def _apply(self, poly=None, polys=None) -> None:
         model = self._doc.activeReliefModel() if self._doc is not None else None
         if model is None:
             self._notify("请先选中浮雕模型（纹理填充作用于活动模型）")
@@ -5354,15 +5515,13 @@ class TextureFillCommand(CommandInstance):
         if self._panel is None or self._doc is None:
             return
         params = self._panel.params()
-        if (params.kind == "weave" and params.weave_mode == "curve"
-                and poly is None):
-            # 沿曲线编织且未点击指定路径：回退到当前选中的曲线
-            sel = self._selectedCurve()
-            if sel is None:
-                self._notify("沿曲线编织需要一条曲线：点击画布上的曲线，"
-                             "或先选中一条曲线再点“应用到整个模型”")
+        if params.kind == "wrap" and poly is None and not polys:
+            # 缠绕未点击指定路径：回退到当前选中的曲线（整组联动）
+            polys = self._selectedWeaveCurves()
+            if not polys:
+                self._notify("缠绕需要曲线：单击曲线，或先选中曲线"
+                             "（单条自相交或多条编组均可）")
                 return
-            poly = sample_curve_points(sel, 512)
         doc = self._doc
         doc.beginEdit()
         try:
@@ -5372,7 +5531,7 @@ class TextureFillCommand(CommandInstance):
             n = apply_texture(hf, params,
                               color_mask=model.colorMask(),
                               color_value=PaintState.instance().currentValue(),
-                              poly=poly)
+                              poly=poly, polys=polys)
             if n > 0:
                 model.bumpVersion()
                 try:
@@ -5381,6 +5540,10 @@ class TextureFillCommand(CommandInstance):
                     pass
                 self._notify(f"纹理已填充：{n} 个顶点"
                              f"（{KIND_LABELS.get(params.kind, params.kind)}）")
+                # 已提交的区域编辑成为新的预览基准（后续调参从该状态重算）
+                self._preview_snapshot = None
+                self._preview_polys = None
+                self._preview_active = False
             else:
                 self._notify("未命中区域：确认曲线落在模型范围内"
                              "且颜色范围设置允许")
@@ -5397,30 +5560,106 @@ class TextureFillCommand(CommandInstance):
     def _applyWhole(self) -> None:
         self._apply(None)
 
-    def _selectedCurve(self):
-        """当前选中的曲线（沿曲线编织的路径来源：优先面板点击，其次已选曲线）。"""
+    def _curveObjectOk(self, o) -> bool:
+        if o.type() == ObjectType.SURFACE or o.isLocked():
+            return False
+        return (hasattr(o, "getSampledPoints") or hasattr(o, "toPolycurve")
+                or hasattr(o, "points"))
+
+    def _groupCurvePolys(self, obj) -> list:
+        """缠绕路径来源：obj 所在群组的全部曲线；无群组则仅 obj 一条。
+
+        单条曲线也允许（自相交如"8"字会交织；无自相交则生成普通带）。
+        返回世界坐标采样点列表 [(N,2), ...]；无有效曲线返回空列表。
+        """
+        gid = ""
+        try:
+            gid = obj.group() or ""
+        except Exception:
+            gid = ""
+        objs = []
+        if gid:
+            for o in self._doc.visibleObjects():
+                try:
+                    if o.group() != gid:
+                        continue
+                except Exception:
+                    continue
+                if self._curveObjectOk(o):
+                    objs.append(o)
+        else:
+            objs = [obj]
+        polys = []
+        for o in objs:
+            pts = sample_curve_points(o, 512)
+            if pts.shape[0] >= 2:
+                polys.append(pts)
+        return polys
+
+    def _selectedWeaveCurves(self) -> list:
+        """当前选中对象中的编织曲线组（群组成员自动扩展为整组）。"""
         if self._doc is None:
-            return None
+            return []
+        gids: set[str] = set()
+        singles = []
         for o in self._doc.selectedObjects():
-            if o.type() == ObjectType.SURFACE or o.isLocked():
+            if not self._curveObjectOk(o):
                 continue
-            if hasattr(o, "getSampledPoints") or hasattr(o, "toPolycurve"):
-                return o
-        return None
+            try:
+                gid = o.group() or ""
+            except Exception:
+                gid = ""
+            if gid:
+                gids.add(gid)
+            else:
+                singles.append(o)
+        objs = list(singles)
+        if gids:
+            for o in self._doc.visibleObjects():
+                try:
+                    if o.group() in gids and self._curveObjectOk(o):
+                        objs.append(o)
+                except Exception:
+                    continue
+        polys = []
+        seen = set()
+        for o in objs:
+            if id(o) in seen:
+                continue
+            seen.add(id(o))
+            pts = sample_curve_points(o, 512)
+            if pts.shape[0] >= 2:
+                polys.append(pts)
+        return polys
 
     def onMouseMove(self, wp, mods) -> None:
         pass
 
     def onMousePress(self, wp, mods) -> None:
-        tol = self._pixelTolWorld()
-        if self._panel is not None and self._panel.weaveMode() == "curve":
-            # 沿曲线编织：开放曲线即可作为编织路径
-            obj = pick_curve(self._doc, wp.x, wp.y, tol)
-            if obj is None:
-                self._notify("未命中曲线：把鼠标移到曲线上再点击（编织路径）")
+        if self._panel is not None:
+            k = self._panel.kind()
+            if k == "wrap":
+                # 缠绕：单击曲线 → 单条自相交曲线或多条编组曲线作为路径并预览
+                tol = self._pixelTolWorld()
+                obj = pick_curve(self._doc, wp.x, wp.y, tol)
+                if obj is None:
+                    self._notify("未命中曲线：把鼠标移到曲线上再点击"
+                                 "（缠绕 = 单条自相交或多条编组曲线）")
+                    return
+                polys = self._groupCurvePolys(obj)
+                if not polys:
+                    self._notify("未取到有效曲线：请单击画布上的曲线"
+                                 "（单条自相交如“8”字，或多条编组均可）")
+                    return
+                self._preview_polys = polys
+                self._doPreview()
                 return
-            self._apply(sample_curve_points(obj, 512))
-            return
+            if k == "weave":
+                # 编织（整面）：不选曲线，预览由面板参数驱动
+                self._notify("编织按面板参数整面生成（实时预览，"
+                             "“确认生成”完成）")
+                return
+        tol = self._pixelTolWorld()
         obj = pick_closed_curve(self._doc, wp.x, wp.y, tol)
         if obj is None:
             self._notify("未命中闭合曲线：把鼠标移动到曲线上再点击"
@@ -5451,19 +5690,28 @@ class TextureFillCommand(CommandInstance):
         if (self._doc is None
                 or self._doc.activeReliefModel() is None):
             return "请先在 2D 选中浮雕模型（纹理填充作用于活动模型）"
+        if self._panel is not None:
+            k = self._panel.kind()
+            if k == "wrap":
+                return ("缠绕：把相互交叉的多条曲线编组后，单击组内任一曲线"
+                        "即实时预览，调参更新，点“确认生成”完成")
+            if k == "weave":
+                return ("编织：按面板参数（横/竖条数、截面）整面实时预览，"
+                        "点“确认生成”完成，取消/右键还原")
         return "点击闭合曲线即在该区域内填充纹理；面板可应用到整个模型（右键/回车结束）"
 
 
 # ============================================================================
-# SlopeZoneCommand：角度分区线（复刻精雕"角度分区线"）
+# SlopeZoneCommand：构造曲线（角度曲线=坡度分区 / 高度曲线=等高线）
 # ============================================================================
 
 class SlopeZoneCommand(CommandInstance):
-    """角度分区线：按坡度把模型分区并生成分界闭合曲线。
+    """构造曲线：按角度或按高度从模型生成曲线。
 
-    复刻精雕 SurfMill"残料边界线和角度分区线"之角度分区：默认
-    10°/30°/60° 分界（平坦/缓坡/陡坡/陡立），每区一条曲线对象、
-    按区着色（绿→橙→红→紫），供区域塑形 / CNC 分区加工取用。
+    角度曲线：按坡度分界（默认 10°/30°/60°：平坦/缓坡/陡坡/陡立）分区，
+    每区一条曲线对象、按区着色（绿→橙→红→紫），供区域塑形 / CNC
+    分区加工取用。
+    高度曲线：取指定高度的等高线（模型该高度水平截面轮廓）。
     """
 
     def __init__(self) -> None:
@@ -5474,7 +5722,7 @@ class SlopeZoneCommand(CommandInstance):
         return "SlopeZone"
 
     def commandTitle(self) -> str:
-        return "角度分区线"
+        return "构造曲线"
 
     def paramPanel(self):
         if self._panel is None:
@@ -5490,21 +5738,43 @@ class SlopeZoneCommand(CommandInstance):
             except Exception:
                 pass
 
+    def _addLoops(self, doc, loops, color) -> None:
+        obj = PolyCurveObject()
+        obj._segments = [
+            {"points": [[float(x), float(y), 0.0] for x, y in lp]}
+            for lp in loops]
+        obj.setColor(color)
+        doc.addObject(obj)
+
     def _generate(self) -> None:
         model = self._doc.activeReliefModel() if self._doc is not None else None
         if model is None:
-            self._notify("请先选中浮雕模型（角度分区作用于活动模型）")
+            self._notify("请先选中浮雕模型（构造曲线作用于活动模型）")
             return
         if self._panel is None or self._doc is None:
             return
         doc = self._doc
+        mode = self._panel.mode()
         doc.beginEdit()
         try:
             if model.hasPendingTransform():
                 model.bake()
             hf = model.heightField()
-            bounds = self._panel.bounds()
             tol = self._panel.tolerance()
+            if mode == "height":
+                z = self._panel.height()
+                # 标量场插值等值线：粗网格下圆也不退化为多边形，
+                # 鞍点自动分裂（布尔阈值 + 边中点会出八角形/自交环）
+                loops = field_contours(hf.data, hf, z, simplify_mm=tol)
+                if loops:
+                    self._addLoops(doc, loops, (40, 120, 230))
+                    self._notify(f"已生成高度曲线：{len(loops)} 条闭合曲线"
+                                 f"（高度 {z:.2f}mm）")
+                else:
+                    self._notify("未生成曲线：该高度不在模型范围内"
+                                 f"（{hf.data.min():.2f}~{hf.data.max():.2f}mm）")
+                return
+            bounds = self._panel.bounds()
             zones = slope_zone_masks(hf, bounds)
             made = 0
             for mask, nm, col in zip(zones, ZONE_NAMES, ZONE_COLORS):
@@ -5513,12 +5783,7 @@ class SlopeZoneCommand(CommandInstance):
                 loops = mask_contours(mask, hf, simplify_mm=tol)
                 if not loops:
                     continue
-                obj = PolyCurveObject()
-                obj._segments = [
-                    {"points": [[float(x), float(y), 0.0] for x, y in lp]}
-                    for lp in loops]
-                obj.setColor(col)
-                doc.addObject(obj)
+                self._addLoops(doc, loops, col)
                 made += 1
             if made:
                 self._notify(f"已生成 {made} 条角度分区线"
@@ -5529,7 +5794,7 @@ class SlopeZoneCommand(CommandInstance):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self._notify(f"角度分区失败：{e}")
+            self._notify(f"构造曲线失败：{e}")
         finally:
             try:
                 doc.endEdit()
@@ -5555,108 +5820,8 @@ class SlopeZoneCommand(CommandInstance):
     def prompt(self) -> str:
         if (self._doc is None
                 or self._doc.activeReliefModel() is None):
-            return "请先在 2D 选中浮雕模型（角度分区作用于活动模型）"
-        return "在面板设置分界角度后点击“生成分区线”（右键/回车结束命令）"
-
-
-# ============================================================================
-# RestBoundaryCommand：残料边界线（复刻精雕"残料边界线"）
-# ============================================================================
-
-class RestBoundaryCommand(CommandInstance):
-    """残料边界线：按刀具半径算"刀具够不到"的残留区并生成边界闭合曲线。
-
-    复刻精雕 SurfMill"残料边界线和角度分区线"之残料边界：球刀走精确
-    两遍扫描包络（静球搁放 + 球底最深走刀），平底刀走圆盘 closing
-    近似；窄沟/尖角/小 R 内拐角均识别为残料。生成的曲线可直接用于
-    区域塑形或 CNC 残料补加工选区。
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._panel: RestBoundaryParamPanel | None = None
-
-    def name(self) -> str:
-        return "RestBoundary"
-
-    def commandTitle(self) -> str:
-        return "残料边界线"
-
-    def onMouseMove(self, wp, mods) -> None:
-        pass
-
-    def onMousePress(self, wp, mods) -> None:
-        pass
-
-    def paramPanel(self):
-        if self._panel is None:
-            self._panel = RestBoundaryParamPanel()
-            self._panel.generate.connect(self._generate)
-            self._panel.finished.connect(self.finish)
-        return self._panel
-
-    def _notify(self, text: str) -> None:
-        if self._manager is not None:
-            try:
-                self._manager.notifyResult(str(text))
-            except Exception:
-                pass
-
-    def _generate(self) -> None:
-        model = self._doc.activeReliefModel() if self._doc is not None else None
-        if model is None:
-            self._notify("请先选中浮雕模型（残料边界作用于活动模型）")
-            return
-        if self._panel is None or self._doc is None:
-            return
-        doc = self._doc
-        doc.beginEdit()
-        try:
-            if model.hasPendingTransform():
-                model.bake()
-            hf = model.heightField()
-            mask = rest_material_mask(hf, self._panel.toolRadius(),
-                                      tool=self._panel.toolShape(),
-                                      threshold_mm=self._panel.threshold())
-            loops = mask_contours(mask, hf,
-                                  simplify_mm=self._panel.tolerance())
-            if loops:
-                obj = PolyCurveObject()
-                obj._segments = [
-                    {"points": [[float(x), float(y), 0.0] for x, y in lp]}
-                    for lp in loops]
-                obj.setColor((230, 80, 40))
-                doc.addObject(obj)
-                self._notify(f"已生成残料边界：{len(loops)} 条闭合曲线"
-                             f"（刀具半径 {self._panel.toolRadius():.2f}mm，"
-                             f"{'球刀' if self._panel.toolShape() == 'ball' else '平底刀'}）")
-            else:
-                self._notify("无残料：该刀具半径下模型全部可加工")
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self._notify(f"残料边界失败：{e}")
-        finally:
-            try:
-                doc.endEdit()
-            except Exception:
-                pass
-
-    def onRightClick(self, wp) -> bool:
-        self.finish()
-        return True
-
-    def onEnter(self, wp) -> bool:
-        return self.onRightClick(wp)
-
-    def showSnapHints(self) -> bool:
-        return False
-
-    def prompt(self) -> str:
-        if (self._doc is None
-                or self._doc.activeReliefModel() is None):
-            return "请先在 2D 选中浮雕模型（残料边界作用于活动模型）"
-        return "在面板设置刀具半径后点击“生成残料边界”（右键/回车结束命令）"
+            return "请先在 2D 选中浮雕模型（构造曲线作用于活动模型）"
+        return "选择模式（角度曲线/高度曲线）后点击“生成曲线”（右键/回车结束）"
 
 
 # ---- 模块级工具：闭合曲线拾取（纹理填充与区域塑形共用） ----

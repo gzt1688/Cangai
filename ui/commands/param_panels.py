@@ -17,7 +17,8 @@ from core.relief import HeightField
 from ui.widgets.smear_state import SmearState, MODE_LABELS as _SMEAR_LABELS
 from core.relief.region_relief import (RegionReliefParams, COLOR_SCOPES,
                                        COLOR_SCOPE_LABELS)
-from core.relief.textures import FILL_PATTERNS, FILL_PATTERN_LABELS
+from core.relief.textures import (FILL_PATTERNS, FILL_PATTERN_LABELS,
+                                  RAND_SUBS, RAND_SUB_LABELS)
 from core.relief.wall_curtain import DeJitterParams, DEFAULT_DEJITTER_DISTANCE
 from core.relief.stamp import (StampParams, DEFAULT_ABSOLUTE, DEFAULT_RELATIVE,
                                DEFAULT_HIGH_LEVEL, DEFAULT_LOW_LEVEL,
@@ -5246,71 +5247,196 @@ class TextureFillParamPanel(ParamPanelBase):
     finished = Signal()
     applyWhole = Signal()
     paramsChanged = Signal()
+    confirmed = Signal()      # 实时预览 → 确认生成
+    cancelled = Signal()      # 预览 → 取消（回滚）
+    refreshPreview = Signal()  # 手动"更新预览"（立即重算一次）
 
-    _KINDS = ("fractal", "corrosion", "weave", "knot", "fill",
-              "rectgrid", "perturb")
-    _KIND_LABELS = ("随机分形", "腐蚀", "编织带", "缠绕结",
-                    "填充图案", "矩形网格", "表面扰动")
+    _KINDS = ("fractal", "weave", "wrap", "fill")
+    _KIND_LABELS = ("随机", "编织", "缠绕", "填充")
     _BLEND_LABELS = ("叠加", "取代", "切除")
     _SCOPE_LABELS = COLOR_SCOPE_LABELS
+    _WEAVE_SECS = ("ellipse", "trapezoid", "spline")
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
 
-        # ---- 几何纹理类型（2 行单选）----
+        # ---- 几何纹理类型（一行单选：随机/编织/缠绕/填充）----
         self._kindGroup = QButtonGroup(self)
         gKind, lKind = self._group("几何纹理类型")
-        lKind.addWidget(self._radioRow("", self._KIND_LABELS[0:4],
+        lKind.addWidget(self._radioRow("", self._KIND_LABELS,
                                        self._kindGroup, 0))
-        lKind.addWidget(self._radioRow("", self._KIND_LABELS[4:],
-                                       self._kindGroup, 4))
         self._kindGroup.button(0).setChecked(True)
         self._kindGroup.idClicked.connect(self._onKindChanged)
         self._layout.addWidget(gKind)
 
-        # ---- 填充子图案（仅"填充图案"类型可用）----
+        # ---- 随机子模式（仅"随机"类型显示：分形/波浪/糙面）----
+        self._subGroup = QButtonGroup(self)
+        self._rowRandSub = self._radioRow("", RAND_SUB_LABELS,
+                                          self._subGroup, 0)
+        # 无分组框的裸行：左缩进 = 上方分组框的框线+内边距，
+        # 使单选钮与"几何纹理类型"组内的单选钮垂直对齐
+        _sub_indent = gKind.contentsRect().left() + 6
+        if _sub_indent <= 6:
+            _sub_indent = 16
+        self._rowRandSub.layout().setContentsMargins(_sub_indent, 0, 0, 0)
+        self._subGroup.button(0).setChecked(True)
+        self._subGroup.idClicked.connect(self._onRandSubChanged)
+        self._layout.addWidget(self._rowRandSub)
+
+        def _pairRow(label, w1, w2, sep="×"):
+            """一行放两个输入框（高度/强度、条数、上宽下宽），压缩纵向空间。"""
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(4)
+            lab = QLabel(label)
+            lab.setMinimumWidth(_LABEL_W)
+            lay.addWidget(lab)
+            lay.addWidget(w1, 1)
+            if sep:
+                lay.addWidget(QLabel(sep))
+            lay.addWidget(w2, 1)
+            return w
+
+        # ---- 填充子图案（仅"填充图案"类型显示）----
         self._comboPattern = QComboBox()
         for lab in FILL_PATTERN_LABELS:
             self._comboPattern.addItem(lab)
-        self._comboPattern.setEnabled(False)
-        self._addRow("填充图案:", self._comboPattern)
+        self._rowPattern = self._row("填充图案:", self._comboPattern)
+        self._comboPattern.currentIndexChanged.connect(
+            self._onFillPatternChanged)
+        self._layout.addWidget(self._rowPattern)
+
+        # ---- 填充几何参数（毫米制；仅填充类型显示）----
+        self._spinFillSize = self._spin(6.0, decimals=1, step=0.5)
+        self._spinFillSize.setRange(0.5, 200.0)
+        self._rowFillSize = self._row("图案尺寸(mm):", self._spinFillSize)
+        self._layout.addWidget(self._rowFillSize)
+        # 砖形长/宽独立（默认标准砖 240×115 → 24×11.5，灰缝间距 1）
+        self._spinFillBrickL = self._spin(24.0, decimals=1, step=0.5)
+        self._spinFillBrickL.setRange(0.5, 500.0)
+        self._spinFillBrickW = self._spin(11.5, decimals=1, step=0.5)
+        self._spinFillBrickW.setRange(0.5, 500.0)
+        self._rowFillBrick = _pairRow("砖 长/宽(mm):",
+                                      self._spinFillBrickL,
+                                      self._spinFillBrickW)
+        self._layout.addWidget(self._rowFillBrick)
+        self._spinFillGapX = self._spin(1.0, decimals=1, step=0.5)
+        self._spinFillGapX.setRange(-100.0, 200.0)
+        self._spinFillGapX.setToolTip("允许负值：负间距图案互相嵌入\n"
+                                      "六边形 0 / -尺寸×0.135 ≈ 蜂窝\n"
+                                      "砖形灰缝标准间距 = 1（10cm 砖比例）")
+        self._spinFillGapY = self._spin(1.0, decimals=1, step=0.5)
+        self._spinFillGapY.setRange(-100.0, 200.0)
+        self._spinFillGapY.setToolTip("允许负值：负间距图案互相嵌入\n"
+                                      "六边形 0 / -尺寸×0.135 ≈ 蜂窝\n"
+                                      "砖形灰缝标准间距 = 1（10cm 砖比例）")
+        self._rowFillGap = _pairRow("横/纵间距(mm):",
+                                    self._spinFillGapX, self._spinFillGapY)
+        self._layout.addWidget(self._rowFillGap)
 
         # ---- 纹理参数 ----
+        # 高度/强度：所有类型共用（合成一行）
         self._spinH = self._spin(1.0, decimals=2, step=0.1)
         self._spinH.setRange(0.01, 50.0)
-        self._addRow("纹理高度(mm):", self._spinH)
-
         self._spinStrength = self._spin(1.0, decimals=2, step=0.1)
         self._spinStrength.setRange(0.0, 3.0)
-        self._addRow("强度:", self._spinStrength)
+        self._layout.addWidget(
+            _pairRow("高度(mm)/强度:", self._spinH, self._spinStrength, "/"))
 
+        # ---- 波浪参数（仅随机·波浪子模式显示）----
+        self._spinWaveN = self._ispin(8, 1, 200)
+        self._spinWaveAng = self._spin(0.0, decimals=1, step=5.0)
+        self._spinWaveAng.setRange(0.0, 360.0)
+        self._rowWaveNA = _pairRow("数量/角度:", self._spinWaveN,
+                                   self._spinWaveAng, "/")
+        self._spinWaveCurv = self._spin(0.3, decimals=2, step=0.05)
+        self._spinWaveCurv.setRange(0.0, 1.0)
+        self._rowWaveCurv = self._row("弧度(0-1):", self._spinWaveCurv)
+        self._layout.addWidget(self._rowWaveNA)
+        self._layout.addWidget(self._rowWaveCurv)
+
+        # 细节尺度：除编织/缠绕/缠绕结外共用
         self._spinDetail = self._spin(5.0, decimals=1, step=0.5)
         self._spinDetail.setRange(0.5, 100.0)
-        self._addRow("细节尺度(mm):", self._spinDetail)
+        self._rowDetail = self._row("细节尺度(mm):", self._spinDetail)
+        self._layout.addWidget(self._rowDetail)
 
+        # 随机种子：仅随机分形/腐蚀/矩形网格/表面扰动
         self._spinSeed = self._ispin(0, 0, 99999)
-        self._addRow("随机种子:", self._spinSeed)
+        self._rowSeed = self._row("随机种子:", self._spinSeed)
+        self._layout.addWidget(self._rowSeed)
 
-        # ---- 编织带参数（仅"编织带"类型启用）----
-        self._weaveBox, _wl = self._group("编织带")
-        self._weaveModeGroup = QButtonGroup(self)
-        self._rowWeaveMode = self._radioRow(
-            "", ("整面编织", "沿曲线编织"), self._weaveModeGroup, 0)
-        self._weaveModeGroup.button(0).setChecked(True)
-        _wl.addWidget(self._rowWeaveMode)
-        self._spinWeaveW = self._spin(8.0, decimals=1, step=0.5)
-        self._spinWeaveW.setRange(0.5, 200.0)
-        self._rowWeaveW = self._row("带宽(mm):", self._spinWeaveW)
+        # ---- 编织/缠绕公共参数（整面编织显示条数；缠绕显示提示并点曲线）----
+        self._weaveBox, _wl = self._group("编织")
+        _wl.setSpacing(6)
+        _wl.setContentsMargins(6, 6, 6, 6)
+        self._labWeaveHint = QLabel("缠绕：单击曲线开始预览\n（单条自相交"
+                                    "如“8”字，或多条编组均可）")
+        self._labWeaveHint.setWordWrap(True)
+        _wl.addWidget(self._labWeaveHint)
+
+        # 条数（横×竖，仅整面编织显示）
+        self._ispinWeaveRows = self._ispin(8, 1, 200)
+        self._ispinWeaveCols = self._ispin(8, 1, 200)
+        self._rowWeaveCounts = _pairRow("条数(横×竖):",
+                                        self._ispinWeaveRows,
+                                        self._ispinWeaveCols)
+        _wl.addWidget(self._rowWeaveCounts)
+
+        # 交叉角度（两组带的夹角，90=经纬垂直；仅整面编织显示）
+        self._spinWeaveAngle = self._spin(90.0, decimals=0, step=5.0)
+        self._spinWeaveAngle.setRange(10.0, 170.0)
+        self._rowWeaveAngle = self._row("交叉角度(°):",
+                                        self._spinWeaveAngle)
+        _wl.addWidget(self._rowWeaveAngle)
+
+        # 子编织（每带细分的细条数 + 细条间缝宽，竹编效果）
+        self._ispinWeaveSub = self._ispin(1, 1, 8)
+        self._spinWeaveSubGap = self._spin(0.6, decimals=1, step=0.2)
+        self._spinWeaveSubGap.setRange(0.0, 20.0)
+        self._rowWeaveSub = _pairRow("子编织(条/缝):",
+                                     self._ispinWeaveSub,
+                                     self._spinWeaveSubGap, sep="/")
+        _wl.addWidget(self._rowWeaveSub)
+
+        # 截面类型
+        self._comboWeaveSec = QComboBox()
+        for _lab in ("椭圆", "梯形", "样条"):
+            self._comboWeaveSec.addItem(_lab)
+        self._rowWeaveSec = self._row("截面类型:", self._comboWeaveSec)
+        _wl.addWidget(self._rowWeaveSec)
+
+        # 截面上宽/下宽（梯形用；下宽即带宽）
+        self._spinWeaveTop = self._spin(1.5, decimals=2, step=0.5)
+        self._spinWeaveTop.setRange(0.0, 100.0)
+        self._spinWeaveBot = self._spin(4.0, decimals=2, step=0.5)
+        self._spinWeaveBot.setRange(0.5, 200.0)
+        self._rowWeaveW = _pairRow("上/下宽(mm):",
+                                   self._spinWeaveTop,
+                                   self._spinWeaveBot, sep="/")
         _wl.addWidget(self._rowWeaveW)
-        self._spinWeaveP = self._spin(3.0, decimals=1, step=0.5)
-        self._spinWeaveP.setRange(0.3, 100.0)
-        self._rowWeaveP = self._row("股距(mm):", self._spinWeaveP)
-        _wl.addWidget(self._rowWeaveP)
-        self._spinWeaveA = self._spin(45.0, decimals=0, step=5.0)
-        self._spinWeaveA.setRange(10.0, 80.0)
-        self._rowWeaveA = self._row("股线斜角(°):", self._spinWeaveA)
-        _wl.addWidget(self._rowWeaveA)
-        self._weaveBox.setEnabled(False)
+
+        # 椭圆高度比（仅椭圆截面显示）
+        self._spinWeaveER = self._spin(1.0, decimals=2, step=0.1)
+        self._spinWeaveER.setRange(0.1, 1.0)
+        self._rowWeaveER = self._row("椭圆高度比:", self._spinWeaveER)
+        _wl.addWidget(self._rowWeaveER)
+        self._comboWeaveSec.currentIndexChanged.connect(
+            lambda *_: self._onWeaveSecChanged())
+        # 全局样式使 QSpinBox 最小提示宽达 ~113px，两列一行必然溢出；
+        # 显式收窄（数值仍可完整显示，超出可键入）
+        for _w in (self._spinH, self._spinStrength, self._ispinWeaveRows,
+                   self._ispinWeaveCols, self._spinWeaveTop,
+                   self._spinWeaveBot, self._spinWeaveER,
+                   self._spinWeaveAngle, self._ispinWeaveSub,
+                   self._spinWeaveSubGap,
+                   self._spinWaveN, self._spinWaveAng, self._spinWaveCurv,
+                   self._spinFillSize, self._spinFillGapX,
+                   self._spinFillGapY,
+                   self._spinFillBrickL, self._spinFillBrickW):
+            _w.setMinimumWidth(62)
+            _w.valueChanged.connect(lambda *_: self.paramsChanged.emit())
         self._layout.addWidget(self._weaveBox)
 
         # ---- 拼合方式 ----
@@ -5329,38 +5455,97 @@ class TextureFillParamPanel(ParamPanelBase):
         self._scopeGroup.button(0).setChecked(True)
         self._layout.addWidget(gScope)
 
-        # ---- 操作 ----
+        # ---- 操作（面板最底部）----
+        # 4 种类型均实时预览：调参即预览（不进撤销栈）；"更新预览"手动
+        # 立即重算；"确认生成"一次性提交，"取消"还原，"完成"结束命令。
+        # 拼合方式、颜色范围始终在按钮上方。
         row = QHBoxLayout()
-        row.setSpacing(8)
-        btnApply = self._button("应用到整个模型", primary=True)
-        btnApply.clicked.connect(self.applyWhole.emit)
+        row.setSpacing(6)
+        self._btnWeaveConfirm = self._button("确认生成", primary=True)
+        self._btnWeaveConfirm.clicked.connect(self.confirmed.emit)
+        row.addWidget(self._btnWeaveConfirm)
+        self._btnRefresh = self._button2("更新预览")
+        self._btnRefresh.clicked.connect(self.refreshPreview.emit)
+        row.addWidget(self._btnRefresh)
+        self._btnWeaveCancel = self._button2("取消")
+        self._btnWeaveCancel.clicked.connect(self.cancelled.emit)
+        row.addWidget(self._btnWeaveCancel)
         btnDone = self._button2("完成")
         btnDone.clicked.connect(self.finished.emit)
-        row.addWidget(btnApply)
         row.addWidget(btnDone)
         row.addStretch(1)
         self._layout.addLayout(row)
 
+        # 初始按默认类型（随机）调度显隐
+        self._onKindChanged()
+
     def kind(self) -> str:
         return self._KINDS[max(0, self._kindGroup.checkedId())]
 
-    def weaveMode(self) -> str:
-        return "curve" if self._weaveModeGroup.checkedId() == 1 else "grid"
+    def _onRandSubChanged(self, *_) -> None:
+        """随机子模式切换：波浪参数仅"波浪"子模式显示。"""
+        is_waves = (self.kind() == "fractal"
+                    and RAND_SUBS[max(0, self._subGroup.checkedId())]
+                    == "waves")
+        self._rowWaveNA.setVisible(is_waves)
+        self._rowWaveCurv.setVisible(is_waves)
+        self.paramsChanged.emit()
 
     def _onKindChanged(self, *_) -> None:
-        is_weave = self.kind() == "weave"
-        self._comboPattern.setEnabled(self.kind() == "fill")
-        self._weaveBox.setEnabled(is_weave)
-        self._rowWeaveW.setEnabled(is_weave and self.weaveMode() == "curve")
-        self._rowWeaveP.setEnabled(is_weave and self.weaveMode() == "curve")
-        self._rowWeaveA.setEnabled(is_weave and self.weaveMode() == "curve")
+        """按纹理类型显隐各自参数（随机/编织/缠绕/填充各有各的参数）。
+        拼合方式、颜色范围所有类型共用；操作按钮在面板最底部按类型切换。"""
+        k = self.kind()
+        is_weave = k in ("weave", "wrap")
+        self._rowRandSub.setVisible(k == "fractal")   # 随机子模式单选
+        is_fill = k == "fill"
+        self._rowPattern.setVisible(is_fill)
+        self._rowFillSize.setVisible(is_fill)
+        self._rowFillGap.setVisible(is_fill)
+        self._rowDetail.setVisible(k == "fractal")
+        self._rowSeed.setVisible(k == "fractal")
+        self._onFillPatternChanged()                  # 含径向间距显隐
+        if is_weave:
+            self._weaveBox.setTitle("编织参数" if k == "weave" else "缠绕参数")
+        self._weaveBox.setVisible(is_weave)
+        self._rowWeaveCounts.setVisible(k == "weave")  # 条数仅整面编织
+        self._rowWeaveAngle.setVisible(k == "weave")   # 交叉角度仅整面编织
+        self._rowWeaveSub.setVisible(is_weave)         # 子编织两种模式通用
+        self._labWeaveHint.setVisible(k == "wrap")     # 缠绕点曲线
+        # 底部操作行（确认生成/更新预览/取消/完成）所有类型恒显
+        self._onRandSubChanged()      # 含 paramsChanged
+
+    def _onFillPatternChanged(self, *_) -> None:
+        """填充图案切换：砖形显示长/宽行，其他图案显示尺寸行。"""
+        pat = FILL_PATTERNS[max(0, self._comboPattern.currentIndex())]
+        is_fill = self.kind() == "fill"
+        is_brick = pat == "brick"
+        self._rowFillSize.setVisible(is_fill and not is_brick)
+        self._rowFillBrick.setVisible(is_fill and is_brick)
+        self.paramsChanged.emit()
+
+    def _onWeaveSecChanged(self, *_) -> None:
+        # 椭圆高度比仅椭圆截面需要，其他截面直接隐藏
+        self._rowWeaveER.setVisible(
+            self._WEAVE_SECS[max(0, self._comboWeaveSec.currentIndex())]
+            == "ellipse")
         self.paramsChanged.emit()
 
     def params(self) -> "TextureFillParams":
         from core.relief.textures import TextureFillParams
         return TextureFillParams(
             kind=self.kind(),
+            rand_sub=RAND_SUBS[max(0, self._subGroup.checkedId())],
+            waves_count=int(self._spinWaveN.value()),
+            waves_curv=self._spinWaveCurv.value(),
+            waves_angle=self._spinWaveAng.value(),
             fill_pattern=FILL_PATTERNS[self._comboPattern.currentIndex()],
+            # 砖形：fill_size 语义 = 砖长（取砖长输入框）；其他图案取尺寸框
+            fill_size=(self._spinFillBrickL.value()
+                       if FILL_PATTERNS[self._comboPattern.currentIndex()]
+                       == "brick" else self._spinFillSize.value()),
+            fill_brick_w=self._spinFillBrickW.value(),
+            fill_gap_x=self._spinFillGapX.value(),
+            fill_gap_y=self._spinFillGapY.value(),
             height_mm=self._spinH.value(),
             strength=self._spinStrength.value(),
             detail_mm=self._spinDetail.value(),
@@ -5368,20 +5553,28 @@ class TextureFillParamPanel(ParamPanelBase):
             blend=("add", "replace", "subtract")[
                 max(0, self._blendGroup.checkedId())],
             color_scope=COLOR_SCOPES[max(0, self._scopeGroup.checkedId())],
-            weave_mode=self.weaveMode(),
-            weave_width_mm=self._spinWeaveW.value(),
-            weave_pitch_mm=self._spinWeaveP.value(),
-            weave_angle=self._spinWeaveA.value(),
+            weave_mode="curve" if self.kind() == "wrap" else "grid",
+            weave_rows=int(self._ispinWeaveRows.value()),
+            weave_cols=int(self._ispinWeaveCols.value()),
+            weave_sec=self._WEAVE_SECS[
+                max(0, self._comboWeaveSec.currentIndex())],
+            weave_top_w=self._spinWeaveTop.value(),
+            weave_bot_w=self._spinWeaveBot.value(),
+            weave_ellipse_ratio=self._spinWeaveER.value(),
+            weave_angle=self._spinWeaveAngle.value(),
+            weave_sub_n=int(self._ispinWeaveSub.value()),
+            weave_sub_gap=self._spinWeaveSubGap.value(),
         )
 
 
-# ==================== SlopeZone（角度分区线） ====================
+# ==================== SlopeZone（构造曲线：角度/高度） ====================
 
 class SlopeZoneParamPanel(ParamPanelBase):
-    """角度分区线参数面板（复刻精雕"角度分区线"）。
+    """构造曲线参数面板（原"角度分区线"，扩展双模式）。
 
-    按坡度分界把模型分成平坦/缓坡/陡坡/陡立等区，生成各区分界闭合曲线
-    （每区一条曲线对象，按区着色）。
+    角度曲线：按坡度分界把模型分成平坦/缓坡/陡坡/陡立等区，生成各区
+    分界闭合曲线（每区一条曲线对象，按区着色）。
+    高度曲线：按指定高度取等高线，生成该高度的水平截面闭合曲线。
     """
 
     finished = Signal()
@@ -5390,7 +5583,15 @@ class SlopeZoneParamPanel(ParamPanelBase):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        g, l = self._group("分界角度（度）")
+        # ---- 模式单选：角度曲线 / 高度曲线 ----
+        self._modeGroup = QButtonGroup(self)
+        self._layout.addWidget(self._radioRow(
+            "模式:", ("角度曲线", "高度曲线"), self._modeGroup, 0))
+        self._modeGroup.button(0).setChecked(True)
+        self._modeGroup.idClicked.connect(self._onModeChanged)
+
+        # ---- 角度曲线参数（仅角度模式显示）----
+        self._grpAngle, l = self._group("分界角度（度）")
         self._spinB1 = self._spin(10.0, decimals=0, step=1.0)
         self._spinB1.setRange(1.0, 89.0)
         l.addWidget(self._row("平坦/缓坡:", self._spinB1))
@@ -5400,7 +5601,13 @@ class SlopeZoneParamPanel(ParamPanelBase):
         self._spinB3 = self._spin(60.0, decimals=0, step=1.0)
         self._spinB3.setRange(1.0, 89.0)
         l.addWidget(self._row("陡坡/陡立:", self._spinB3))
-        self._layout.addWidget(g)
+        self._layout.addWidget(self._grpAngle)
+
+        # ---- 高度曲线参数（仅高度模式显示）----
+        self._spinHeight = self._spin(0.0, decimals=2, step=0.5)
+        self._spinHeight.setRange(-1000.0, 1000.0)
+        self._rowHeight = self._row("高度(mm):", self._spinHeight)
+        self._layout.addWidget(self._rowHeight)
 
         self._spinTol = self._spin(0.05, decimals=2, step=0.01)
         self._spinTol.setRange(0.0, 1.0)
@@ -5408,7 +5615,7 @@ class SlopeZoneParamPanel(ParamPanelBase):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        btnGen = self._button("生成分区线", primary=True)
+        btnGen = self._button("生成曲线", primary=True)
         btnGen.clicked.connect(self.generate.emit)
         btnDone = self._button2("完成")
         btnDone.clicked.connect(self.finished.emit)
@@ -5416,67 +5623,24 @@ class SlopeZoneParamPanel(ParamPanelBase):
         row.addWidget(btnDone)
         row.addStretch(1)
         self._layout.addLayout(row)
+
+        self._onModeChanged()
+
+    def _onModeChanged(self, *_) -> None:
+        is_angle = self.mode() == "angle"
+        self._grpAngle.setVisible(is_angle)
+        self._rowHeight.setVisible(not is_angle)
+        self.paramsChanged.emit()
+
+    def mode(self) -> str:
+        return ("angle", "height")[max(0, self._modeGroup.checkedId())]
 
     def bounds(self) -> tuple:
         return (self._spinB1.value(), self._spinB2.value(),
                 self._spinB3.value())
 
-    def tolerance(self) -> float:
-        return self._spinTol.value()
-
-
-# ==================== RestBoundary（残料边界线） ====================
-
-class RestBoundaryParamPanel(ParamPanelBase):
-    """残料边界线参数面板（复刻精雕"残料边界线"）。
-
-    按刀具半径计算模型上刀具够不到的残留材料区（窄沟/尖角/小 R 内拐角），
-    生成其边界闭合曲线，供 CNC 残料补加工或区域塑形取用。
-    """
-
-    finished = Signal()
-    generate = Signal()
-    paramsChanged = Signal()
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        g, l = self._group("刀具")
-        self._spinR = self._spin(1.5, decimals=2, step=0.1)
-        self._spinR.setRange(0.1, 30.0)
-        l.addWidget(self._row("刀具半径(mm):", self._spinR))
-        self._toolGroup = QButtonGroup(self)
-        l.addWidget(self._radioRow("", ("球刀", "平底刀"),
-                                   self._toolGroup, 0))
-        self._toolGroup.button(0).setChecked(True)
-        self._layout.addWidget(g)
-
-        self._spinTh = self._spin(0.02, decimals=2, step=0.01)
-        self._spinTh.setRange(0.0, 2.0)
-        self._addRow("残料深度阈值(mm):", self._spinTh)
-
-        self._spinTol = self._spin(0.05, decimals=2, step=0.01)
-        self._spinTol.setRange(0.0, 1.0)
-        self._addRow("曲线简化(mm):", self._spinTol)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        btnGen = self._button("生成残料边界", primary=True)
-        btnGen.clicked.connect(self.generate.emit)
-        btnDone = self._button2("完成")
-        btnDone.clicked.connect(self.finished.emit)
-        row.addWidget(btnGen)
-        row.addWidget(btnDone)
-        row.addStretch(1)
-        self._layout.addLayout(row)
-
-    def toolRadius(self) -> float:
-        return self._spinR.value()
-
-    def toolShape(self) -> str:
-        return "ball" if self._toolGroup.checkedId() <= 0 else "flat"
-
-    def threshold(self) -> float:
-        return self._spinTh.value()
+    def height(self) -> float:
+        return self._spinHeight.value()
 
     def tolerance(self) -> float:
         return self._spinTol.value()

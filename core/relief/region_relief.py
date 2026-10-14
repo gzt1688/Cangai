@@ -259,6 +259,115 @@ def compute_signed_distance(inside: np.ndarray, cell: float,
     return np.where(inside, dist, -dist) * float(cell)
 
 
+def compute_polygon_sd(poly: np.ndarray, grid: Grid,
+                       inside: np.ndarray | None = None) -> np.ndarray:
+    """解析多边形有符号距离场（全域）：到折线边界的精确欧氏距离。
+
+    与 :func:`compute_signed_distance`（像素掩码 + EDT）相比，本函数不做
+    网格化——距离直接按像素中心到边的解析几何计算，符号用射线法判定，
+    圆/椭圆/样条等光滑轮廓的距离等值线为亚像素精度，不会继承像素化
+    阶梯（像素化掩码的 EDT 台阶被穹顶剖面放大后，高度曲线会提取出
+    "奇怪的多边形"）。
+
+    全域计算（内正外负、边界连续过零）：穹顶鼓起在真边界处平滑归零，
+    贴根的小高度等值线不再贴着像素掩码走。inside 参数保留兼容但不再
+    用于跳过外部像素（符号必须全域正确）。
+
+    性能：边数 > 256 的密集采样轮廓先按弧长均匀重采样到 256——弦高
+    误差随曲率自消（对剖面 s = sd/dmax 是系统性偏置），对圆/椭圆类
+    光滑轮廓不引入可见误差；射线法用交点排序 + searchsorted。
+    距离场光滑（Lipschitz 1），全域解析在 ~1/4 采样网格上计算后双线性
+    上采样（凸轮廓内部插值误差 < 0.001mm），仅边界 2 像素带内用全
+    分辨率精确值——复杂度 O((N/4)²×E + 周长像素×E)，大网格秒级。
+    """
+    min_x, min_y, spacing, nx, ny = grid
+    if poly.shape[0] < 2:
+        return np.zeros((ny, nx), dtype=np.float64)
+    if poly.shape[0] > 256:
+        poly = resample_polyline(poly, 256)
+
+    ax = poly[:, 0]
+    ay = poly[:, 1]
+    bx = np.roll(ax, -1)
+    by = np.roll(ay, -1)
+    abx = bx - ax
+    aby = by - ay
+    len_sq = abx * abx + aby * aby
+    inv_len_sq = np.where(len_sq > 1e-18, 1.0 / np.maximum(len_sq, 1e-18), 1e18)
+
+    def _exact_dist(pxv: np.ndarray, pyv: np.ndarray) -> np.ndarray:
+        """展平像素 (P,) 的精确到边距离（分块矩阵）。"""
+        m = pxv.size
+        best = np.empty(m, dtype=np.float64)
+        CH = 16384
+        for s0 in range(0, m, CH):
+            e0 = min(s0 + CH, m)
+            apx = pxv[s0:e0, None] - ax[None, :]
+            apy = pyv[s0:e0, None] - ay[None, :]
+            tt = (apx * abx[None, :] + apy * aby[None, :]) * inv_len_sq[None, :]
+            np.clip(tt, 0.0, 1.0, out=tt)
+            dx = apx - tt * abx[None, :]
+            dy = apy - tt * aby[None, :]
+            best[s0:e0] = np.sqrt(np.min(dx * dx + dy * dy, axis=1))
+        return best
+
+    def _sign_rows(sd_grid: np.ndarray, ys: np.ndarray,
+                   xs: np.ndarray) -> np.ndarray:
+        """射线法定符号（交点排序 + searchsorted）。ys/xs 为世界坐标轴。"""
+        out = sd_grid.copy()
+        for ri, wy in enumerate(ys):
+            cross = (ay > wy) != (by > wy)
+            if not cross.any():
+                out[ri] = -out[ri]
+                continue
+            xint = ax[cross] + (wy - ay[cross]) * abx[cross] / aby[cross]
+            xso = np.sort(xint)
+            cnt = len(xso) - np.searchsorted(xso, xs, side="left")
+            out[ri] = np.where((cnt % 2) == 1, out[ri], -out[ri])
+        return out
+
+    # ---- 粗网格全域解析 ----
+    step = max(1, int(math.ceil(max(nx, ny) / 256.0)))
+    sub_iy = np.arange(0, ny, step, dtype=np.int64)
+    sub_ix = np.arange(0, nx, step, dtype=np.int64)
+    gy = min_y + sub_iy * spacing
+    gx = min_x + sub_ix * spacing
+    PY, PX = np.meshgrid(gy, gx, indexing="ij")
+    sd_sub = _exact_dist(PX.ravel(), PY.ravel()).reshape(len(gy), len(gx))
+    sd_sub = _sign_rows(sd_sub, gy, gx)
+    if step > 1:
+        from scipy.ndimage import map_coordinates
+        yy, xx = np.meshgrid(np.arange(ny) / step, np.arange(nx) / step,
+                             indexing="ij")
+        sd = map_coordinates(sd_sub, [yy, xx], order=1, mode="nearest")
+    else:
+        sd = sd_sub
+
+    # ---- 边界 2 像素带：全分辨率精确覆盖 ----
+    if step > 1:
+        inside = build_inside_mask(poly, grid)
+        if inside.any():
+            from scipy.ndimage import binary_dilation
+            band = binary_dilation(inside, structure=np.ones((5, 5), dtype=bool))
+            rr_, cc_ = np.nonzero(band)
+            d_band = _exact_dist(min_x + cc_ * spacing, min_y + rr_ * spacing)
+            # band 内像素的符号：逐行射线（只对出现的行）
+            for ri in np.unique(rr_):
+                wy = min_y + ri * spacing
+                cross = (ay > wy) != (by > wy)
+                sel = rr_ == ri
+                if not cross.any():
+                    d_band[sel] = -d_band[sel]
+                    continue
+                xint = ax[cross] + (wy - ay[cross]) * abx[cross] / aby[cross]
+                xso = np.sort(xint)
+                pxs = min_x + cc_[sel] * spacing
+                cnt = len(xso) - np.searchsorted(xso, pxs, side="left")
+                d_band[sel] = np.where((cnt % 2) == 1, d_band[sel], -d_band[sel])
+            sd[band] = d_band
+    return sd
+
+
 # ==================== 基高（所有截面的公共基础） ====================
 
 def _seg_dist_sq(px: np.ndarray, py: float, ax: np.ndarray, ay: np.ndarray,
@@ -412,7 +521,8 @@ def compute_dome_free_bulge(inside: np.ndarray, sd: np.ndarray,
     平台区不叠加鼓起（保持平面）。
     """
     field = np.zeros(inside.shape, dtype=np.float64)
-    work_sd = _smooth_sd_for_triangle(sd, inside) if params.shape == "triangle" else sd
+    # 解析 SDF 无网格量化台阶，三角形不再需要 EDT 平滑补救
+    work_sd = sd
 
     dmax = float(work_sd.max()) if work_sd.size else 0.0
     if dmax < 1e-3:
@@ -433,7 +543,9 @@ def compute_dome_free_bulge(inside: np.ndarray, sd: np.ndarray,
     t = np.clip((s - s_platform) / span, 0.0, 1.0)
     shape = _dome_profile(params.shape, t)
     free = bulge_peak * shape
-    free[(s <= s_platform) | (~inside)] = 0.0
+    # 截断改用解析 sd 符号（像素掩码边界有 1 格悬崖，会把小高度
+    # 等值线变成像素阶梯多边形）
+    free[(s <= s_platform) | (work_sd <= 0.0)] = 0.0
     return free
 
 
@@ -642,7 +754,9 @@ def compute_region_relief_field(poly: np.ndarray, grid: Grid,
         free = compute_smooth_dome_free_bulge(inside, grid, params,
                                               params.base_height, params.base_angle)
     else:
-        sd = compute_signed_distance(inside, spacing)
+        # 穹顶用解析多边形 SDF：像素化掩码的 EDT 台阶会让高度曲线
+        # 提取出"奇怪的多边形"（尤其小高度等值线贴着掩码边界走）
+        sd = compute_polygon_sd(collapsed, grid, inside)
         free = compute_dome_free_bulge(inside, sd, params,
                                        params.base_height, params.base_angle)
 

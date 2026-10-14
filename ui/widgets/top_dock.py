@@ -41,8 +41,7 @@ ICON_MAP = {
     "ReliefRedo": resource_path("icons/redo.svg"),
 }
 # 用 QPainter 绘制中文的命令（Qt SVG 渲染器对中文字体支持弱）
-TEXT_ICON_KEYS = {"Text": "字", "TextureFill": "纹", "SlopeZone": "坡",
-                 "RestBoundary": "残"}
+TEXT_ICON_KEYS = {"Text": "字"}
 
 # 按钮悬停提示（统一极简规则）：
 #   1) 没有左右键功能的普通按钮 → 不在此表写，直接不显示悬停提示。
@@ -101,11 +100,8 @@ CATEGORIES = [
         ("LevelCalibrate", "水平\n校准"),
         ("RegionSlope", "斜面"),
         ("RevolveSlope", "旋转\n面"),
-    ]),
-    ("纹理分析", [
         ("TextureFill", "纹理\n填充"),
-        ("SlopeZone", "角度\n分区"),
-        ("RestBoundary", "残料\n边界"),
+        ("SlopeZone", "构造\n曲线"),
     ]),
     ("3D", [
         ("Extrude", "挤出"),

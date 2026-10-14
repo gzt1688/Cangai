@@ -57,8 +57,7 @@ COMMAND_MODES = {
     "RegionSlope":     ("relief",),   # 斜面
     "RevolveSlope":    ("relief",),   # 旋转面
     "TextureFill":     ("relief",),   # 纹理填充（几何纹理族）
-    "SlopeZone":       ("relief",),   # 角度分区线
-    "RestBoundary":    ("relief",),   # 残料边界线
+    "SlopeZone":       ("relief",),   # 构造曲线（角度/高度）
     # 浮雕动作（mainWindow 直调，不经过 executeCommand；
     # 列在此处供顶部按钮按模式置灰）
     "ReliefUndo":      ("relief",),   # 浮雕撤销

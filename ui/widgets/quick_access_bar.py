@@ -74,7 +74,7 @@ RELIEF_COMMAND_KEYS = {
     "RegionRelief", "Stamp", "SweepMaterial", "Smooth", "Move", "SweepSmooth",
     "DeJitter", "RegionTransform", "RegionDeform", "LevelCalibrate", "RegionSlope",
     "RevolveSlope", "ModelScale",
-    "TextureFill", "SlopeZone", "RestBoundary",
+    "TextureFill", "SlopeZone",
 }
 
 
