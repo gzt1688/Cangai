@@ -3,9 +3,13 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
 from PySide6.QtCore import Qt, Signal, QEvent
 import ui.styles.theme as theme
+from i18n import tr, languageChanged
 
 _NORMAL_BG = "#e0e0e0"
 _HOVER_BG = "#d0d0d0"
+
+# 视图方向标签中文原文（retranslateUi 用）
+_VIEW_LABELS = ["透\n视", "顶\n视", "前\n视", "右\n视"]
 
 
 def _labelNormal() -> str:
@@ -56,7 +60,7 @@ class ViewSwitchBar(QWidget):
         layout.setAlignment(Qt.AlignTop)
 
         self._labels: list[tuple[QLabel, int]] = []
-        for idx, text in [(0, "透\n视"), (1, "顶\n视"), (2, "前\n视"), (3, "右\n视")]:
+        for idx, text in enumerate(_VIEW_LABELS):
             lbl = QLabel(text, self)
             lbl.setFixedSize(25, 50)
             lbl.setAlignment(Qt.AlignCenter)
@@ -99,6 +103,11 @@ class ViewSwitchBar(QWidget):
 
         totalH = layout.sizeHint().height()
         self.setFixedSize(25, totalH)
+        languageChanged().connect(self.retranslateUi)
+
+    def retranslateUi(self) -> None:
+        """语言切换：视图方向标签保持中文（英文无法竖排），无需重设。"""
+        pass
 
     def _updateSelection(self, idx: int) -> None:
         self._current = idx
@@ -162,8 +171,7 @@ class ViewSwitchBar(QWidget):
             except Exception:
                 desktop = os.path.expanduser("~")
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", desktop,
-            "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.svg *.ico);;"
-            "所有文件 (*)")
+            self, tr("选择图片"), desktop,
+            tr("图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.svg *.ico);;所有文件 (*)"))
         if path:
             self.imageSelected.emit(path)

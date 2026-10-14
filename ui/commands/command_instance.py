@@ -1,5 +1,6 @@
 """命令实例基类：定义命令生命周期（启动/输入/完成/取消）。"""
 from __future__ import annotations
+import math
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import List, Optional
@@ -29,6 +30,13 @@ class CommandInstance(ABC):
     def setContext(self, doc, view) -> None:
         self._doc = doc
         self._view = view
+        self._modeView = None   # 活动视口探测（3D 模式下由 CommandManager 注入）
+
+    def setModeView(self, view) -> None:
+        """注入"模式视口"：提供 canvasMode()/viewMode() 接口的活动画布。
+        上下文 _view 始终是 2D 画布（预览图元宿主），视图方向判定需查询
+        真正可见的视口（3D 模式下为 Viewport3D，前视/右视按侧视平面绘制）。"""
+        self._modeView = view
 
     def state(self) -> CommandState:
         return self._state
@@ -166,6 +174,17 @@ class CommandInstance(ABC):
         path = self._previewItem.path()
         return None if path.isEmpty() else path
 
+    def previewPen(self):
+        """当前预览画笔（颜色/线型/线宽），供 3D 视口叠加绘制复用 2D 预览样式。"""
+        if self._previewItem is None:
+            return None
+        return self._previewItem.pen()
+
+    def needsCursorMarker(self) -> bool:
+        """命令是否需要 3D 视口在光标处绘制预览点（白底实心圆）。
+        逐点交互类命令默认 True；推拉等不需要的覆盖为 False。"""
+        return True
+
     def previewMarker(self):
         """光标预览点几何（圆心、半径）；未显示返回 None。供 3D 视口绘制。"""
         if self._markerItem is None or not self._markerItem.isVisible():
@@ -179,15 +198,108 @@ class CommandInstance(ABC):
     @abstractmethod
     def onMouseMove(self, wp: Point3D, mods) -> None: ...
 
+    def _viewAxes(self):
+        """当前视图绘制平面的世界轴 (u, v)。2D 画布/顶视/透视 = XY；
+        3D 视口（canvasMode=="3d"）前视 = XZ、右视 = YZ。
+        优先查询模式视口（真正可见的活动画布）；其余画布模式（浮雕等）
+        固定 XY——取点/预览几何都落在 XY 平面。"""
+        for v in (getattr(self, "_modeView", None), self._view):
+            if v is None:
+                continue
+            cm = getattr(v, "canvasMode", None)
+            if cm is not None:
+                try:
+                    if v.canvasMode() != "3d":
+                        continue   # 该视口非 3D 画布：固定 XY，交给下一个候选
+                except Exception:
+                    continue
+            vm = getattr(v, "viewMode", None)
+            if vm is None:
+                continue
+            try:
+                m = int(vm())
+            except Exception:
+                continue
+            if m == 2:
+                return (0, 2)
+            if m == 3:
+                return (1, 2)
+            return (0, 1)
+        return (0, 1)
+
+    def _isSideView(self) -> bool:
+        """当前是否在 3D 视口侧视图（前视/右视）绘图：
+        形状基元（圆/弧/椭圆）是 XY 平面对象，需按视图平面烘焙成曲线。"""
+        return self._viewAxes() != (0, 1)
+
+    def _uv(self, p: Point3D):
+        """世界点在当前视图绘制平面上的 (u, v) 分量。"""
+        ax = self._viewAxes()
+        return self._comp(p, ax[0]), self._comp(p, ax[1])
+
+    def _uvDist(self, p: Point3D, q: Point3D) -> float:
+        """两点在当前视图绘制平面 (u,v) 上的距离（侧视画圆/椭圆度量）。"""
+        ax = self._viewAxes()
+        return math.hypot(self._comp(p, ax[0]) - self._comp(q, ax[0]),
+                          self._comp(p, ax[1]) - self._comp(q, ax[1]))
+
+    def _planePts(self, pts) -> List[Point3D]:
+        """世界点列 → 当前视图平面坐标点列（x=u, y=v, z=平面外分量）。
+        供 XY 平面数学工具（三点解弧等）在侧视平面复用。"""
+        ax = self._viewAxes()
+        w = 3 - ax[0] - ax[1]
+        return [Point3D(self._comp(p, ax[0]), self._comp(p, ax[1]),
+                        self._comp(p, w)) for p in pts]
+
+    def _planeToWorld(self, pts, anchor: Point3D) -> List[Point3D]:
+        """视图平面 (u,v) 点列 → 世界坐标点列。
+        平面外分量 w 取锚点的对应分量（顶视/透视=构造平面 Z，
+        前视/右视=所在侧视平面常量 0）。"""
+        ax = self._viewAxes()
+        w = self._comp(anchor, 3 - ax[0] - ax[1])
+        return [self._mkUVW(ax, p.x, p.y, w) for p in pts]
+
+    def _uvPath(self, pts) -> QPainterPath:
+        """世界点列 → 当前视图平面 (u,v) 坐标的预览路径
+        （ax=(0,1) 时与 _linePath 等价）。"""
+        path = QPainterPath()
+        if not pts:
+            return path
+        u0, v0 = self._uv(pts[0])
+        path.moveTo(u0, v0)
+        for p in pts[1:]:
+            u, v = self._uv(p)
+            path.lineTo(u, v)
+        return path
+
+    @staticmethod
+    def _mkUVW(axes, u: float, v: float, w: float) -> Point3D:
+        """由 (u,v) + 平面外分量 w 组装世界点。"""
+        c = [0.0, 0.0, 0.0]
+        c[axes[0]], c[axes[1]] = u, v
+        c[3 - axes[0] - axes[1]] = w
+        return Point3D(c[0], c[1], c[2])
+
+    def _comp(self, p: Point3D, i: int) -> float:
+        return p.x if i == 0 else (p.y if i == 1 else p.z)
+
     def _orthoPoint(self, wp: Point3D, origin: Point3D) -> Point3D:
-        """正交约束：若开启，把 wp 约束到 origin 的水平/垂直方向。"""
+        """正交约束：若开启，把 wp 约束到 origin 的水平/垂直方向。
+        按当前视图绘制平面 (u,v) 度量（前视水平=X、垂直=Z）。"""
         from core.grid_manager import GridManager
         if not GridManager.instance().isOrthoEnabled():
             return wp
-        dx, dy = wp.x - origin.x, wp.y - origin.y
+        ax = self._viewAxes()
+        dx = self._comp(wp, ax[0]) - self._comp(origin, ax[0])
+        dy = self._comp(wp, ax[1]) - self._comp(origin, ax[1])
+        w = 3 - ax[0] - ax[1]
         if abs(dx) > abs(dy):
-            return Point3D(wp.x, origin.y, wp.z)
-        return Point3D(origin.x, wp.y, wp.z)
+            # 水平：v 锁 origin，u 随鼠标
+            return self._mkUVW(ax, self._comp(wp, ax[0]),
+                               self._comp(origin, ax[1]), self._comp(wp, w))
+        # 垂直：u 锁 origin，v 随鼠标
+        return self._mkUVW(ax, self._comp(origin, ax[0]),
+                           self._comp(wp, ax[1]), self._comp(wp, w))
 
     def onMouseRelease(self, mods) -> None:
         pass
@@ -214,6 +326,15 @@ class CommandInstance(ABC):
 
     def onKeyPress(self, key, mods) -> bool:
         """命令激活期间的键盘事件（如画线 C 键闭合）；返回 True 表示已消费。"""
+        return False
+
+    def allowsSelectionDelete(self) -> bool:
+        """Del 键删除选中对象是否被允许（命令激活期间默认禁止——命令
+        可能正持有目标对象引用，删除会破坏其内部状态）。
+
+        "点击即生效、保持激活可连续操作"的命令（挤出/布尔等）在空闲
+        态（无任何被引用的目标/预览）应返回 True：它们的应用结果会被
+        自动选中，若一律禁止 Del，用户会碰到"实体选中却删不掉"。"""
         return False
 
     def cancel(self) -> None:

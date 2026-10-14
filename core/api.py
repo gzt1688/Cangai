@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -33,12 +34,31 @@ API_VERSION = 1
 
 # 内置插件目录（随软件分发）与用户插件目录（%APPDATA%/Cangai/plugins）
 def builtinPluginDir() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plugins")
+    """插件目录：源码树为项目根 plugins\；打包版为 exe 同级 plugins\。
+
+    打包脚本会在发布包里创建该空目录，用户把自己写的插件放进去即可
+    （同名 id 时用户投放的版本覆盖内置）。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), "plugins")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "plugins")
 
 
 def userPluginDir() -> str:
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
     return os.path.join(base, "Cangai", "plugins")
+
+
+def privatePluginDir() -> str:
+    """私有插件目录（源码树级，**不随软件分发**——打包脚本只带 plugins/）。
+
+    开发期个人功能放这里：进版本库、开发运行可装载，但公共发布版
+    天然不包含（目录不存在时发现阶段直接跳过）。
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "plugins_private")
 
 
 @dataclass
@@ -217,9 +237,10 @@ class CangaiAPI:
 
     def objects(self, typeName: str | None = None, layerId: int | None = None,
                 selected: bool | None = None) -> List:
-        """按类型名/图层/选中状态查询对象（如 typeName="CURVE"）。"""
+        """按类型名/图层/选中状态查询对象（如 typeName="CURVE"）。
+        跨空间查询：包含 2D/浮雕空间与 3D 空间的全部对象。"""
         out = []
-        for o in self.activeDocument().objects():
+        for o in self.activeDocument().allObjects():
             if typeName is not None and o.type().name != typeName:
                 continue
             if layerId is not None and o.layerId() != layerId:
@@ -321,7 +342,7 @@ class CangaiAPI:
         if self._host is not None:
             self._host.executeCommand(name)
             return None
-        return entry["fn"](dict(context or {}))
+        return entry.fn(dict(context or {}))
 
     def executeCommand(self, name: str, *args) -> bool:
         """执行交互命令（画布取点类完整流程）。"""

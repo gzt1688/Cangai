@@ -169,6 +169,15 @@ def computeFillet(seg1Start: Point3D, seg1End: Point3D,
         return result
 
     tangentDist = radius / math.tan(halfAngle)
+    # 切距钳制：半径大于边长时 trimPt 会越过线段端点，整线批量圆角重建
+    # 的折线自交——按两线各自交点到远端的可用长度收 49%，并同步回算
+    # 钳制后的有效半径，保证圆心/弧中点与切点一致
+    avail1 = max((seg1End - inter).length(), (seg1Start - inter).length())
+    avail2 = max((seg2End - inter).length(), (seg2Start - inter).length())
+    tangentDist = min(tangentDist, 0.49 * min(avail1, avail2))
+    if tangentDist < EPSILON_RADIUS:
+        return result
+    radius = tangentDist * math.tan(halfAngle)
     result.trimPt1 = inter + dir1 * tangentDist
     result.trimPt2 = inter + dir2 * tangentDist
 
@@ -181,15 +190,15 @@ def computeFillet(seg1Start: Point3D, seg1End: Point3D,
     centerDist = radius / sinHalf
     result.center = inter + bisector * centerDist
 
-    # 圆弧中点：沿两切点方向之和归一化
+    # 圆弧中点：两切点单位径向之和的方向 × 半径（旧式 s*k 的模长是
+    # r²·√(2/(1+dot))、仅方向正确——sampleFilletArc 只取方向角故侥幸，
+    # 这里改为真正落在弧上，任何把 arcMid 当弧上点的消费者不再偏移）
     v1 = (result.trimPt1 - result.center) * (1.0 / radius)
     v2 = (result.trimPt2 - result.center) * (1.0 / radius)
-    d = v1.dot(v2)
-    denom = 1.0 + d
-    if denom > EPSILON_LENGTH:
-        s = result.trimPt1 + result.trimPt2 - result.center * 2.0
-        k = radius / denom
-        result.arcMid = result.center + s * k
+    u = v1 + v2
+    uLen = u.length()
+    if uLen > EPSILON_LENGTH:
+        result.arcMid = result.center + u * (radius / uLen)
     else:
         bis = (result.trimPt1 + result.trimPt2) * 0.5 - result.center
         bisLen2 = bis.length()
@@ -198,7 +207,9 @@ def computeFillet(seg1Start: Point3D, seg1End: Point3D,
         else:
             result.arcMid = Point3D(inter.x, inter.y, inter.z)
 
-    result.arcWeight = math.cos(halfAngle)
+    # 弧扫角 = π−α（α=两切线夹角）；有理二次 Bezier 中间权重 =
+    # cos(扫角/2) = sin(α/2)。旧 cos(α/2) 仅直角正确
+    result.arcWeight = math.sin(halfAngle)
     result.valid = True
     return result
 
@@ -281,20 +292,21 @@ def cornerFromProjection(seg1Start: Point3D, seg1End: Point3D,
     bisector = bisector * (1.0 / bisLen)
     result.center = inter + bisector * (radius / sinHalf)
 
-    # 圆弧中点：沿两切点方向之和归一化
+    # 圆弧中点：两切点单位径向之和的方向 × 半径（同 computeFillet，
+    # 旧式 s*k 模长量纲不符，仅方向正确）
     v1u = (result.trimPt1 - result.center) * (1.0 / radius)
     v2u = (result.trimPt2 - result.center) * (1.0 / radius)
-    denom = 1.0 + v1u.dot(v2u)
-    if denom > EPSILON_LENGTH:
-        s = result.trimPt1 + result.trimPt2 - result.center * 2.0
-        result.arcMid = result.center + s * (radius / denom)
+    u = v1u + v2u
+    uLen = u.length()
+    if uLen > EPSILON_LENGTH:
+        result.arcMid = result.center + u * (radius / uLen)
     else:
         bis = (result.trimPt1 + result.trimPt2) * 0.5 - result.center
         bisLen2 = bis.length()
         if bisLen2 < EPSILON_LENGTH:
             return result
         result.arcMid = result.center + bis * (radius / bisLen2)
-    result.arcWeight = math.cos(halfAngle)
+    result.arcWeight = math.sin(halfAngle)
     result.valid = True
     return result
 
@@ -334,60 +346,73 @@ def sampleFilletArc(fr: FilletResult, samples: int = ARC_SAMPLES) -> List[Point3
 # ==================== 批量角点计算 ====================
 
 def computeAllCornersFillet(points: Sequence[Point3D], radius: float,
-                            sharpCorners: Optional[Set[int]] = None) -> List[CornerResult]:
-    """批量计算折线所有内角点的圆角。"""
-    results: List[CornerResult] = []
-    if len(points) < 3 or radius < EPSILON_RADIUS:
-        return results
-    for i in range(1, len(points) - 1):
-        cr = CornerResult(cornerIndex=i)
-        if sharpCorners is not None and i not in sharpCorners:
-            results.append(cr)
-            continue
-        prev, corner, nxt = points[i - 1], points[i], points[i + 1]
-        if not isSharpCorner(prev, corner, nxt):
-            results.append(cr)
-            continue
-        fr = computeFillet(prev, corner, corner, nxt, radius)
-        if not fr.valid:
-            results.append(cr)
-            continue
-        cr.valid = True
-        cr.intersection = fr.intersection
-        cr.trimPt1 = fr.trimPt1
-        cr.trimPt2 = fr.trimPt2
-        cr.center = fr.center
-        cr.arcMid = fr.arcMid
-        cr.arcWeight = fr.arcWeight
-        results.append(cr)
-    return results
+                            sharpCorners: Optional[Set[int]] = None,
+                            closed: bool = False) -> List[CornerResult]:
+    """批量计算折线角点的圆角。
+
+    closed=True 时首顶点也算角点（前顶点回绕到末点）；首末点重合的
+    闭合轮廓按去重后的顶点数回绕，末点不重复计算。
+    """
+    return _computeAllCorners(points, sharpCorners, closed,
+                              lambda p, c, n: computeFillet(p, c, c, n, radius),
+                              _fillFilletCorner)
 
 
 def computeAllCornersBevel(points: Sequence[Point3D], d1: float, d2: float,
-                           sharpCorners: Optional[Set[int]] = None) -> List[CornerResult]:
-    """批量计算折线所有内角点的斜角。"""
+                           sharpCorners: Optional[Set[int]] = None,
+                           closed: bool = False) -> List[CornerResult]:
+    """批量计算折线角点的斜角（closed 含义同 computeAllCornersFillet）。"""
+    return _computeAllCorners(points, sharpCorners, closed,
+                              lambda p, c, n: computeBevel(p, c, c, n, d1, d2),
+                              _fillBevelCorner)
+
+
+def _computeAllCorners(points, sharpCorners, closed, compute, fill) -> List[CornerResult]:
     results: List[CornerResult] = []
-    if len(points) < 3 or d1 < EPSILON_RADIUS or d2 < EPSILON_RADIUS:
+    n = len(points)
+    if n < 3:
         return results
-    for i in range(1, len(points) - 1):
+    if closed:
+        m = n - 1 if points[0].distanceTo(points[-1]) < 1e-6 else n
+        indices = range(m)
+    else:
+        m = n
+        indices = range(1, n - 1)
+    for i in indices:
         cr = CornerResult(cornerIndex=i)
         if sharpCorners is not None and i not in sharpCorners:
             results.append(cr)
             continue
-        prev, corner, nxt = points[i - 1], points[i], points[i + 1]
+        prev = points[(i - 1) % m]
+        nxt = points[(i + 1) % m]
+        corner = points[i]
         if not isSharpCorner(prev, corner, nxt):
             results.append(cr)
             continue
-        br = computeBevel(prev, corner, corner, nxt, d1, d2)
+        br = compute(prev, corner, nxt)
         if not br.valid:
             results.append(cr)
             continue
-        cr.valid = True
-        cr.intersection = br.intersection
-        cr.trimPt1 = br.trimPt1
-        cr.trimPt2 = br.trimPt2
+        fill(cr, br)
         results.append(cr)
     return results
+
+
+def _fillFilletCorner(cr: CornerResult, fr: FilletResult) -> None:
+    cr.valid = True
+    cr.intersection = fr.intersection
+    cr.trimPt1 = fr.trimPt1
+    cr.trimPt2 = fr.trimPt2
+    cr.center = fr.center
+    cr.arcMid = fr.arcMid
+    cr.arcWeight = fr.arcWeight
+
+
+def _fillBevelCorner(cr: CornerResult, br: BevelResult) -> None:
+    cr.valid = True
+    cr.intersection = br.intersection
+    cr.trimPt1 = br.trimPt1
+    cr.trimPt2 = br.trimPt2
 
 
 # ==================== 闭合多边形顶点倒角 ====================
@@ -418,15 +443,21 @@ def applyFilletToVertices(vertices: Sequence[Point3D], fr: float,
         e1 = e1 * (1.0 / len1)
         e2 = e2 * (1.0 / len2)
 
-        cutLen = min(fr, len1 * 0.49, len2 * 0.49)
+        dot = e1.dot(e2)
+        cross = e1.x * e2.y - e1.y * e2.x
+        alpha = abs(math.atan2(cross, dot))   # 顶点内角
+        # fr 按半径语义：切距 = r/tan(α/2)（旧代码直接把 fr 当切距，
+        # 实际半径 = fr·tan(α/2)，非直角处偏离输入半径）
+        tanHalf = math.tan(alpha * 0.5)
+        cutWanted = fr / tanHalf if tanHalf > 1e-6 else fr
+        cutLen = min(cutWanted, len1 * 0.49, len2 * 0.49)
         T1 = Point3D(V.x + e1.x * cutLen, V.y + e1.y * cutLen, V.z)
         T2 = Point3D(V.x + e2.x * cutLen, V.y + e2.y * cutLen, V.z)
         result.append(T1)
 
-        dot = e1.dot(e2)
-        cross = e1.x * e2.y - e1.y * e2.x
-        arcAngle = abs(math.atan2(cross, dot))
-        w = math.cos(arcAngle / 2.0)
+        # 弧扫角 = π−α；有理二次 Bezier 中间权重 = cos(扫角/2) = sin(α/2)
+        # （旧 cos(α/2) 仅 α=90° 碰巧正确，非直角处采样出椭弧）
+        w = math.sin(alpha * 0.5)
         if w < 0.05:
             w = 0.05
 

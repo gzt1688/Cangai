@@ -112,7 +112,8 @@ def filletClosedPolyline(pts: List[Point3D], junctions: List[int],
                          rounded: bool = True) -> List[Point3D]:
     """在闭合折线的指定顶点处做倒角。
 
-    与原版波浪圆倒角同算法：按转角 θ 修剪两侧各 t = r/tan(θ/2)，
+    与原版波浪圆倒角同算法：按转角 θ（=π−内角α）修剪两侧各
+    t = r/tan(α/2) = r·tan(θ/2)，
     修剪量不超过相邻连接点间折线长的 45%；修剪区内原顶点全部剔除，
     不留多余线段。rounded=True 时修剪点间插入半径 r、两侧相切的
     圆弧采样点（圆角）；否则修剪点直连（倒直角）。
@@ -146,10 +147,12 @@ def filletClosedPolyline(pts: List[Point3D], junctions: List[int],
         if l1 < 1e-12 or l2 < 1e-12:
             return None
         cosT = max(-1.0, min(1.0, (dx1 * dx2 + dy1 * dy2) / (l1 * l2)))
-        theta = math.acos(cosT)
+        theta = math.acos(cosT)   # 转角 = π−内角α
         if theta < 1e-6 or theta > math.pi - 1e-6:
             return None
-        t = r / math.tan(theta * 0.5)
+        # 切距 = r/tan(α/2) = r·tan(θ/2)（旧式 r/tan(θ/2) 在非 90° 角处
+        # 切距反向偏离；90° 时两者相等故矩形测试不暴露）
+        t = r * math.tan(theta * 0.5)
         # 修剪量不超过相邻连接点间折线长的 45%（两侧独立钳制）；
         # idx=0 的前驱段跨闭合处：展开坐标为 js[m-1] → js[0]+n。
         pJ = js[idx - 1] if idx > 0 else js[-1]

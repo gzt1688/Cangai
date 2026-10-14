@@ -86,6 +86,9 @@ class BaseGraphicsItem(QGraphicsPathItem):
 
     def _paintSelectionBox(self, painter, color: str) -> None:
         """选中虚线框：精确贴合对象世界包围盒（不含像素余量）。"""
+        from core import app_settings
+        if not app_settings.show_selection_box:
+            return
         if self._obj.type() == ObjectType.POINT:
             return
         try:

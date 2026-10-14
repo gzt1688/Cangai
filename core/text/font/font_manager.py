@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 import sys
 import glob
+import hashlib
+import pickle
+import zlib
 from typing import Dict, List, Optional, Tuple
 from .font_data import FontData, FontType
 from . import ttf_reader, sgl_reader, shx_reader, shp_reader
@@ -94,7 +97,16 @@ def loadFont(filePath: str) -> FontData:
     realPath, fontNumber = _splitFontNumber(filePath)
     ext = os.path.splitext(realPath)[1].lower()
     if ext in (".sgl",):
-        return sgl_reader.loadFromFile(realPath)
+        # sgl 单线字体解析约 5~11s，用磁盘缓存（pickle+zlib，按文件
+        # mtime/size 校验）避免每次启动/文字命令重复解析。unpickle
+        # 失败（代码更新类结构变化等）自动回退重新解析并重建缓存。
+        cached = _cachedFont(realPath)
+        if cached is not None:
+            return cached
+        fd = sgl_reader.loadFromFile(realPath)
+        if fd is not None and fd.isLoaded and not fd.error:
+            _saveCachedFont(realPath, fd)
+        return fd
     if ext in (".shx",):
         return shx_reader.loadFromFile(realPath)
     if ext in (".shp",):
@@ -104,6 +116,60 @@ def loadFont(filePath: str) -> FontData:
     fd = FontData()
     fd.error = f"不支持的字体格式: {ext}"
     return fd
+
+
+
+# ---- sgl 字体磁盘缓存 ----
+_FONT_CACHE_DIR = None
+
+
+def _fontCacheDir() -> Optional[str]:
+    global _FONT_CACHE_DIR
+    if _FONT_CACHE_DIR is None:
+        d = os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+            "Cangai", "font_cache")
+        try:
+            os.makedirs(d, exist_ok=True)
+            _FONT_CACHE_DIR = d
+        except Exception:
+            _FONT_CACHE_DIR = ""
+    return _FONT_CACHE_DIR or None
+
+
+def _cachedFont(realPath: str) -> Optional[FontData]:
+    d = _fontCacheDir()
+    if not d:
+        return None
+    try:
+        st = os.stat(realPath)
+        key = hashlib.md5(realPath.encode("utf-8")).hexdigest()
+        p = os.path.join(d, key + ".pkl.z")
+        if not os.path.isfile(p):
+            return None
+        with open(p, "rb") as f:
+            blob = zlib.decompress(f.read())
+        meta, fd = pickle.loads(blob)
+        if meta != (st.st_mtime_ns, st.st_size):
+            return None
+        return fd
+    except Exception:
+        return None
+
+
+def _saveCachedFont(realPath: str, fd: FontData) -> None:
+    d = _fontCacheDir()
+    if not d:
+        return
+    try:
+        st = os.stat(realPath)
+        key = hashlib.md5(realPath.encode("utf-8")).hexdigest()
+        p = os.path.join(d, key + ".pkl.z")
+        blob = zlib.compress(pickle.dumps(((st.st_mtime_ns, st.st_size), fd)), 6)
+        with open(p, "wb") as f:
+            f.write(blob)
+    except Exception:
+        pass
 
 
 class FontManager:
@@ -168,6 +234,13 @@ class FontManager:
         fd = loadFont(filePath)
         self._cache[key] = fd
         return fd
+
+    def getCached(self, filePath: str) -> Optional[FontData]:
+        """返回已缓存的字体；未加载则返回 None（不触发加载）。"""
+        fd = self._cache.get(os.path.normpath(filePath))
+        if fd is not None and fd.isLoaded:
+            return fd
+        return None
 
     def clearCache(self) -> None:
         self._cache.clear()

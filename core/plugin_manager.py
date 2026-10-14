@@ -7,7 +7,8 @@
 入口脚本需提供 `register(api)`；可选 `unregister(api)`（停用时回调清理）。
 清单字段：id / name / version / apiVersion / description / entry。
 
-发现目录：软件内置 `plugins/` + 用户 `%APPDATA%/Cangai/plugins/`
+发现目录：软件内置 `plugins/` + 私有 `plugins_private/`（源码树内，
+不随软件分发，存在才生效）+ 用户 `%APPDATA%/Cangai/plugins/`
 （同名 id 时用户插件覆盖内置）。启停状态持久化于 app_settings.plugin_state。
 """
 from __future__ import annotations
@@ -20,7 +21,8 @@ import traceback
 from dataclasses import dataclass
 
 import core.app_settings as app_settings
-from core.api import API_VERSION, builtinPluginDir, userPluginDir
+from core.api import (API_VERSION, builtinPluginDir, privatePluginDir,
+                      userPluginDir)
 
 
 @dataclass
@@ -41,7 +43,8 @@ class PluginInfo:
 class PluginManager:
     def __init__(self, api, extraDirs: list | None = None) -> None:
         self._api = api
-        self._dirs: list = [builtinPluginDir(), userPluginDir()]
+        self._dirs: list = [builtinPluginDir(), privatePluginDir(),
+                             userPluginDir()]
         if extraDirs:
             self._dirs.extend(extraDirs)
         self._infos: dict = {}          # id → PluginInfo
@@ -142,6 +145,17 @@ class PluginManager:
             info.error = ""
             return True
         except Exception as e:
+            # 回滚半途注册：异常前已注册进 _actions/_commands/_buttons 的项
+            # 会残留生效（_registered 未记录，unload 清不掉），按 diff 撤销；
+            # 同时清掉泄漏的模块表项（exec_module 前已塞入 sys.modules）
+            try:
+                after = self._api.snapshotRegistrations()
+                for name in ((after[0] - before[0]) | (after[1] - before[1])):
+                    self._api.unregisterRegistration(name)
+                self._api.removeButtonsForPlugin(info.pluginId)
+                sys.modules.pop(f"cangai_plugin_{info.pluginId}", None)
+            except Exception:
+                pass
             info.status = "出错"
             info.error = f"{type(e).__name__}: {e}"
             traceback.print_exc()

@@ -58,13 +58,16 @@ def _clampedBSpline(ctrl: List[Point], degree: int, n: int) -> List[Point]:
         if inner > 0:
             for k in range(1, inner + 1):
                 knots.append(k / (inner + 1))
-        knots += [float(inner + 1)] * (degree + 1)
-        t_max = knots[-1]
+        # 尾节点必须为 1.0：此前写成 inner+1 会让参数域远超内节点范围，
+        # 曲线在 [0,1] 内被压缩塌陷（多控制点字形如"口"左壁丢失）。
+        knots += [1.0] * (degree + 1)
         c = np.array(ctrl, dtype=float)
         spl = BSpline(knots, c, degree)
+        # 自适应采样：控制点多时加密采样，保证长样条平滑
+        n = max(n, 3 * len(ctrl))
         pts = []
         for i in range(n + 1):
-            t = t_max * i / n
+            t = i / n
             v = spl(t)
             pts.append((float(v[0]), float(v[1])))
         return pts

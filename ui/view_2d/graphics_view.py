@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 from typing import Optional
 from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, Signal
-from PySide6.QtGui import QMouseEvent, QWheelEvent, QPainter, QPalette, QColor, QBrush, QPen, QFont, QPolygonF
+from PySide6.QtGui import (QMouseEvent, QWheelEvent, QKeyEvent, QPainter,
+                           QPalette, QColor, QBrush, QPen, QFont, QPolygonF)
 from PySide6.QtWidgets import QGraphicsView, QGraphicsItem
 
 from core.grid_manager import GridManager
@@ -13,6 +14,7 @@ from core.snap.snap_manager import SnapManager
 from core.snap.snap_types import SnapResult, snapLabel, SnapType
 from core.vector.geometry_types import Point3D, ObjectType
 from ui.view_2d.items.dimension_item import DimensionGraphicsItem
+from ui.view_drop import droppedFilePaths, acceptIfFiles
 
 
 def _segIntersectsRect(p, q, r: QRectF) -> bool:
@@ -48,6 +50,17 @@ def paintSnapMarker(painter, snap, sp, cursorPos) -> None:
     sp 为标记的屏幕坐标，cursorPos 为当前光标屏幕坐标。"""
     painter.save()
     painter.resetTransform()
+    # HiDPI：QPainter 初始 transform 含设备像素比缩放（QOpenGLWidget 与
+    # 高 DPI 光栅视图同理），resetTransform 会把它一并清掉——此后所有
+    # 绘制落在设备像素上，缩放屏（125%/150%）时标记缩小、气泡文字又小
+    # 又糊。按设备像素比补回缩放，恢复 1:1 逻辑像素绘制。
+    try:
+        dpr = painter.device().devicePixelRatioF() if \
+            painter.device() is not None else 1.0
+    except Exception:
+        dpr = 1.0
+    if dpr and dpr > 0:
+        painter.scale(dpr, dpr)
     pen = QPen(QColor("#15b6c9"), 1.4)
     pen.setCosmetic(True)
     painter.setPen(pen)
@@ -95,18 +108,18 @@ def paintSnapMarker(painter, snap, sp, cursorPos) -> None:
     # 气泡提示
     label = snapLabel(t)
     if label:
-        painter.setPen(QPen(QColor("#15b6c9")))
         painter.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
         fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(label) + 8
-        th = fm.height() + 2
-        bx = sp.x() + 10
-        by = sp.y() - th - 2
+        tw = int(fm.horizontalAdvance(label)) + 10
+        th = int(fm.height()) + 4
+        bx = int(sp.x()) + 12
+        by = int(sp.y()) - th - 4
         painter.setBrush(QColor("#15b6c9"))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(bx, by, tw, th, 3, 3)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         painter.setPen(QPen(QColor("#ffffff")))
-        painter.drawText(bx + 4, by + fm.ascent() + 1, label)
+        painter.drawText(bx + 5, by + fm.ascent() + 2, label)
     painter.restore()
 
 
@@ -115,9 +128,12 @@ class GraphicsView(QGraphicsView):
     mouseMoved = Signal(object)
     snapChanged = Signal(object)
     scaleChanged = Signal(float)
+    # 画布拖入文件：路径列表 + 落点世界坐标（主窗口接入导入）
+    fileDropped = Signal(list, object)
 
     def __init__(self, scene) -> None:
         super().__init__(scene)
+        self.setAcceptDrops(True)   # 支持把 png/jpg/dxf/stl 直接拖进画布
         self.setRenderHint(QPainter.Antialiasing, True)
         self.setRenderHint(QPainter.SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.NoDrag)
@@ -384,7 +400,10 @@ class GraphicsView(QGraphicsView):
         """键盘事件优先交给活动命令消费（缩放数字输入、画线 C 闭合等）；
         命令不消费的键（Esc/Enter/Ctrl+Z/F8/Delete 等全局快捷键），再让
         QGraphicsView 默认处理，若仍未接受则转发给顶层窗口（MainWindow）
-        的 keyPressEvent 统一处理，防止焦点在 GraphicsView 时快捷键失效。"""
+        的 keyPressEvent 统一处理，防止焦点在 GraphicsView 时快捷键失效。
+
+        注意：Tab 快捷键不在此处理，由主窗口的 QShortcut 全局监听，
+        避免被 QGraphicsView 默认的焦点切换机制吞掉。"""
         cm = self._commandManager
         # Esc / Enter：保留给 MainWindow 走 cancelActive / onEnter 专门分支
         if cm is not None \
@@ -403,6 +422,24 @@ class GraphicsView(QGraphicsView):
             # 直接转发同一个事件（此路径上命令管理器与 QGraphicsView 都未 accept，
             # 即使再次经过 accept 判断也不会冲突）
             win.keyPressEvent(event)
+
+    # ---------------- 文件拖入画布 ----------------
+
+    def dragEnterEvent(self, event) -> None:
+        acceptIfFiles(event)
+
+    def dragMoveEvent(self, event) -> None:
+        acceptIfFiles(event)
+
+    def dropEvent(self, event) -> None:
+        paths = droppedFilePaths(event)
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        wp = self.screenToWorld(
+            self.viewport().mapFrom(self, event.position().toPoint()))
+        self.fileDropped.emit(paths, wp)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MiddleButton:

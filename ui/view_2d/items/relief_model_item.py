@@ -33,6 +33,7 @@ class ReliefModelItem(BaseGraphicsItem):
         super().__init__(obj)
         self._pixmap: QPixmap | None = None
         self._cachedKey: int | None = None
+        self._pixmapDirty = False
         self._rebuildCache()
 
     # ---------------- 预览缓存 ----------------
@@ -46,6 +47,7 @@ class ReliefModelItem(BaseGraphicsItem):
             o.zExaggeration())
         self._pixmap = self._toPixmap(img)
         self._cachedKey = o.version()
+        self._pixmapDirty = False
 
     @staticmethod
     def _toPixmap(img: np.ndarray) -> QPixmap:
@@ -118,8 +120,12 @@ class ReliefModelItem(BaseGraphicsItem):
 
     def syncFromObject(self) -> None:
         super().syncFromObject()
-        if self._obj.version() != self._cachedKey:
-            self._rebuildCache()
+        # 预览重建只"标记脏"，推迟到 paint 时惰性执行：浮雕模式的笔画
+        # （堆料/磨光/Ctrl 涂抹）每 33ms 推一次 version，若在此急切重建，
+        # 会在**隐藏的** 2D 画布上白烧几十毫秒/次（downsample 1024 + 着色），
+        # 直接造成 3D 视口长帧（模型闪跳）。隐藏视图不会 paint → 零成本；
+        # 2D 可见时 paint 前重建一次，Qt 事件合并天然节流。
+        self._pixmapDirty = True
         # _place 可能已变（移动/缩放/旋转）→ 世界 AABB/shape 变，需告知场景
         self.prepareGeometryChange()
         self.update()
@@ -135,6 +141,9 @@ class ReliefModelItem(BaseGraphicsItem):
         opt.state &= ~QStyle.StateFlag.State_Selected
 
         o = self._obj
+        if self._pixmapDirty or self._obj.version() != self._cachedKey:
+            self._rebuildCache()          # 惰性重建：仅在本图元真实绘制时执行
+
         localRect = self._localRect()
         tr = self._placeTransform()
 

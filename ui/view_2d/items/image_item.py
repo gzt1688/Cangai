@@ -61,10 +61,18 @@ class ImageGraphicsItem(BaseGraphicsItem):
         painter.restore()
         if o.isSelected():
             from ui.styles import theme
+            from core import app_settings
             hl = theme.selectionColorFor(o)
-            pen = QPen(QColor(hl), 1.0, Qt.PenStyle.DashLine)
+            pts = o.points()
+            poly = QPolygonF([QPointF(p.x, p.y) for p in pts])
+            painter.save()
+            if app_settings.show_selection_box:
+                pen = QPen(QColor(hl), 1.0, Qt.PenStyle.DashLine)
+            else:
+                # 关闭虚线框时用加粗实线四角框作选中高亮（与曲线加粗描边一致）
+                pen = QPen(QColor(hl), 2.0)
             pen.setCosmetic(True)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            pts = o.points()
-            painter.drawPolygon(QPolygonF([QPointF(p.x, p.y) for p in pts]))
+            painter.drawPolygon(poly)
+            painter.restore()

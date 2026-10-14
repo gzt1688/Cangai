@@ -2,41 +2,78 @@
 
 支持 10 种对象捕捉（参考 AutoCAD OSNAP）：
 端点 / 中点 / 圆心 / 节点 / 象限点 / 交点 / 垂足 / 切点 / 最近点 / 顶点。
+
+捕捉平面轴：`snap(..., axes=(u, v))` 指定参与 2D 距离计算的两个世界轴。
+默认 (0, 1)=XY（2D 画布/顶视）；3D 视口前视传 (0, 2)=XZ、右视传 (1, 2)=YZ，
+使侧视下取点按屏幕平面度量距离——否则竖直方向的吸附会错误地吸到
+XY 投影重合的点上（表现为前视画线第二个点被吸回第一个点）。
 """
 from __future__ import annotations
 import math
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Tuple
 from .snap_types import SnapType, SnapResult
 from ..vector.geometry_types import Point3D, ObjectType
 
 
-def _nearestOnSegment(p: Point3D, a: Point3D, b: Point3D) -> Point3D:
-    """点 p 到线段 ab 的最近点（钳制到段内）。"""
-    dx, dy = b.x - a.x, b.y - a.y
+_AXES_XY: Tuple[int, int] = (0, 1)
+
+
+def _comp(p: Point3D, i: int) -> float:
+    """点 p 的第 i 个世界分量（0=x, 1=y, 2=z）。"""
+    return p.x if i == 0 else (p.y if i == 1 else p.z)
+
+
+def _wAxis(axes: Tuple[int, int]) -> int:
+    """捕捉平面外的第 3 轴索引。"""
+    return 3 - axes[0] - axes[1]
+
+
+def _nearestOnSegment(p: Point3D, a: Point3D, b: Point3D,
+                      axes: Tuple[int, int] = _AXES_XY) -> Point3D:
+    """点 p 到线段 ab 的最近点（按捕捉平面 (u,v) 度量，钳制到段内）。
+    返回世界点：u,v 为投影最近点，平面外分量取 a 的值。"""
+    u0, v0 = axes
+    dx = _comp(b, u0) - _comp(a, u0)
+    dy = _comp(b, v0) - _comp(a, v0)
     L2 = dx * dx + dy * dy
     if L2 < 1e-12:
         return a
-    t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / L2
+    t = ((_comp(p, u0) - _comp(a, u0)) * dx + (_comp(p, v0) - _comp(a, v0)) * dy) / L2
     t = max(0.0, min(1.0, t))
-    return Point3D(a.x + t * dx, a.y + t * dy, a.z)
+    c = [0.0, 0.0, 0.0]
+    c[u0] = _comp(a, u0) + t * dx
+    c[v0] = _comp(a, v0) + t * dy
+    c[_wAxis(axes)] = _comp(a, _wAxis(axes))
+    return Point3D(c[0], c[1], c[2])
 
 
-def _segSegIntersect(a1: Point3D, a2: Point3D, b1: Point3D, b2: Point3D):
-    """两线段交点（无交点返回 None）。"""
-    d1x, d1y = a2.x - a1.x, a2.y - a1.y
-    d2x, d2y = b2.x - b1.x, b2.y - b1.y
+def _segSegIntersect(a1: Point3D, a2: Point3D, b1: Point3D, b2: Point3D,
+                     axes: Tuple[int, int] = _AXES_XY):
+    """两线段交点（按捕捉平面 (u,v) 求解；无交点返回 None）。
+    返回世界点：u,v 为交点，平面外分量取 a1 的值。"""
+    u0, v0 = axes
+    d1x = _comp(a2, u0) - _comp(a1, u0)
+    d1y = _comp(a2, v0) - _comp(a1, v0)
+    d2x = _comp(b2, u0) - _comp(b1, u0)
+    d2y = _comp(b2, v0) - _comp(b1, v0)
     denom = d1x * d2y - d1y * d2x
     if abs(denom) < 1e-12:
         return None
-    t = ((b1.x - a1.x) * d2y - (b1.y - a1.y) * d2x) / denom
-    s = ((b1.x - a1.x) * d1y - (b1.y - a1.y) * d1x) / denom
+    t = ((_comp(b1, u0) - _comp(a1, u0)) * d2y -
+         (_comp(b1, v0) - _comp(a1, v0)) * d2x) / denom
+    s = ((_comp(b1, u0) - _comp(a1, u0)) * d1y -
+         (_comp(b1, v0) - _comp(a1, v0)) * d1x) / denom
     if -1e-6 <= t <= 1 + 1e-6 and -1e-6 <= s <= 1 + 1e-6:
-        return Point3D(a1.x + t * d1x, a1.y + t * d1y, a1.z)
+        c = [0.0, 0.0, 0.0]
+        c[u0] = _comp(a1, u0) + t * d1x
+        c[v0] = _comp(a1, v0) + t * d1y
+        c[_wAxis(axes)] = _comp(a1, _wAxis(axes))
+        return Point3D(c[0], c[1], c[2])
     return None
 
 
 def _segCircleIntersect(a: Point3D, b: Point3D, cx: float, cy: float, r: float):
-    """线段与圆交点列表。"""
+    """线段与圆交点列表（仅 XY 捕捉平面使用）。"""
     dx, dy = b.x - a.x, b.y - a.y
     fx, fy = a.x - cx, a.y - cy
     A = dx * dx + dy * dy
@@ -88,6 +125,8 @@ class SnapManager:
         # 解析对象（圆/弧/椭圆/直线）→ 采样折线缓存：键为几何签名（内容变化即换键），
         # 超上限整体清空；非解析对象不走此缓存（显示点列由对象自身缓存）
         self._sampleCache = {}
+        # 当前捕捉平面轴（snap() 入口设置；主线程串行调用，无重入）
+        self._ax: Tuple[int, int] = _AXES_XY
 
     @classmethod
     def instance(cls) -> "SnapManager":
@@ -119,12 +158,47 @@ class SnapManager:
     def setSnapRadius(self, r: float) -> None:
         self._snapRadius = r
 
+    # ---------- 捕捉平面 (u,v) 访问 ----------
+    def _u(self, p: Point3D) -> float:
+        return _comp(p, self._ax[0])
+
+    def _v(self, p: Point3D) -> float:
+        return _comp(p, self._ax[1])
+
+    def _mk(self, u: float, v: float, w: float) -> Point3D:
+        """由 (u,v) + 平面外分量组装世界点。"""
+        c = [0.0, 0.0, 0.0]
+        c[self._ax[0]], c[self._ax[1]] = u, v
+        c[_wAxis(self._ax)] = w
+        return Point3D(c[0], c[1], c[2])
+
+    def _dist2d(self, p: Point3D, q: Point3D) -> float:
+        """两点在捕捉平面 (u,v) 上的距离。"""
+        return math.hypot(self._u(p) - self._u(q), self._v(p) - self._v(q))
+
     def snap(self, worldPos: Point3D, objects: List, viewRadius: float,
-             refPoint: Optional[Point3D] = None) -> SnapResult:
+             refPoint: Optional[Point3D] = None,
+             axes: Tuple[int, int] = _AXES_XY,
+             eye: Optional[tuple] = None) -> SnapResult:
+        """求吸附。eye 为相机位置（3D 视口传入）：多个候选在捕捉平面上
+        距离/优先级完全并列时（如顶视下圆柱上下两圆投影重合），取离
+        相机更近（看得见的）那个；2D 画布不传，行为不变。"""
+        self._ax = axes if axes in ((0, 1), (0, 2), (1, 2)) else _AXES_XY
         candidates: List[SnapResult] = []
         # 单对象捕捉
         for obj in objects:
             if not obj.isVisible() or obj.isLocked():
+                continue
+            featGetter = getattr(obj, "snapFeatures", None)
+            if callable(featGetter):
+                # B-Rep 实体：按解析边特征吸附（圆心/端点/中点/象限/
+                # 最近点/顶点），不走常规类型分发
+                feats = featGetter()
+                if feats:
+                    for r in self._snapSolid(obj, feats, worldPos,
+                                             viewRadius):
+                        if r.isValid and r.distance <= viewRadius:
+                            candidates.append(r)
                 continue
             supported = set(obj.getSupportedSnapTypes())
             for st in (self._enabledTypes & supported):
@@ -139,10 +213,23 @@ class SnapManager:
         # 优先级：最近点级别最低，只要存在非最近点命中就只用非最近点
         precise = [r for r in candidates if r.type != SnapType.NEAREST]
         pool = precise if precise else candidates
-        return min(pool, key=lambda r: (r.distance, _SNAP_PRIORITY.get(r.type, 99)))
+        best = min(pool, key=lambda r: (r.distance,
+                                        _SNAP_PRIORITY.get(r.type, 99)))
+        if eye is not None:
+            # 距离+优先级完全并列（纯投影歧义）：取离相机更近的候选
+            tied = [r for r in pool
+                    if abs(r.distance - best.distance) < 1e-9
+                    and _SNAP_PRIORITY.get(r.type, 99)
+                    == _SNAP_PRIORITY.get(best.type, 99)]
+            if len(tied) > 1:
+                best = min(tied, key=lambda r: (
+                    (eye[0] - r.position.x) ** 2
+                    + (eye[1] - r.position.y) ** 2
+                    + (eye[2] - r.position.z) ** 2))
+        return best
 
     def _makeResult(self, obj, st: SnapType, p: Point3D, worldPos: Point3D) -> SnapResult:
-        d = math.hypot(p.x - worldPos.x, p.y - worldPos.y)
+        d = self._dist2d(p, worldPos)
         return SnapResult(position=p, type=st, objectId=obj.id(),
                           distance=d, isValid=True)
 
@@ -202,7 +289,10 @@ class SnapManager:
             pts = obj.points()
             for i in range(len(pts) - 1):
                 a, b = pts[i], pts[i + 1]
-                p = Point3D((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5)
+                p = self._mk((self._u(a) + self._u(b)) * 0.5,
+                             (self._v(a) + self._v(b)) * 0.5,
+                             _comp(a, _wAxis(self._ax)) * 0.5
+                             + _comp(b, _wAxis(self._ax)) * 0.5)
                 out.append(self._makeResult(obj, SnapType.MIDPOINT, p, wp))
         elif t == ObjectType.POLYCURVE:
             # 每段曲线沿其采样长度的中点
@@ -218,45 +308,75 @@ class SnapManager:
                 out.append(self._makeResult(obj, SnapType.MIDPOINT, p, wp))
         return out
 
-    @staticmethod
-    def _pathMidpoint(pts) -> Optional[Point3D]:
-        """沿折线累加长度，返回总长度一半处的点（真正的路径中点）。"""
+    def _pathMidpoint(self, pts) -> Optional[Point3D]:
+        """沿折线累加长度（按捕捉平面 (u,v) 度量），返回总长度一半处的点。"""
         if len(pts) < 2:
             return None
         segs = []
         total = 0.0
         for i in range(len(pts) - 1):
-            d = math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y)
+            d = self._dist2d(pts[i], pts[i + 1])
             segs.append(d)
             total += d
         if total < 1e-9:
             return None
         half = total * 0.5
         acc = 0.0
+        w = _wAxis(self._ax)
         for i, d in enumerate(segs):
             if acc + d >= half:
                 t = (half - acc) / d if d > 1e-9 else 0.0
                 a, b = pts[i], pts[i + 1]
-                return Point3D(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z)
+                return self._mk(self._u(a) + (self._u(b) - self._u(a)) * t,
+                                self._v(a) + (self._v(b) - self._v(a)) * t,
+                                _comp(a, w))
             acc += d
         return pts[-1]
+
+    # ---------- 椭圆解析（含自转角，与 _samplePointsOf 同一变换） ----------
+    def _ellipseFrame(self, obj):
+        """椭圆局部系 (center, a, b, cos, sin)：世界点 = c + R·(a·cosθ, b·sinθ)。"""
+        c = obj.center()
+        a, b = obj.majorAxis(), obj.minorAxis()
+        rot = float(obj.rotation())
+        return c, a, b, math.cos(rot), math.sin(rot)
+
+    def _ellipsePointAt(self, obj, ang) -> Point3D:
+        c, a, b, cr, sr = self._ellipseFrame(obj)
+        lx, ly = a * math.cos(ang), b * math.sin(ang)
+        return Point3D(c.x + lx * cr - ly * sr, c.y + lx * sr + ly * cr, c.z)
+
+    def _ellipseLocal(self, obj, wp: Point3D):
+        """世界点 → 椭圆局部坐标 (lx, ly)（逆自转角）。"""
+        c, a, b, cr, sr = self._ellipseFrame(obj)
+        dx, dy = wp.x - c.x, wp.y - c.y
+        return (dx * cr + dy * sr, -dx * sr + dy * cr), c, a, b
 
     def _snapCenter(self, obj, wp: Point3D, viewRadius: float) -> List[SnapResult]:
         out = []
         t = obj.type()
         if t in (ObjectType.CIRCLE, ObjectType.ARC, ObjectType.ELLIPSE):
             c = obj.center()
+            if self._ax != _AXES_XY:
+                # 侧视：解析圆不在捕捉平面内，退化为"靠近圆心投影"即捕捉
+                d = self._dist2d(c, wp)
+                if d <= viewRadius:
+                    out.append(SnapResult(position=c, type=SnapType.CENTER,
+                                          objectId=obj.id(), distance=d,
+                                          isValid=True))
+                return out
             d = math.hypot(wp.x - c.x, wp.y - c.y)
             if t == ObjectType.ELLIPSE:
-                # 椭圆：鼠标在椭圆边界附近且偏内 → 圆心
-                a, b = obj.majorAxis(), obj.minorAxis()
+                # 椭圆：鼠标在椭圆边界附近且偏内 → 圆心（边界/内外判定
+                # 都在椭圆局部系做，正确处理自转角）
+                (lx, ly), c, a, b = self._ellipseLocal(obj, wp)
                 if a < 1e-9 or b < 1e-9:
                     return out
-                ang = math.atan2((wp.y - c.y) * a, (wp.x - c.x) * b)
-                bx = c.x + a * math.cos(ang); by = c.y + b * math.sin(ang)
-                edge_d = math.hypot(wp.x - bx, wp.y - by)
-                # 偏内：归一化坐标在椭圆内
-                inside = ((wp.x - c.x) / a) ** 2 + ((wp.y - c.y) / b) ** 2 < 1.0
+                ang = math.atan2(ly * a, lx * b)
+                bp = self._ellipsePointAt(obj, ang)
+                edge_d = math.hypot(wp.x - bp.x, wp.y - bp.y)
+                # 偏内：局部归一化坐标在椭圆内
+                inside = (lx / a) ** 2 + (ly / b) ** 2 < 1.0
                 if edge_d <= viewRadius and inside:
                     out.append(SnapResult(position=c, type=SnapType.CENTER,
                                           objectId=obj.id(), distance=edge_d, isValid=True))
@@ -290,10 +410,9 @@ class SnapManager:
                     p = Point3D(c.x + r * math.cos(ang), c.y + r * math.sin(ang), c.z)
                     out.append(self._makeResult(obj, SnapType.QUARTER, p, wp))
         elif t == ObjectType.ELLIPSE:
-            c = obj.center(); a = obj.majorAxis(); b = obj.minorAxis()
             for ang in (0, math.pi / 2, math.pi, 3 * math.pi / 2):
-                p = Point3D(c.x + a * math.cos(ang), c.y + b * math.sin(ang), c.z)
-                out.append(self._makeResult(obj, SnapType.QUARTER, p, wp))
+                out.append(self._makeResult(obj, SnapType.QUARTER,
+                                             self._ellipsePointAt(obj, ang), wp))
         return out
 
     def _snapPerpendicular(self, obj, wp: Point3D,
@@ -301,22 +420,26 @@ class SnapManager:
         """垂足：从参考点（当前绘制起点）向目标线作垂线。
         情况1：参考点在线外，垂足在目标线上，鼠标靠近垂足时捕捉。
         情况2：参考点在目标线上，鼠标移动使预览线与目标线垂直时，
-        将鼠标吸附到精确垂线方向，标记画在参考点（垂足）。"""
+        将鼠标吸附到精确垂线方向，标记画在参考点（垂足）。
+        全部按捕捉平面 (u,v) 度量。"""
         out = []
         if refPoint is None or obj.type() != ObjectType.LINE:
             return out
+        w = _wAxis(self._ax)
         pts = obj.points()
         for i in range(len(pts) - 1):
             a, b = pts[i], pts[i + 1]
-            foot = _nearestOnSegment(refPoint, a, b)
-            dx, dy = b.x - a.x, b.y - a.y
+            foot = _nearestOnSegment(refPoint, a, b, self._ax)
+            dx = self._u(b) - self._u(a)
+            dy = self._v(b) - self._v(a)
             L2 = dx * dx + dy * dy
             if L2 < 1e-12:
                 continue
-            onLine = (math.hypot(foot.x - refPoint.x, foot.y - refPoint.y) < 1e-6)
+            onLine = (self._dist2d(foot, refPoint) < 1e-6)
             if onLine:
                 # 情况2：参考点在线上，预览线与目标线垂直时吸附
-                rx, ry = wp.x - refPoint.x, wp.y - refPoint.y
+                rx = self._u(wp) - self._u(refPoint)
+                ry = self._v(wp) - self._v(refPoint)
                 previewLen = math.hypot(rx, ry)
                 if previewLen < 1e-9:
                     continue
@@ -330,9 +453,10 @@ class SnapManager:
                     px, py = px / pL, py / pL
                     # 将鼠标投影到过 refPoint 的精确垂线上
                     proj = rx * px + ry * py
-                    snapped = Point3D(refPoint.x + px * proj,
-                                      refPoint.y + py * proj, refPoint.z)
-                    d = math.hypot(snapped.x - wp.x, snapped.y - wp.y)
+                    snapped = self._mk(self._u(refPoint) + px * proj,
+                                       self._v(refPoint) + py * proj,
+                                       _comp(refPoint, w))
+                    d = self._dist2d(snapped, wp)
                     out.append(SnapResult(position=snapped,
                                           type=SnapType.PERPENDICULAR,
                                           objectId=obj.id(), distance=d,
@@ -344,6 +468,9 @@ class SnapManager:
 
     def _snapTangent(self, obj, wp: Point3D) -> List[SnapResult]:
         out = []
+        if self._ax != _AXES_XY:
+            # 切点构造依赖"圆平面 = 捕捉平面"，侧视无意义
+            return out
         t = obj.type()
         if t in (ObjectType.CIRCLE, ObjectType.ARC):
             c = obj.center(); r = obj.radius()
@@ -365,8 +492,8 @@ class SnapManager:
             pts = obj.points()
             best = None
             for i in range(len(pts) - 1):
-                p = _nearestOnSegment(wp, pts[i], pts[i + 1])
-                d = math.hypot(p.x - wp.x, p.y - wp.y)
+                p = _nearestOnSegment(wp, pts[i], pts[i + 1], self._ax)
+                d = self._dist2d(p, wp)
                 if best is None or d < best[1]:
                     best = (p, d)
             if best:
@@ -375,23 +502,36 @@ class SnapManager:
             pts = obj.getSampledPoints() if hasattr(obj, "getSampledPoints") else []
             best = None
             for i in range(len(pts) - 1):
-                p = _nearestOnSegment(wp, pts[i], pts[i + 1])
-                d = math.hypot(p.x - wp.x, p.y - wp.y)
+                p = _nearestOnSegment(wp, pts[i], pts[i + 1], self._ax)
+                d = self._dist2d(p, wp)
                 if best is None or d < best[1]:
                     best = (p, d)
             if best:
                 out.append(self._makeResult(obj, SnapType.NEAREST, best[0], wp))
-        elif t in (ObjectType.CIRCLE, ObjectType.ARC):
-            c = obj.center(); r = obj.radius()
-            a = math.atan2(wp.y - c.y, wp.x - c.x)
-            if t == ObjectType.ARC and not _inArcRange(a, obj.startAngle(), obj.endAngle()):
-                a = obj.startAngle()
-            p = Point3D(c.x + r * math.cos(a), c.y + r * math.sin(a), c.z)
-            out.append(self._makeResult(obj, SnapType.NEAREST, p, wp))
-        elif t == ObjectType.ELLIPSE:
-            c = obj.center(); a = obj.majorAxis(); b = obj.minorAxis()
-            ang = math.atan2((wp.y - c.y) * a, (wp.x - c.x) * b)
-            p = Point3D(c.x + a * math.cos(ang), c.y + b * math.sin(ang), c.z)
+        elif t in (ObjectType.CIRCLE, ObjectType.ARC, ObjectType.ELLIPSE):
+            if self._ax != _AXES_XY:
+                # 侧视：解析公式依赖"圆平面 = 捕捉平面"，改走采样折线最近点
+                pts = self._cachedSamples(obj)
+                best = None
+                for i in range(len(pts) - 1):
+                    p = _nearestOnSegment(wp, pts[i], pts[i + 1], self._ax)
+                    d = self._dist2d(p, wp)
+                    if best is None or d < best[1]:
+                        best = (p, d)
+                if best:
+                    out.append(self._makeResult(obj, SnapType.NEAREST, best[0], wp))
+                return out
+            if t == ObjectType.ELLIPSE:
+                # 最近点：局部系求参数角（逆自转角后再 atan2），再映射回世界
+                (lx, ly), c, a, b = self._ellipseLocal(obj, wp)
+                ang = math.atan2(ly * a, lx * b)
+                p = self._ellipsePointAt(obj, ang)
+            else:
+                c = obj.center(); r = obj.radius()
+                ang = math.atan2(wp.y - c.y, wp.x - c.x)
+                if t == ObjectType.ARC and not _inArcRange(ang, obj.startAngle(), obj.endAngle()):
+                    ang = obj.startAngle()
+                p = Point3D(c.x + r * math.cos(ang), c.y + r * math.sin(ang), c.z)
             out.append(self._makeResult(obj, SnapType.NEAREST, p, wp))
         return out
 
@@ -403,21 +543,135 @@ class SnapManager:
                                             obj.getControlPoint(i), wp))
         return out
 
+    # ---------- B-Rep 实体（解析边特征） ----------
+
+    def _snapSolid(self, obj, feats: List, wp: Point3D,
+                   viewRadius: float) -> List[SnapResult]:
+        """实体子元素吸附：圆边 → 圆心（近圆周且偏内，与 2D 圆一致）/
+        象限/端点/中点/最近点；直线边 → 端点/中点/最近点；顶点。
+        位置带真实 3D 坐标（画在圆柱顶面可吸到顶圆真实圆心），
+        距离按捕捉平面 (u,v) 度量。"""
+        out: List[SnapResult] = []
+        en = self._enabledTypes
+        w = _wAxis(self._ax)
+        for f in feats:
+            k = f["kind"]
+            if k == "circle":
+                cx, cy, cz = f["center"]
+                c = Point3D(cx, cy, cz)
+                plane_par = abs(f["axis"][w]) > 0.999
+                d = self._dist2d(c, wp)
+                if SnapType.CENTER in en:
+                    if plane_par:
+                        # 圆平面 ∥ 捕捉平面：近圆周且偏内 → 圆心（同 2D 圆）
+                        edge_d = abs(d - f["radius"])
+                        if edge_d <= viewRadius and d < f["radius"]:
+                            out.append(SnapResult(
+                                position=c, type=SnapType.CENTER,
+                                objectId=obj.id(), distance=edge_d,
+                                isValid=True))
+                    elif d <= viewRadius:
+                        # 侧视/斜置圆：解析公式失效，靠近投影圆心即捕捉
+                        out.append(SnapResult(
+                            position=c, type=SnapType.CENTER,
+                            objectId=obj.id(), distance=d, isValid=True))
+                if SnapType.QUARTER in en:
+                    for q in f["quarters"]:
+                        out.append(self._makeResult(obj, SnapType.QUARTER,
+                                                    q, wp))
+                if not f["full"]:
+                    if SnapType.ENDPOINT in en:
+                        for p in f["endPts"]:
+                            out.append(self._makeResult(obj, SnapType.ENDPOINT,
+                                                        p, wp))
+                    if SnapType.MIDPOINT in en and f["midPt"] is not None:
+                        out.append(self._makeResult(obj, SnapType.MIDPOINT,
+                                                    f["midPt"], wp))
+                if SnapType.NEAREST in en and plane_par:
+                    p = self._circleNearest(f, wp)
+                    if p is not None:
+                        out.append(self._makeResult(obj, SnapType.NEAREST,
+                                                    p, wp))
+            elif k == "line":
+                a, b = f["a"], f["b"]
+                if SnapType.ENDPOINT in en:
+                    out.append(self._makeResult(obj, SnapType.ENDPOINT, a, wp))
+                    out.append(self._makeResult(obj, SnapType.ENDPOINT, b, wp))
+                if SnapType.MIDPOINT in en:
+                    out.append(self._makeResult(obj, SnapType.MIDPOINT,
+                                                Point3D((a.x + b.x) * 0.5,
+                                                        (a.y + b.y) * 0.5,
+                                                        (a.z + b.z) * 0.5),
+                                                wp))
+                if SnapType.NEAREST in en:
+                    out.append(self._makeResult(
+                        obj, SnapType.NEAREST,
+                        _nearestOnSegment(wp, a, b, self._ax), wp))
+            elif k == "vertex":
+                if SnapType.VERTEX in en:
+                    out.append(self._makeResult(obj, SnapType.VERTEX,
+                                                f["p"], wp))
+        return out
+
+    def _circleNearest(self, f: dict, wp: Point3D) -> Optional[Point3D]:
+        """鼠标在圆平面上的最近点（圆弧钳制到参数范围内）。"""
+        ex, ey = f["ex"], f["ey"]
+        cx, cy, cz = f["center"]
+        vx, vy, vz = wp.x - cx, wp.y - cy, wp.z - cz
+        la = vx * ex[0] + vy * ex[1] + vz * ex[2]
+        lb = vx * ey[0] + vy * ey[1] + vz * ey[2]
+        ang = math.atan2(lb, la)
+        if not f["full"]:
+            def _ad(x, y):
+                dd = abs(x - y) % (2 * math.pi)
+                return min(dd, 2 * math.pi - dd)
+            ang = f["a0"] if _ad(ang, f["a0"]) <= _ad(ang, f["a1"]) \
+                else f["a1"]
+        r = f["radius"]
+        ca, sa = math.cos(ang), math.sin(ang)
+        return Point3D(cx + r * (ca * ex[0] + sa * ey[0]),
+                       cy + r * (ca * ex[1] + sa * ey[1]),
+                       cz + r * (ca * ex[2] + sa * ey[2]))
+
     # ---------- 交点（两两对象） ----------
     def _snapIntersections(self, wp: Point3D, objects: List,
                            viewRadius: float) -> List[SnapResult]:
         out: List[SnapResult] = []
-        n = len(objects)
-        for i in range(n):
-            oi = objects[i]
-            if not oi.isVisible() or oi.isLocked():
+        # 先一次性取各对象采样折线 + (u,v) 包围盒再配对：
+        # 1) 鼠标预筛——交点必然落在两个对象上，包围盒离鼠标超出捕捉半径
+        #    的对象不可能贡献可视交点，直接剔除（大场景下把 O(N²) 配对
+        #    压到只配视口附近的少数对象）；
+        # 2) 包围盒每帧每对象只算一次，不再每对重算（圆/椭圆 1025 点采样
+        #    全列表扫描 × N²/2 对是鼠标移动的主要卡顿源）。
+        infos = []
+        for o in objects:
+            if not o.isVisible() or o.isLocked():
                 continue
+            featGetter = getattr(o, "snapFeatures", None)
+            if callable(featGetter):
+                continue   # B-Rep 实体走解析特征吸附，不参与折线求交
+            pts = self._cachedSamples(o)
+            if len(pts) < 2:
+                continue
+            bb = _bboxOf(pts, self._ax)
+            if bb is None:
+                continue
+            if viewRadius > 0 and (
+                    bb[0] - self._u(wp) > viewRadius
+                    or self._u(wp) - bb[2] > viewRadius
+                    or bb[1] - self._v(wp) > viewRadius
+                    or self._v(wp) - bb[3] > viewRadius):
+                continue
+            infos.append((o, bb))
+        n = len(infos)
+        for i in range(n):
+            oi, ba = infos[i]
             for j in range(i + 1, n):
-                oj = objects[j]
-                if not oj.isVisible() or oj.isLocked():
+                oj, bb2 = infos[j]
+                if not _bboxOverlap(ba, bb2):
                     continue
                 for p in self._intersectPair(oi, oj, wp, viewRadius):
-                    d = math.hypot(p.x - wp.x, p.y - wp.y)
+                    d = self._dist2d(p, wp)
                     if d <= viewRadius:
                         out.append(SnapResult(position=p, type=SnapType.INTERSECTION,
                                               objectId=oi.id(), distance=d, isValid=True))
@@ -425,29 +679,18 @@ class SnapManager:
 
     def _intersectPair(self, a, b, wp: Optional[Point3D] = None,
                        viewRadius: float = 0.0) -> List[Point3D]:
+        # 侧视：解析圆类不在捕捉平面内，全部按采样折线求交
+        if self._ax != _AXES_XY:
+            sa = self._cachedSamples(a)
+            sb = self._cachedSamples(b)
+            return self._polylinePairIntersect(sa, sb, wp, viewRadius)
         ta, tb = a.type(), b.type()
         pts: List[Point3D] = []
         if ta == ObjectType.LINE and tb == ObjectType.LINE:
             # 闭合折线（矩形/多边形）点列补齐收尾副本后再求交
             pa = self._cachedSamples(a)
             pb = self._cachedSamples(b)
-            if len(pa) >= 2 and len(pb) >= 2:
-                # 包围盒快速排除（无交则整对跳过，避免 O(n·m) 全量弦求交）
-                if not _bboxOverlap(_bboxOf(pa), _bboxOf(pb)):
-                    return []
-                if wp is not None and viewRadius > 0 and \
-                        (len(pa) > 32 or len(pb) > 32):
-                    # 多段折线：只保留经过鼠标附近（捕捉半径内）的弦，控制组合数
-                    nearA = self._chordsNear(pa, wp, viewRadius)
-                    nearB = self._chordsNear(pb, wp, viewRadius)
-                else:
-                    nearA = list(zip(pa, pa[1:]))
-                    nearB = list(zip(pb, pb[1:]))
-                for a1, a2 in nearA:
-                    for b1, b2 in nearB:
-                        p = _segSegIntersect(a1, a2, b1, b2)
-                        if p:
-                            pts.append(p)
+            pts = self._polylinePairIntersect(pa, pb, wp, viewRadius)
         elif ta == ObjectType.LINE and tb in (ObjectType.CIRCLE, ObjectType.ARC):
             pts.extend(self._lineCircle(a, b))
         elif tb == ObjectType.LINE and ta in (ObjectType.CIRCLE, ObjectType.ARC):
@@ -460,24 +703,30 @@ class SnapManager:
             # 解析密采（圆 1024 点）与显示曲线一致，精度远小于捕捉半径。
             sa = self._cachedSamples(a)
             sb = self._cachedSamples(b)
-            if len(sa) >= 2 and len(sb) >= 2:
-                # 包围盒快速排除
-                if (_bboxOf(sa) is None or _bboxOf(sb) is None):
-                    return []
-                if not _bboxOverlap(_bboxOf(sa), _bboxOf(sb)):
-                    return []
-                if wp is not None and viewRadius > 0:
-                    # 只保留经过鼠标附近（捕捉半径内）的弦，控制组合数
-                    nearA = self._chordsNear(sa, wp, viewRadius)
-                    nearB = self._chordsNear(sb, wp, viewRadius)
-                else:
-                    nearA = list(zip(sa, sa[1:]))
-                    nearB = list(zip(sb, sb[1:]))
-                for a1, a2 in nearA:
-                    for b1, b2 in nearB:
-                        p = _segSegIntersect(a1, a2, b1, b2)
-                        if p:
-                            pts.append(p)
+            pts = self._polylinePairIntersect(sa, sb, wp, viewRadius)
+        return pts
+
+    def _polylinePairIntersect(self, pa: List[Point3D], pb: List[Point3D],
+                               wp: Optional[Point3D], viewRadius: float) -> List[Point3D]:
+        """两组采样折线按捕捉平面求交（包围盒快排 + 鼠标附近弦过滤）。"""
+        pts: List[Point3D] = []
+        if len(pa) >= 2 and len(pb) >= 2:
+            # 包围盒快速排除（无交则整对跳过，避免 O(n·m) 全量弦求交）
+            if not _bboxOverlap(_bboxOf(pa, self._ax), _bboxOf(pb, self._ax)):
+                return []
+            if wp is not None and viewRadius > 0 and \
+                    (len(pa) > 32 or len(pb) > 32):
+                # 多段折线：只保留经过鼠标附近（捕捉半径内）的弦，控制组合数
+                nearA = self._chordsNear(pa, wp, viewRadius)
+                nearB = self._chordsNear(pb, wp, viewRadius)
+            else:
+                nearA = list(zip(pa, pa[1:]))
+                nearB = list(zip(pb, pb[1:]))
+            for a1, a2 in nearA:
+                for b1, b2 in nearB:
+                    p = _segSegIntersect(a1, a2, b1, b2, self._ax)
+                    if p:
+                        pts.append(p)
         return pts
 
     def _geomKey(self, obj):
@@ -571,13 +820,12 @@ class SnapManager:
             pts.append(Point3D(pts[0].x, pts[0].y, pts[0].z))
         return pts
 
-    @staticmethod
-    def _chordsNear(pts: List[Point3D], wp: Point3D,
+    def _chordsNear(self, pts: List[Point3D], wp: Point3D,
                     viewRadius: float) -> list:
-        """过滤出距 wp ≤ 捕捉半径的弦（交点若在 wp 附近，必在这样的弦上）。"""
+        """过滤出距 wp ≤ 捕捉半径的弦（按捕捉平面度量）。"""
         out = []
         for a1, a2 in zip(pts, pts[1:]):
-            if _nearestOnSegment(wp, a1, a2).distanceTo(wp) <= viewRadius:
+            if self._dist2d(_nearestOnSegment(wp, a1, a2, self._ax), wp) <= viewRadius:
                 out.append((a1, a2))
         return out
 
@@ -619,12 +867,12 @@ class SnapManager:
         return out
 
 
-def _bboxOf(pts: List[Point3D]):
+def _bboxOf(pts: List[Point3D], axes: Tuple[int, int] = _AXES_XY):
     if not pts:
         return None
-    xs = [p.x for p in pts]
-    ys = [p.y for p in pts]
-    return (min(xs), min(ys), max(xs), max(ys))
+    us = [_comp(p, axes[0]) for p in pts]
+    vs = [_comp(p, axes[1]) for p in pts]
+    return (min(us), min(vs), max(us), max(vs))
 
 
 def _bboxOverlap(a, b) -> bool:

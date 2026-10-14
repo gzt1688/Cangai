@@ -60,6 +60,19 @@ class HeightField:
     def origin(self) -> Tuple[float, float]:
         return self._origin
 
+    def setOrigin(self, xy: Tuple[float, float]) -> None:
+        """设置栅格 (row=0, col=0) 节点的世界坐标。不触发 stamp 更新（仅用于生成时定位）。"""
+        self._origin = (float(xy[0]), float(xy[1]))
+
+    def setSpacing(self, spacing: float) -> None:
+        """重设栅格间距 (mm/px)；内部数据栅格不重采样，直接改变世界物理尺寸。"""
+        s = float(spacing)
+        if s <= 0:
+            raise ValueError("spacing 必须为正（mm/px）")
+        self._spacing = s
+        if not getattr(self, "clamped", False):
+            self.requested_spacing = s
+
     @property
     def spacing(self) -> float:
         return self._spacing
@@ -237,9 +250,11 @@ class HeightField:
         """替换母场数据（copy-on-write 提交点）：换上新数组并推进 stamp。
 
         旧数组保持不变，供已存在的撤销快照/op 按引用安全持有（绝不就地改写
-        可能被共享的数组）。形状必须与当前母场一致。
+        可能被共享的数组）。形状必须与当前母场一致。强制深拷贝——
+        ascontiguousarray 对已是 float32/C 连续的输入原样返回同一对象，
+        调用方随后改该数组会绕过 stamp 静默改场。
         """
-        a = np.ascontiguousarray(arr, dtype=np.float32)
+        a = np.array(arr, dtype=np.float32, copy=True, order="C")
         if a.shape != self._data.shape:
             raise ValueError("setData 形状必须与母场一致")
         self._data = a
@@ -261,12 +276,51 @@ class HeightField:
     # ---------------- 预览 / 渲染边界 ----------------
 
     def downsample(self, max_dim: int = 1024) -> "HeightField":
-        """等比降采样出预览副本（长边 ≤ max_dim）；已足够小则返回自身。"""
+        """等比降采样出预览副本（长边 ≤ max_dim）；已足够小则返回自身。
+
+        行/列均匀取样且必含末行末列（linspace）：[::step] 会丢掉末尾
+        (step−1) 行/列，场尺寸随降采样系统性缩小、丢边界内容。
+        """
         if max(self.nx, self.ny) <= max_dim:
             return self
         step = int(math.ceil(max(self.nx, self.ny) / float(max_dim)))
-        sub = self._data[::step, ::step]
-        return HeightField(sub, self._origin, self._spacing * step)
+
+        def _take(n: int) -> np.ndarray:
+            return np.unique(np.linspace(
+                0, n - 1, max(2, int(math.ceil(n / step))))
+                .round().astype(np.intp))
+
+        rows = _take(self.ny)
+        cols = _take(self.nx)
+        sub = self._data[np.ix_(rows, cols)]
+        # 名义栅距按较长轴平均步距：末样本恰好落在原场边界上，
+        # 总尺寸不再缩小（短轴误差 < 1 个粗格，预览级可忽略）
+        (n_long, c_long) = max((self.ny, len(rows)), (self.nx, len(cols)))
+        sp = float(self._spacing * (n_long - 1) / max(c_long - 1, 1))
+        return HeightField(sub, self._origin, sp)
+
+    def padded(self, margin: float) -> "HeightField":
+        """四周外扩 ``margin`` mm 并补 0（基准面），返回新场。
+
+        保持原 spacing（不参与 grid_size 钳制，避免扩边改变精度导致原数据
+        粘贴错位）；四边各扩 ``round(margin/spacing)`` 格，栅格实际余量 ≥
+        margin。margin <= 0 返回自身。供“重构网格”加边界余量使用。
+        """
+        margin = max(0.0, float(margin))
+        if margin <= 0:
+            return self
+        pad = max(1, int(round(margin / self._spacing)))
+        ny, nx = self.ny + 2 * pad, self.nx + 2 * pad
+        new = np.zeros((ny, nx), dtype=np.float32)
+        new[pad:pad + self.ny, pad:pad + self.nx] = self._data
+        hf = HeightField(
+            new,
+            (self._origin[0] - pad * self._spacing,
+             self._origin[1] - pad * self._spacing),
+            self._spacing)
+        hf.clamped = self.clamped
+        hf.requested_spacing = self.requested_spacing
+        return hf
 
     def to_texture_array(self) -> np.ndarray:
         """ndarray → 纹理行序的唯一边界函数（连续 float32）。

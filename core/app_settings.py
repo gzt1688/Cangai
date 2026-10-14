@@ -30,6 +30,7 @@ shortcuts = [
     ["复制", "Ctrl+C", "复制选中对象"],
     ["粘贴", "Ctrl+V", "粘贴剪贴板对象"],
     ["正交", "F8", "切换正交模式"],
+    ["切换显示模式", "Tab", "2D：等高线↔灰度图；浮雕：地图↔颜色"],
 ]
 
 # ==================== 标注样式设置（设置 → 通用 → 标注）====================
@@ -38,6 +39,12 @@ shortcuts = [
 dim_font = "Microsoft YaHei"
 dim_text_px = 12.0
 dim_unit = "mm"
+
+
+# ==================== 外观：选中物体虚线框 ====================
+# 选中物体时是否绘制贴合包围盒的虚线框（设置 → 外观样式 → 选中物体虚线框）。
+# 默认关闭：选中高亮已由图元加粗描边体现，虚线框仅在需要明确包围盒时开启。
+show_selection_box = False
 
 
 # ==================== 渲染 / 性能设置 ====================
@@ -107,6 +114,7 @@ def undo_memory_budget_bytes() -> int:
 def perf_snapshot() -> dict:
     """渲染/性能与文件设置快照（供设置对话框取消时回滚）。"""
     return {
+        "language": language,
         "max_field_pixels_side": max_field_pixels_side,
         "undo_memory_budget_mb": undo_memory_budget_mb,
         "gpu_accelerated": gpu_accelerated,
@@ -128,6 +136,8 @@ def perf_restore(snap: dict) -> None:
     global mesh_max_dim_gpu, mesh_max_dim_cpu, preview_max_dim
     global msaa_samples, async_compute
     global autosave_enabled, autosave_interval_min, backup_on_save
+    global language
+    language = snap.get("language", language)
     max_field_pixels_side = snap.get("max_field_pixels_side", max_field_pixels_side)
     undo_memory_budget_mb = snap.get("undo_memory_budget_mb", undo_memory_budget_mb)
     gpu_accelerated = snap.get("gpu_accelerated", gpu_accelerated)
@@ -179,6 +189,7 @@ def system_info() -> dict:
 # 持久化渲染性能与文件保存项（上调后/开启后重启不丢）；语言/主题等沿用现有内存态约定。
 # 文件损坏/缺失时自愈为默认值，不影响启动。
 _PERF_KEYS = (
+    "language",
     "max_field_pixels_side", "undo_memory_budget_mb", "gpu_accelerated",
     "mesh_max_dim_gpu", "mesh_max_dim_cpu", "preview_max_dim",
     "msaa_samples", "async_compute",

@@ -10,23 +10,33 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
 import ui.styles.theme as theme
 import core.app_settings as app_settings
+from core.api import API_VERSION
+from i18n import tr, languageChanged
 
 
 # 预设主题色：青 / 橙 / 绿 / 蓝
 _PRESET_COLORS = ["#15b6c9", "#ff6400", "#27ae60", "#1e88e5"]
+
+# 导航页名（key 顺序对应 _stack 各页）
+_NAV_NAMES = ["外观样式", "渲染性能", "通用", "文件", "键盘", "插件", "说明"]
+
+# 软件基本信息（设置-说明页展示；发新版时更新版本号）
+APP_NAME = "Cangai 浮雕设计"
+APP_VERSION = "V1.0"
 
 
 class SettingsDialog(QDialog):
     appearanceChanged = Signal()
     gridVisibleChanged = Signal(bool)
     axisVisibleChanged = Signal(bool)
+    selectionBoxChanged = Signal(bool)
     fileSlotsChanged = Signal()
     renderSettingsChanged = Signal()
     dimensionSettingsChanged = Signal()   # 标注样式（字体/字号/单位）变更
 
     def __init__(self, parent=None, pluginManager=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("设置")
+        self.setWindowTitle(tr("设置"))
         self.setMinimumSize(560, 480)
         self.setStyleSheet(f"background: {theme.BG_PANEL};")
         self._pluginManager = pluginManager
@@ -46,8 +56,8 @@ class SettingsDialog(QDialog):
         self._nav = QListWidget()
         self._nav.setFixedWidth(140)
         self._applyNavStyle()
-        for name in ["外观样式", "渲染性能", "通用", "文件", "键盘", "插件", "其他"]:
-            self._nav.addItem(name)
+        for name in _NAV_NAMES:
+            self._nav.addItem(tr(name))
         self._nav.setCurrentRow(0)
         self._nav.currentRowChanged.connect(self._onNavChanged)
         outer.addWidget(self._nav)
@@ -72,27 +82,29 @@ class SettingsDialog(QDialog):
             " border-radius: 3px; padding: 4px 0; }"
             "QPushButton:hover { background: #d0d0d0; }"
             "QPushButton:pressed { background: #c0c0c0; }")
-        btnApply = QPushButton("应用")
-        btnApply.setFixedWidth(64)
-        btnApply.setStyleSheet(_btnStyle)
-        btnApply.clicked.connect(self._onApply)
-        btnBar.addWidget(btnApply)
-        btnOk = QPushButton("确认")
-        btnOk.setFixedWidth(64)
-        btnOk.setStyleSheet(
+        self._btnApply = QPushButton(tr("应用"))
+        self._btnApply.setFixedWidth(64)
+        self._btnApply.setStyleSheet(_btnStyle)
+        self._btnApply.clicked.connect(self._onApply)
+        btnBar.addWidget(self._btnApply)
+        self._btnOk = QPushButton(tr("确认"))
+        self._btnOk.setFixedWidth(64)
+        self._btnOk.setStyleSheet(
             f"QPushButton {{ background: {theme.PRIMARY}; color: white; border: none; border-radius: 3px; padding: 4px 0; }}"
             f"QPushButton:hover {{ background: {theme.PRIMARY_DARK}; }}")
-        btnOk.clicked.connect(self._onOk)
-        btnBar.addWidget(btnOk)
-        btnCancel = QPushButton("取消")
-        btnCancel.setFixedWidth(64)
-        btnCancel.setStyleSheet(_btnStyle)
-        btnCancel.clicked.connect(self._onCancel)
-        btnBar.addWidget(btnCancel)
+        self._btnOk.clicked.connect(self._onOk)
+        btnBar.addWidget(self._btnOk)
+        self._btnCancel = QPushButton(tr("取消"))
+        self._btnCancel.setFixedWidth(64)
+        self._btnCancel.setStyleSheet(_btnStyle)
+        self._btnCancel.clicked.connect(self._onCancel)
+        btnBar.addWidget(self._btnCancel)
         root.addLayout(btnBar)
 
         self._pendingColor = theme.PRIMARY
         self.appearanceChanged.connect(self._applyNavStyle)
+        # 语言变更：重绘对话框自身可见文本
+        languageChanged().connect(self.retranslateUi)
 
     def _takeSnapshot(self) -> dict:
         import copy
@@ -280,6 +292,10 @@ class SettingsDialog(QDialog):
         self._axisCheck.setChecked(True)
         self._axisCheck.toggled.connect(self.axisVisibleChanged.emit)
         form2.addRow(self._axisCheck)
+        self._selBoxCheck = QCheckBox("选中物体虚线框")
+        self._selBoxCheck.setChecked(app_settings.show_selection_box)
+        self._selBoxCheck.toggled.connect(self.selectionBoxChanged.emit)
+        form2.addRow(self._selBoxCheck)
         layout.addWidget(box2)
 
         layout.addStretch()
@@ -322,7 +338,7 @@ class SettingsDialog(QDialog):
         self._gpuCheck.toggled.connect(self._onGpuToggled)
         fg.addRow(self._gpuCheck)
 
-        self._asyncCheck = QCheckBox("重计算放后台线程（区域浮雕/重构）")
+        self._asyncCheck = QCheckBox("重计算放后台线程（区域塑形/重构）")
         self._asyncCheck.setChecked(app_settings.async_compute)
         self._asyncCheck.toggled.connect(self._onAsyncToggled)
         fg.addRow(self._asyncCheck)
@@ -524,6 +540,22 @@ class SettingsDialog(QDialog):
 
     def _onLanguageChanged(self, text: str) -> None:
         app_settings.language = text
+        # 触发翻译器切换 → 广播 languageChanged（各组件 retranslateUi 实时刷新）
+        from i18n import setLanguage
+        setLanguage(text)
+        # 主题/外观信号也广播一次，确保主窗口样式同步
+        self.appearanceChanged.emit()
+
+    def retranslateUi(self) -> None:
+        """语言切换时重设对话框可见文本（关闭重开亦同）。"""
+        self.setWindowTitle(tr("设置"))
+        for i, name in enumerate(_NAV_NAMES):
+            item = self._nav.item(i)
+            if item is not None:
+                item.setText(tr(name))
+        self._btnApply.setText(tr("应用"))
+        self._btnOk.setText(tr("确认"))
+        self._btnCancel.setText(tr("取消"))
 
     def _onUnitChanged(self, text: str) -> None:
         app_settings.unit = text
@@ -760,11 +792,38 @@ class SettingsDialog(QDialog):
             self._slotPathEdits[idx].setText(d)
 
     def _buildOtherPage(self) -> QWidget:
+        """说明页：软件基本信息（名称/版本/开发语言等，只读展示）。"""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
+        box = QGroupBox("软件信息")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+        _rows = [
+            ("软件名称:", APP_NAME),
+            ("版本:", APP_VERSION),
+            ("开发语言:", "Python 3"),
+            ("界面框架:", "PySide6（Qt 6）"),
+            ("3D 渲染:", "OpenGL（ModernGL）"),
+            ("几何内核:", "build123d（OCCT）"),
+            ("插件接口:", f"API v{API_VERSION}"),
+            ("分发方式:", "PyInstaller 便携版（免安装单目录）"),
+        ]
+        for label, value in _rows:
+            lb = QLabel(value)
+            lb.setStyleSheet("color: #333;")
+            lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            form.addRow(label, lb)
+
+        layout.addWidget(box)
+
+        hint = QLabel("插件可放入软件目录 plugins\\ 或 %APPDATA%\\Cangai\\plugins\\，"
+                      "详见“插件”页。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
         layout.addStretch()
         return page
 
@@ -933,6 +992,7 @@ _DEFAULT_SHORTCUTS = [
     ("复制",       "Ctrl+C", "复制选中对象"),
     ("粘贴",       "Ctrl+V", "粘贴剪贴板对象"),
     ("正交",       "F8",     "切换正交模式"),
+    ("切换显示模式", "Tab",   "2D：等高线↔灰度图；浮雕：地图↔颜色"),
 ]
 
 
@@ -990,6 +1050,17 @@ class KeyCaptureWidget(QLineEdit):
             return
         if key == Qt.Key_Escape:
             self.clearFocus()
+            return
+        # Tab / Backtab：QLineEdit 默认会用其切换焦点，这里显式拦截捕获为快捷键
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            parts = []
+            for modFlag, modName in self._MOD_NAMES.items():
+                if mods & modFlag:
+                    parts.append(modName)
+            parts.append("Tab" if key == Qt.Key_Tab else "Shift+Tab")
+            self.setText("+".join(parts))
+            self.changed.emit()
+            event.accept()
             return
         if key in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt,
                    Qt.Key_Meta, Qt.Key_CapsLock):

@@ -6,6 +6,10 @@
   - 整线模式：点选一条多段线 → 预览全部尖角 → 确认批量执行
 - Trim 修剪：
   - 选择边界曲线 → 选择要修剪的曲线 → 点击要保留的一侧 → 确认执行
+- Bridge 桥接：
+  - 点两点画定位线，交点处按桥宽截断；恰两交点且均为闭合轮廓时熔接
+    相连（同一轮廓自熔成两条环 / 内外两轮廓熔成一条环），其余逐交点
+    开缺口；开放路径同样可桥接，可任意位置反复搭桥
 v1 仅支持 LineObject 边（矩形/多边形产物即 LineObject，闭环自洽）。
 """
 from __future__ import annotations
@@ -29,7 +33,9 @@ from ..command_instance import CommandInstance
 from ..param_panels import (ChamferParamPanel, TrimParamPanel, ArrayParamPanel,
                             OffsetParamPanel, MirrorParamPanel,
                             ExtendParamPanel, CloseParamPanel,
-                            OutlineParamPanel, AlignParamPanel)
+                            OutlineParamPanel, AlignParamPanel,
+                            BridgeParamPanel)
+from core.vector.bridge_geometry import locatorCrossings, splitPolyline
 from core.vector.array_generator import (rectangularArray, circularArray,
                                           curveArray, getObjectsCenter)
 from core.vector.mirror_geometry import mirrorObject
@@ -37,6 +43,7 @@ from core.vector.join_geometry import (joinObjects, _segmentsOf as _objToSegment
 from core.vector.extend_geometry import extendObject
 from core.vector.close_geometry import closingSegmentFor
 from core.vector.outline_geometry import (computeOuterOutline,
+                                          RegionFinder,
                                           simplifyPolyline,
                                           sampleClosed, sampleOpen)
 
@@ -213,9 +220,10 @@ class ChamferCommand(CommandInstance):
         if self._wholeObj is None:
             return []
         pts = self._wholeObj.points()
+        closed = bool(self._wholeObj.isClosed()) if hasattr(self._wholeObj, "isClosed") else False
         if self._mode == 0:
-            return computeAllCornersFillet(pts, self._radius)
-        return computeAllCornersBevel(pts, self._d1, self._d2)
+            return computeAllCornersFillet(pts, self._radius, closed=closed)
+        return computeAllCornersBevel(pts, self._d1, self._d2, closed=closed)
 
     @staticmethod
     def _cornerPath(cr: CornerResult, isFillet: bool) -> QPainterPath:
@@ -345,12 +353,14 @@ class ChamferCommand(CommandInstance):
         if corner is None:
             return False
         middle = self._arcSamplesOf(cr)
-        # 修剪点按与角点前一顶点（闭合时为末点）的距离排序，保证接线顺序正确
+        # 修剪点按与角点前一顶点（闭合时为末点）的距离排序，保证接线顺序正确；
+        # 弧采样固定从 trimPt1 侧到 trimPt2 侧，seq 反序时采样须同步反转，
+        # 否则会出现 trimPt2→弧起点的长弦连线（左下角错位连接）
         prevPt = pts[corner - 1] if corner > 0 else pts[-1]
         if cr.trimPt1.distanceTo(prevPt) <= cr.trimPt2.distanceTo(prevPt):
             seq = [cr.trimPt1] + middle + [cr.trimPt2]
         else:
-            seq = [cr.trimPt2] + middle + [cr.trimPt1]
+            seq = [cr.trimPt2] + middle[::-1] + [cr.trimPt1]
         pts[corner:corner + 1] = seq
         self._setPoints(obj, pts)
         self._doc.notifyObjectChanged(obj.id())
@@ -381,10 +391,10 @@ class ChamferCommand(CommandInstance):
             self._msg = "该多段线没有可倒角的尖角"
             return False
         pts = list(self._wholeObj.points())
-        # 从后往前替换，避免索引偏移
+        # 从后往前替换，避免索引偏移（闭合轮廓角点 0 也参与，prev 取末点）
         for cr in sorted(results, key=lambda c: c.cornerIndex, reverse=True):
             i = cr.cornerIndex
-            if i <= 0 or i >= len(pts):
+            if i < 0 or i >= len(pts):
                 continue
             middle = self._arcSamplesOf(cr)
             pts[i:i + 1] = [cr.trimPt1] + middle + [cr.trimPt2]
@@ -880,6 +890,8 @@ class MirrorCommand(CommandInstance):
             for seg in obj.segments():
                 out.extend([Point3D(p[0], p[1], p[2]) for p in seg.get("points", [])])
             return out
+        if t == "SOLID":
+            return list(obj.basePoints())
         return []
 
 
@@ -1145,29 +1157,41 @@ class ExtendCommand(CommandInstance):
         return []
 
 
-# ==================== Outline 外轮廓 ====================
+# ==================== Outline 轮廓（外轮廓 / 内轮廓） ====================
 
 class OutlineCommand(CommandInstance):
-    """外轮廓命令（移植自 Rhino 插件 ToolPage.ShowOuterOutline）。
+    """轮廓命令（移植自 Rhino 插件 ToolPage.ShowOuterOutline）。
 
-    选中曲线 → 弹参数面板（偏移距离/重建去密集点/最大点数）→ 实时预览
-    包裹全部曲线的单一外轮廓 → 确定/右键生成闭合折线。
-    算法：闭合曲线外偏 + 开放曲线包裹带 → Clipper 布尔并集 → 去内孔 →
-    多区域（彼此隔开）时用全部采样点凸包外偏兜底。
+    两种轮廓模式（面板单选切换）：
+    - 外轮廓：选中曲线 → 弹参数面板（偏移距离/重建去密集点/抽稀公差）→ 实时预览
+      包裹全部曲线的单一外轮廓 → 确定/右键生成闭合折线（原有功能，保持不变）。
+      算法：闭合曲线外偏 + 开放曲线包裹带 → Clipper 布尔并集 → 去内孔 →
+      多区域（彼此隔开）时用全部采样点凸包外偏兜底。
+    - 内轮廓：纯曲线布尔平面剖分、对曲线独立处理（不关联浮雕模型）——
+      无需预选曲线、无偏移距离、无栅格（无锯齿）；闭合曲线作为区域边界，
+      开放曲线加厚成极窄墙分割；对鼠标所在位置动态求"命中曲线集"，面片
+      = ∩命中 − ∪未命中 − 开放墙，多个闭合曲线相交（如三圆重叠）的交叉
+      区域也能精确识别；悬停预览、点击直接提取该区域轮廓（所见即所得，
+      可连续拾取），右键/Esc 结束。
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._panel = None
         self._targets = []
+        self._mode = "outer"   # 轮廓模式：outer=外轮廓 / inner=内轮廓
+        self._hoverPt: Optional[Point3D] = None   # 内轮廓模式最后悬停点
+        self._innerRegions = None   # 内轮廓 RegionFinder（缓存复用），切到内轮廓时建立
 
     def name(self) -> str:
         return "Outline"
 
     def commandTitle(self) -> str:
-        return "外轮廓"
+        return "轮廓"
 
     def prompt(self) -> str:
+        if self._mode == "inner":
+            return "悬停预览闭合区域边界，点击区域内部直接提取轮廓，右键/Esc 结束"
         return "设置偏移距离，预览确认后右键/确定生成包裹线，Esc 取消"
 
     def showSnapHints(self) -> bool:
@@ -1182,33 +1206,69 @@ class OutlineCommand(CommandInstance):
               "CURVE", "NURBS_CURVE")
         self._targets = [o for o in self._doc.selectedObjects()
                          if o.type().name in ok]
-        if not self._targets:
-            self._manager.notifyResult("外轮廓：请先选中曲线")
-            self.finish()
+        # 不再因未选中曲线而立即结束：内轮廓模式靠鼠标点击拾取闭合曲线；
+        # 外轮廓模式无选中时保持命令、仅提示（生成时 _apply 已有兜底提示）。
+        if not self._targets and self._mode == "outer":
+            self._manager.notifyResult(
+                "轮廓：外轮廓模式请先选中曲线；可切换到内轮廓模式点击拾取")
 
     def paramPanel(self):
         if self._panel is None:
             self._panel = OutlineParamPanel()
             self._panel.paramsChanged.connect(self._refreshPreview)
+            self._panel.modeChanged.connect(self._onModeChanged)
             self._panel.confirmed.connect(self._onConfirmed)
             self._panel.cancelRequested.connect(self.cancel)
+            self._panel.setMode(self._mode)
             self._refreshPreview()
         return self._panel
 
     # ---------- 面板槽 ----------
 
+    def _onModeChanged(self, mode: str) -> None:
+        """切换轮廓模式：更新提示行、清空另一模式的残留预览。"""
+        self._mode = mode
+        self._hoverPt = None
+        if mode == "inner":
+            # 纯曲线布尔：进入内轮廓即预计算曲线路径与开放墙（缓存复用）
+            self._innerRegions = self._computeInnerRegions()
+            if self._innerRegions is None or not self._innerRegions.valid:
+                self._manager.notifyResult(
+                    "内轮廓：未识别到闭合区域（请先绘制闭合或相交的曲线）")
+            self._setPreviewPath(QPainterPath())
+        else:
+            self._refreshPreview()
+        self._emitPrompt()
+
     def _onConfirmed(self) -> None:
+        if self._mode != "outer":
+            return   # 内轮廓模式"确定"已隐藏，点击画布即生成
         if self._apply():
             self.finish()
 
-    def onMousePress(self, wp, mods) -> None:
-        pass
+    def _emitPrompt(self) -> None:
+        if self._manager is not None:
+            self._manager.promptChanged.emit(self.prompt())
+
+    # ---------- 交互 ----------
 
     def onMouseMove(self, wp, mods) -> None:
-        pass
+        if self._mode != "inner":
+            return
+        self._hoverPt = Point3D(wp.x, wp.y, wp.z)
+        self._refreshInnerPreview(self._hoverPt)
+
+    def onMousePress(self, wp, mods) -> None:
+        if self._mode != "inner":
+            return
+        self._hoverPt = Point3D(wp.x, wp.y, wp.z)
+        self._applyInner(self._hoverPt)
 
     def onRightClick(self, wp: Point3D) -> bool:
-        # 右键 = 确认生成（取消走面板"取消"按钮或 Esc）
+        if self._mode == "inner":
+            # 内轮廓：右键结束命令（返回 False → 由调度中心取消）
+            return False
+        # 外轮廓：右键 = 确认生成（原有逻辑）
         if self._apply():
             self.finish()
         return True
@@ -1239,11 +1299,88 @@ class OutlineCommand(CommandInstance):
         return computeOuterOutline(closedPts, openPts, dist)
 
     def _refreshPreview(self) -> None:
-        """实时预览包裹线（实线）。"""
+        """外轮廓：实时预览包裹线（实线）；内轮廓：按悬停点重算内缩轮廓。"""
+        if self._mode == "inner":
+            if self._hoverPt is not None:
+                self._refreshInnerPreview(self._hoverPt)
+            return
         path = QPainterPath()
         for pts in self._compute():
             if len(pts) < 3:
                 continue
+            path.moveTo(pts[0][0], pts[0][1])
+            for p in pts[1:]:
+                path.lineTo(p[0], p[1])
+            path.closeSubpath()
+        self._setPreviewPath(path, solid=True)
+
+    # ---------- 内轮廓：纯曲线布尔区域识别（无栅格 → 无锯齿） ----------
+
+    def _innerCurves(self) -> list:
+        """参与内轮廓区域识别的曲线：全部未锁定、非曲面对象（不依赖选中）。"""
+        if self._doc is None:
+            return []
+        return [o for o in self._doc.objects()
+                if o.type() != ObjectType.SURFACE and not o.isLocked()]
+
+    def _innerWall(self, closedPts, openPts) -> float:
+        """开放线加厚墙的半宽：取曲线包围盒对角线的极小比例（避免 Clipper 数值退化）。"""
+        xs0 = ys0 = float('inf')
+        xs1 = ys1 = float('-inf')
+        for pts in list(closedPts) + list(openPts):
+            for p in pts:
+                xs0 = min(xs0, p.x); ys0 = min(ys0, p.y)
+                xs1 = max(xs1, p.x); ys1 = max(ys1, p.y)
+        if xs0 > xs1 or ys0 > ys1:
+            return 0.01
+        diag = math.hypot(xs1 - xs0, ys1 - ys0)
+        return max(diag * 1e-4, 1e-3)
+
+    def _computeInnerRegions(self):
+        """纯曲线布尔平面剖分（曲线独立处理，不关联浮雕模型、无栅格 → 无锯齿）：
+
+        闭合曲线作为区域边界，开放曲线加厚成极窄墙作为分割线；RegionFinder
+        预计算曲线路径与开放墙，点击/悬停时动态求所在闭合面片边界（含多个
+        闭合曲线相交时的交叉重叠区域）。返回 RegionFinder；无闭合曲线返回 None。
+        """
+        if self._doc is None:
+            return None
+        curves = self._innerCurves()
+        if not curves:
+            return None
+        closedPts: List[List[Point3D]] = []
+        openPts: List[List[Point3D]] = []
+        for o in curves:
+            pts = self._getSamplePoints(o)
+            try:
+                flagC = bool(o.isClosed())
+            except Exception:
+                flagC = False
+            if flagC or pts[0].distanceTo(pts[-1]) < 1e-6:
+                if len(pts) < 3:
+                    continue
+                closedPts.append(sampleClosed(pts))
+            else:
+                if len(pts) < 2:
+                    continue
+                openPts.append(sampleOpen(pts))
+        if not closedPts:
+            return None
+        wall = self._innerWall(closedPts, openPts)
+        return RegionFinder(closedPts, openPts, wall)
+
+    def _innerOutlineAt(self, wp: Point3D) -> Optional[List[Point3D]]:
+        """点击位置所在闭合面片 → 世界坐标闭合轮廓点列（纯曲线布尔，精确无锯齿）。"""
+        finder = self._innerRegions
+        if finder is None or not finder.valid:
+            return None
+        return finder.regionAt(wp)
+
+    def _refreshInnerPreview(self, wp: Point3D) -> None:
+        """悬停预览：鼠标在某闭合区域内时显示该区域边界，否则清空。"""
+        path = QPainterPath()
+        pts = self._innerOutlineAt(wp)
+        if pts is not None:
             path.moveTo(pts[0][0], pts[0][1])
             for p in pts[1:]:
                 path.lineTo(p[0], p[1])
@@ -1276,12 +1413,39 @@ class OutlineCommand(CommandInstance):
             "外轮廓：已生成 %d 条包裹线（距离 %.3f）" % (len(results), dist))
         return True
 
+    def _applyInner(self, wp: Point3D) -> bool:
+        """内轮廓：点击即提取当前悬停处的闭合区域边界；命令保持可连续拾取。"""
+        if self._doc is None:
+            return False
+        if self._innerRegions is None or not self._innerRegions.valid:
+            self._manager.notifyResult("内轮廓：未识别到闭合区域（请先绘制闭合或相交的曲线）")
+            return False
+        pts = self._innerOutlineAt(wp)
+        if pts is None:
+            self._manager.notifyResult("内轮廓：请点击曲线围成的闭合区域内部")
+            return False
+        rebuild = self._panel.rebuild() if self._panel is not None else True
+        tol = self._panel.tolerance() if self._panel is not None else 0.01
+        self._doc.beginEdit()
+        try:
+            ptsOut = pts
+            if rebuild:
+                ptsOut = simplifyPolyline(ptsOut, tol)
+            line = LineObject(ptsOut)
+            line.setClosed(True)
+            self._doc.addObject(line)
+        finally:
+            self._doc.endEdit()
+        self._manager.notifyResult(
+            "内轮廓：已提取该区域轮廓，可继续点击或右键结束")
+        return True
+
     @staticmethod
     def _getSamplePoints(obj) -> List[Point3D]:
         t = obj.type().name
         if t == "LINE":
             return obj.points()
-        if t in ("CURVE", "NURBS_CURVE"):
+        if t == "CURVE":
             return obj.getSampledPoints()
         if t in ("CIRCLE", "ELLIPSE", "ARC"):
             poly = obj.toPolycurve()
@@ -1294,6 +1458,8 @@ class OutlineCommand(CommandInstance):
             for seg in obj.segments():
                 out.extend([Point3D(p[0], p[1], p[2]) for p in seg.get("points", [])])
             return out
+        if t == "SOLID":
+            return list(obj.basePoints())
         return []
 
 
@@ -2582,6 +2748,7 @@ def registerAll(manager) -> None:
     manager.register("ClosePath", CloseCommand)
     manager.register("Outline", OutlineCommand)
     manager.register("Align", AlignCommand)
+    manager.register("Bridge", BridgeCommand)
     manager.register("PanelMove", PanelMoveCommand)
     manager.register("PanelRotate", PanelRotateCommand)
     manager.register("PanelScale", PanelScaleCommand)
@@ -3317,6 +3484,257 @@ class TrimCommand(CommandInstance):
             if self._doc is not None:
                 self._doc.removeObject(oldId)
                 self._doc.addObject(poly)
+
+
+# ==================== Bridge 桥接 ====================
+
+class BridgeCommand(CommandInstance):
+    """桥接：截断镂空轮廓并把内外相连（激光雕刻防挖件脱落）。
+
+    点两个点画出定位线，在定位线与路径的交点处按桥宽截出缺口：
+    - 恰有两个交点且都落在闭合轮廓上 → 熔接相连，缺口端点按定位线
+      同侧用直线两两相接（即桥接条两侧壁，材料保留激光不切割）：
+      同一轮廓自熔成两条闭合路径（在已桥接的图形上再加一道桥）；
+      内外两条轮廓熔接为一条闭合路径（首次桥接，示意图效果）；
+    - 其余情况（含开放路径、任意多交点）→ 每个交点开一个缺口，
+      路径在缺口处断开，材料保留即料桥。开放路径同样可桥接，
+      因此可在任意位置反复搭任意多道桥。
+    预览即最终结果（所见即所得）；生成后保持激活连续搭桥；右键退回
+    上一步/再按退出，Esc 结束；整条命令一次撤销。
+    """
+
+    def name(self) -> str:
+        return "Bridge"
+
+    def commandTitle(self) -> str:
+        return "桥接参数"
+
+    def showSnapHints(self) -> bool:
+        return False
+
+    def start(self) -> None:
+        super().start()
+        self._width = 2.0
+        self._p1: Optional[Point3D] = None
+        self._hover: Optional[Point3D] = None
+        self._pickState = "waitFirst"   # waitFirst → waitSecond →（生成后回 waitFirst）
+        self._msg = ""
+        self._panel = None
+        self._sampleCache: Optional[list] = None
+
+    def prompt(self) -> str:
+        if self._msg:
+            return self._msg
+        if self._pickState == "waitFirst":
+            return "桥接：点击第一点（定位线起点，从挖件内侧向外拉）"
+        return "桥接：点击第二点，在跨越的轮廓上截断并相连"
+
+    def paramPanel(self):
+        if self._panel is None:
+            self._panel = BridgeParamPanel()
+            self._panel.widthChanged.connect(self._onPanelWidth)
+            self._panel.setBridgeWidth(self._width)
+        return self._panel
+
+    def _onPanelWidth(self, w: float) -> None:
+        self._width = max(0.05, w)
+        if self._pickState == "waitSecond" and self._p1 is not None \
+                and self._hover is not None:
+            self._updateHoverPreview(self._hover)
+
+    # ---------- 方案规划（预览与执行共用，所见即所得） ----------
+
+    def _samples(self):
+        """可见路径的采样缓存：[(对象, 采样点列, 是否闭合)]。
+
+        闭合轮廓与开放路径（已被桥接切开的路径）都参与——开放路径
+        也能在任意位置继续开桥。闭合路径的采样点首末重合。"""
+        if self._sampleCache is None:
+            cache = []
+            if self._doc is not None:
+                for obj in self._doc.visibleObjects():
+                    pts = TrimCommand._getSamplePoints(obj)
+                    if len(pts) >= 2:
+                        cache.append((obj, pts, OffsetCommand._isClosed(obj)))
+            self._sampleCache = cache
+        return self._sampleCache
+
+    def _planBridge(self, p1: Point3D, p2: Point3D):
+        """定位线 → 桥接方案。返回 (错误提示, 方案)；提示非空表示不可桥接。
+
+        恰有两个交点且都落在闭合轮廓上时走熔接，其余一律开缺口：
+        - ("fuse", obj1, pieces, obj2|None)：同一轮廓自熔 → 两条闭合
+          路径 pieces（obj2=None）；内外两轮廓 → 熔接为一条闭合路径
+          （obj1 原位更新保 ID/样式，obj2 删除）。
+        - ("gaps", jobs, 缺口数)：每个被跨越路径在全部交点处开缺口，
+          jobs = [(对象, 保留段点列), ...]（开放路径同样支持）。"""
+        crossed = []   # (定位线参数, 轮廓弧长, 交点, 对象, 采样点, 是否闭合)
+        for obj, pts, closed in self._samples():
+            crossings, _cumul = locatorCrossings(p1, p2, pts)
+            for s, t_loc, inter in crossings:
+                crossed.append((t_loc, s, inter, obj, pts, closed))
+        if not crossed:
+            return "定位线未跨越任何轮廓，请重新点击第二点", None
+        crossed.sort(key=lambda e: e[0])   # 沿定位线从 p1 到 p2 排序
+        if len(crossed) == 2 and crossed[0][5] and crossed[1][5]:
+            _t1, s1, i1, obj1, pts1, _c1 = crossed[0]
+            _t2, s2, i2, obj2, pts2, _c2 = crossed[1]
+            if obj1 is obj2:
+                # 同一闭合轮廓交两次（如熔接后的图形再加一道桥）：两端
+                # 各截缺口、各自同侧端点相连，自熔成两条闭合路径
+                kept, _r = splitPolyline(pts1, [(s1, _t1, i1), (s2, _t2, i2)],
+                                         self._width, True)
+                kept = [seg for seg in kept if len(seg) >= 2]
+                if len(kept) == 2:
+                    loops = [kept[0] + [kept[0][0]], kept[1] + [kept[1][0]]]
+                    return "", ("fuse", obj1, loops, None)
+                if kept:   # 两缺口重叠等退化：按普通开缺口处理
+                    return "", ("gaps", [(obj1, kept)], 1)
+                return "桥宽覆盖整条轮廓，已跳过", None
+            kept1, _r1 = splitPolyline(pts1, [(s1, _t1, i1)], self._width, True)
+            kept2, _r2 = splitPolyline(pts2, [(s2, _t2, i2)], self._width, True)
+            if len(kept1) != 1 or len(kept2) != 1:
+                return "桥宽覆盖整条轮廓，已跳过", None
+            seg1, seg2 = kept1[0], kept2[0]
+            dx, dy = p2.x - p1.x, p2.y - p1.y
+
+            def side(pt: Point3D) -> bool:
+                """点在定位线（有向 p1→p2）的哪一侧。"""
+                return dx * (pt.y - p1.y) - dy * (pt.x - p1.x) > 0
+
+            # 缺口两端须分居定位线两侧（近乎相切时数值上会同侧，结果不可靠）
+            if side(seg1[0]) == side(seg1[-1]) or side(seg2[0]) == side(seg2[-1]):
+                return "定位线与轮廓夹角过小，请调整两点", None
+            # 翻转 seg2 使其首点与 seg1 末点同侧：两条连接线即桥接条两侧壁
+            if side(seg2[0]) != side(seg1[-1]):
+                seg2 = seg2[::-1]
+            fused = list(seg1) + list(seg2) + [seg1[0]]
+            return "", ("fuse", obj1, [fused], obj2)
+        # 其余：所有交点开缺口（按对象分组，开放路径同样支持）
+        jobs: dict = {}
+        for _t, s, inter, obj, pts, closed in crossed:
+            jobs.setdefault(id(obj), [obj, pts, closed, []])[3].append((s, _t, inter))
+        plan = []
+        ngaps = 0
+        for obj, pts, closed, crs in jobs.values():
+            kept, _removed = splitPolyline(pts, crs, self._width, closed)
+            kept = [seg for seg in kept if len(seg) >= 2]
+            if not kept:
+                return "桥宽覆盖整条轮廓，已跳过", None
+            plan.append((obj, kept))
+            ngaps += len(crs)
+        return "", ("gaps", plan, ngaps)
+
+    # ---------- 预览与交互 ----------
+
+    def _updateHoverPreview(self, p2: Point3D) -> None:
+        """预览定位线（虚线）与桥接结果路径（所见即所得）。"""
+        path = QPainterPath()
+        if self._p1 is None:
+            return
+        path.moveTo(self._p1.x, self._p1.y)
+        path.lineTo(p2.x, p2.y)
+        _msg, plan = self._planBridge(self._p1, p2)
+        if plan is not None:
+            if plan[0] == "fuse":
+                pieces = plan[2]
+            else:
+                pieces = [seg for _obj, segs in plan[1] for seg in segs]
+            for piece in pieces:
+                path.moveTo(piece[0].x, piece[0].y)
+                for p in piece[1:]:
+                    path.lineTo(p.x, p.y)
+        self._setPreviewPath(path)
+
+    def onMousePress(self, wp: Point3D, mods) -> None:
+        self._msg = ""
+        if self._pickState == "waitFirst":
+            self._p1 = wp
+            self._pickState = "waitSecond"
+            return
+        # waitSecond：第二点确认，按方案截断/熔接
+        self._hover = wp
+        if not self._apply(self._p1, wp):
+            return   # 失败：留在 waitSecond 可重点第二点，右键退回第一点
+        self._pickState = "waitFirst"
+        self._p1 = None
+        self._sampleCache = None   # 文档已改，采样缓存失效
+        self._setPreviewPath(QPainterPath())
+
+    def onMouseMove(self, wp: Point3D, mods) -> None:
+        self._hover = wp
+        if self._panel is not None:
+            self._panel.setXYZ(wp.x, wp.y, wp.z)
+        self._setCursorMarker(wp)
+        if self._pickState == "waitSecond" and self._p1 is not None:
+            self._updateHoverPreview(wp)
+
+    def onRightClick(self, wp: Point3D) -> bool:
+        if self._pickState == "waitSecond":
+            # 退回重选第一点，不结束命令
+            self._pickState = "waitFirst"
+            self._p1 = None
+            self._msg = ""
+            self._setPreviewPath(QPainterPath())
+            return True
+        return False   # 交由调度取消命令（右键退出）
+
+    def onEnter(self) -> bool:
+        return self.onRightClick(None)
+
+    # ---------- 执行 ----------
+
+    def _apply(self, p1: Point3D, p2: Point3D) -> bool:
+        """按方案写回文档，返回是否成功。"""
+        msg, plan = self._planBridge(p1, p2)
+        if msg:
+            self._msg = msg
+            return False
+        if self._doc is None:
+            return False
+        if plan[0] == "fuse":
+            _tag, obj1, pieces, obj2 = plan
+            self._writeBackPieces(obj1, pieces)
+            if obj2 is not None:
+                self._doc.removeObject(obj2.id())
+            if self._manager is not None:
+                self._manager.notifyResult("已桥接相连")
+            return True
+        _tag, jobs, ngaps = plan
+        for obj, pieces in jobs:
+            self._writeBackPieces(obj, pieces)
+        if self._manager is not None:
+            self._manager.notifyResult(f"已开 {ngaps} 处桥")
+        return True
+
+    def _writeBackPieces(self, obj, pieces: List[List[Point3D]]) -> None:
+        """第一段更新原对象（保 ID/样式），其余段新建 PolyCurveObject。"""
+        self._updateObjectPoints(obj, pieces[0])
+        for seg_pts in pieces[1:]:
+            poly = PolyCurveObject()
+            poly.addSegment({"points": [[p.x, p.y, p.z] for p in seg_pts]})
+            if self._doc is not None:
+                self._doc.addObject(poly)
+        if self._doc is not None:
+            self._doc.notifyObjectChanged(obj.id())
+
+    def _updateObjectPoints(self, obj, newPts: List[Point3D]) -> None:
+        """更新对象点列；圆/曲线等非直线对象转 PolyCurveObject 保留形状。"""
+        if obj.type().name == "LINE":
+            lst = obj.points()
+            lst.clear()
+            lst.extend(newPts)
+            return
+        oldId = obj.id()
+        poly = PolyCurveObject()
+        poly.addSegment({"points": [[p.x, p.y, p.z] for p in newPts]})
+        poly._id = oldId   # 保留旧 ID 与样式，视图同步按原位替换
+        poly._color = obj._color
+        poly._lineWidth = obj._lineWidth
+        poly._layerId = obj.layerId()
+        if self._doc is not None:
+            self._doc.removeObject(oldId)
+            self._doc.addObject(poly)
 
 
 # ==================== Array 阵列 ====================

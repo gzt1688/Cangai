@@ -6,10 +6,13 @@ from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtGui import QColor
 import ui.styles.theme as theme
 from ui.widgets.paint_state import PaintState
+from i18n import tr, languageChanged
 
 
 class CaptureToolbar(QToolBar):
     snapTypeToggled = Signal(str, bool)
+    clearColorsRequested = Signal()        # 清除颜色：清空模型全部色号
+    autoColorSeparateRequested = Signal()  # 自动分色：按选中闭合曲线逐块填不同色
 
     # 捕捉类型按钮（key, 中文标签）：10 个类型全部默认开启
     _BTN_DEFS = [("endpoint", "端点"), ("nearest", "最近点"), ("point", "节点"),
@@ -19,6 +22,8 @@ class CaptureToolbar(QToolBar):
     _HIGHLIGHT = "#15b6c9"
 
     def __init__(self) -> None:
+        # 按钮文字保持中文：英文太长（Endpoint/Midpoint 等）小按钮放不下，
+        # 仅 tooltip 翻译（悬停显示英文说明）。
         super().__init__("捕捉")
         self.setMovable(False)
         # 禁用右键弹出的工具栏上下文菜单（"颜色栏"区域右键不再弹菜单）
@@ -29,10 +34,10 @@ class CaptureToolbar(QToolBar):
         # 禁用（停用）按钮按下前的状态快照
         self._disabledSnapshot: Optional[Dict[str, bool]] = None
 
-        title = QLabel("捕捉:")
-        title.setFixedHeight(24)
-        title.setStyleSheet("font-weight: bold; font-size: 13px; padding: 0 6px;")
-        self.addWidget(title)
+        self._titleLabel = QLabel("捕捉:")
+        self._titleLabel.setFixedHeight(24)
+        self._titleLabel.setStyleSheet("font-weight: bold; font-size: 13px; padding: 0 6px;")
+        self.addWidget(self._titleLabel)
 
         for key, label in self._BTN_DEFS:
             btn = QPushButton(label)
@@ -69,16 +74,33 @@ class CaptureToolbar(QToolBar):
         sep2.setStyleSheet("color: #ccc;")
         self.addWidget(sep2)
 
-        colorTitle = QLabel("当前颜色:")
-        colorTitle.setFixedHeight(24)
-        colorTitle.setStyleSheet("font-weight: bold; font-size: 13px; padding: 0 6px;")
-        self.addWidget(colorTitle)
+        self._colorTitle = QLabel(tr("当前颜色:"))
+        self._colorTitle.setFixedHeight(24)
+        self._colorTitle.setStyleSheet("font-weight: bold; font-size: 13px; padding: 0 6px;")
+        self.addWidget(self._colorTitle)
 
         self._colorBox = QLabel()
         self._colorBox.setFixedWidth(28)
         self._colorBox.setSizePolicy(QLabel().sizePolicy().horizontalPolicy(), QSizePolicy.Expanding)
-        self._colorBox.setToolTip("当前颜色（空格填色 / W 切换）")
+        self._colorBox.setToolTip(tr("当前颜色（空格填色 / W 切换）"))
         self.addWidget(self._colorBox)
+
+        # 当前颜色块右侧：清除颜色 / 自动分色（作用于活动浮雕模型的色号蒙版）
+        self._btnClearColors = QPushButton(tr("清除颜色"))
+        self._btnClearColors.setFixedHeight(24)
+        self._btnClearColors.setMinimumWidth(52)
+        self._btnClearColors.setStyleSheet(self._btnStyle())
+        self._btnClearColors.setToolTip(tr("清除模型上的所有颜色"))
+        self._btnClearColors.clicked.connect(self.clearColorsRequested.emit)
+        self.addWidget(self._btnClearColors)
+
+        self._btnAutoSeparate = QPushButton(tr("自动分色"))
+        self._btnAutoSeparate.setFixedHeight(24)
+        self._btnAutoSeparate.setMinimumWidth(52)
+        self._btnAutoSeparate.setStyleSheet(self._btnStyle())
+        self._btnAutoSeparate.setToolTip(tr("按选中的闭合曲线自动分色：每个闭合区域填一种不同颜色"))
+        self._btnAutoSeparate.clicked.connect(self.autoColorSeparateRequested.emit)
+        self.addWidget(self._btnAutoSeparate)
 
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.VLine)
@@ -101,6 +123,16 @@ class CaptureToolbar(QToolBar):
         self._paint = PaintState.instance()
         self._paint.currentChanged.connect(self._applyCurrentColor)
         self._applyCurrentColor(self._paint.currentIndex())
+        languageChanged().connect(self.retranslateUi)
+
+    def retranslateUi(self) -> None:
+        """语言切换：捕捉类型/禁用按钮保持中文（英文放不下），其余翻译。"""
+        self._colorTitle.setText(tr("当前颜色:"))
+        self._colorBox.setToolTip(tr("当前颜色（空格填色 / W 切换）"))
+        self._btnClearColors.setText(tr("清除颜色"))
+        self._btnClearColors.setToolTip(tr("清除模型上的所有颜色"))
+        self._btnAutoSeparate.setText(tr("自动分色"))
+        self._btnAutoSeparate.setToolTip(tr("按选中的闭合曲线自动分色：每个闭合区域填一种不同颜色"))
 
     # ------------------------------------------------------------------
     # 调色板 / 当前颜色（PaintState 驱动）
@@ -154,6 +186,8 @@ class CaptureToolbar(QToolBar):
         for btn in self._buttons.values():
             btn.setStyleSheet(style)
         self._noneButton.setStyleSheet(style)
+        self._btnClearColors.setStyleSheet(style)
+        self._btnAutoSeparate.setStyleSheet(style)
 
     # ------------------------------------------------------------------
     # 禁用（停用）按钮：保存/恢复全部捕捉状态（参考原项目 onDisableToggled）

@@ -101,6 +101,10 @@ class SceneBridge:
             self._syncing = False
 
     def _onAdded(self, oid: str) -> None:
+        # 3D / CNC 空间对象（各自模式单独绘制的曲线/毛坯）不进入 2D 场景：
+        # 2D/浮雕画布与 3D、CNC 模式的曲线互相独立、互不可见
+        if self._doc.is3DObject(oid) or self._doc.isCncObject(oid):
+            return
         obj = self._doc.object(oid)
         if obj is None:
             return
@@ -116,7 +120,7 @@ class SceneBridge:
         elif obj.type() == ObjectType.DIMENSION:
             # 尺寸标注浮于曲线/模型之上，便于读数不被压线遮挡
             item.setZValue(50)
-        item.setVisible(self._layerVisible(obj))
+        item.setVisible(self._itemVisible(obj))
         self._items[oid] = item
         self._scene.addItem(item)
 
@@ -133,13 +137,23 @@ class SceneBridge:
             return parent is None or parent.visible
         return True
 
+    def _itemVisible(self, obj) -> bool:
+        """图元在 2D 画布上是否可见：对象自身可见 且 所在图层可见。
+
+        浮雕模式下非编辑模型会被 setVisible(False) 隐藏，此处让其图元同步消失，
+        使框选/点选不会命中未显示的模型。
+        """
+        if not obj.isVisible():
+            return False
+        return self._layerVisible(obj)
+
     def _syncLayerVisibility(self) -> None:
         """图层显隐切换：把对应对象图元隐藏/显示（2D 画布同步）。"""
         for oid, item in self._items.items():
             obj = self._doc.object(oid)
             if obj is None:
                 continue
-            item.setVisible(self._layerVisible(obj))
+            item.setVisible(self._itemVisible(obj))
 
     def _onRemoved(self, oid: str) -> None:
         item = self._items.pop(oid, None)
@@ -151,6 +165,7 @@ class SceneBridge:
         obj = self._doc.object(oid)
         if item is not None and obj is not None:
             updateItem(item, obj, self._viewScale)
+            item.setVisible(self._itemVisible(obj))
 
     def updatePixelScale(self, scale: float) -> None:
         """视图缩放变化：点标记是固定屏幕尺寸，按新缩放重算其世界半径。"""

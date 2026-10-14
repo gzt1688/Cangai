@@ -17,8 +17,8 @@ _PROBE_CHARS = "1234567890ABCDEFGHIJKLabcdefghijklmnopqrstuvwxyz"
 
 def _loadFontTools():
     from fontTools.ttLib import TTFont
-    from fontTools.pens.recordingPen import RecordingPen
-    return TTFont, RecordingPen
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
+    return TTFont, DecomposingRecordingPen
 
 
 def _drawToPaths(pen_value, em, autoClose) -> tuple:
@@ -160,7 +160,7 @@ def _detectSingleLine(ttFont, glyphSet, cmap, em) -> bool:
         gn = cmap.get(ord(c))
         if gn is None:
             continue
-        pen = RecordingPen()
+        pen = RecordingPen(glyphSet)
         try:
             glyphSet[gn].draw(pen)
         except Exception:
@@ -217,7 +217,7 @@ def _loadFromPath(filePath: str, fontNumber: int = 0) -> FontData:
             gn = _cmap.get(ord(c))
             if gn is None:
                 return None
-            pen = _rp()
+            pen = _rp(_gs)
             try:
                 _gs[gn].draw(pen)
             except Exception:

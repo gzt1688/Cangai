@@ -70,13 +70,16 @@ class EventBus:
                 self._subs.get(topic, []).remove(sub)
 
     def emit(self, topic: str, payload=None) -> None:
-        """发布事件；逐个调用订阅者，单个异常不影响其余订阅者。"""
+        """发布事件；逐个调用订阅者，单个异常不影响其余订阅者。
+
+        SystemExit/KeyboardInterrupt 不吞——那是进程级退出意图，
+        静默掉会让插件层 sys.exit() 变成无反应。"""
         for sub in list(self._subs.get(topic, ())):
             try:
                 sub.adapter(payload)
+            except (SystemExit, KeyboardInterrupt):
+                raise
             except Exception as exc:   # 隔离订阅者错误（含插件代码）
-                self._on_error(topic, exc)
-            except BaseException as exc:   # SystemExit 等也不允许打断发布方
                 self._on_error(topic, exc)
 
     def subscriberCount(self, topic: str | None = None) -> int:

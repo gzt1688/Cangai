@@ -14,6 +14,23 @@ Path = List[Point]
 CharPaths = List[Path]
 
 
+class _BoxGlyph:
+    """缺字形占位：emSize 空间的空心方框（宽 0.6em、高 0.8em）。
+
+    字体缺少某字符字形时用它占位渲染，避免文字整体消失不可见；
+    接口与 GlyphData 兼容（width / paths / inkCenter），可走统一的
+    _transformGlyph 变换流程（含旋转）。"""
+
+    def __init__(self, emSize: float) -> None:
+        w, h = emSize * 0.6, emSize * 0.8
+        self.width = w
+        self.paths = [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (0.0, 0.0)]]
+
+    def inkCenter(self) -> Optional[Point]:
+        path = self.paths[0]
+        return (self.width * 0.5, path[2][1] * 0.5)
+
+
 def _rotate(p: Point, cx: float, cy: float, cosA: float, sinA: float) -> Point:
     dx, dy = p[0] - cx, p[1] - cy
     return (cx + dx * cosA - dy * sinA, cy + dx * sinA + dy * cosA)
@@ -71,12 +88,16 @@ def layoutLinear(text: str, font: FontData, charHeight: float,
             continue
         g = font.getGlyph(c)
         if g is None:
-            if vertical:
-                curY -= charHeight + charSpacing
-            else:
-                curX += charHeight * 0.5 + charSpacing
-            results.append([])
-            continue
+            if c.isspace():
+                # 空白字符无字形属正常：只前进不画
+                if vertical:
+                    curY -= charHeight * 0.5 + charSpacing
+                else:
+                    curX += charHeight * 0.5 + charSpacing
+                results.append([])
+                continue
+            # 字体缺字形：用空心方框占位（不再静默丢字/整段消失）
+            g = _BoxGlyph(font.emSize)
         charW = g.width * scale
         paths = _transformGlyph(g, scale, curX, curY, rotation)
         results.append(paths)
@@ -163,10 +184,14 @@ def layoutOnCurve(text: str, font: FontData, curvePts: List[Point],
     for c in text:
         g = font.getGlyph(c)
         if g is None:
-            spaceW = charHeight * 0.5
-            curLen += (spaceW + charSpacing) * direction
-            results.append([])
-            continue
+            if c.isspace():
+                # 空白字符无字形属正常：只前进不画
+                spaceW = charHeight * 0.5
+                curLen += (spaceW + charSpacing) * direction
+                results.append([])
+                continue
+            # 字体缺字形：用空心方框占位（不再静默丢字）
+            g = _BoxGlyph(font.emSize)
         charW = g.width * scale
         if (not curve.closed and
                 (curLen < 0 or curLen > curve.length)):

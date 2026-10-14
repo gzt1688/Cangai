@@ -1,6 +1,7 @@
 """文档模型：Document 维护对象集合与选择状态，Layer 描述图层。"""
 from __future__ import annotations
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -14,9 +15,11 @@ from .vector.arc_object import ArcObject
 from .vector.ellipse_object import EllipseObject
 from .vector.point_object import PointObject
 from .vector.poly_curve_object import PolyCurveObject
+from .vector.nurbs_curve_object import NurbsCurveObject
 from .vector.relief_model_object import ReliefModelObject
 from .vector.image_object import ImageObject
 from .vector.dimension_object import DimensionObject
+from .vector.brep_object import BRepObject
 from .vector.geometry_types import ObjectType
 
 
@@ -28,9 +31,12 @@ _TYPE_FACTORY = {
     "ELLIPSE": EllipseObject,
     "POINT": PointObject,
     "POLYCURVE": PolyCurveObject,
+    "NURBS_CURVE": NurbsCurveObject,
     "SURFACE": ReliefModelObject,
     "IMAGE": ImageObject,
     "DIMENSION": DimensionObject,
+    # 3D 实体（挤出/墙线/布尔/螺纹/推拉等 BRepObject 产物）
+    "BREP": BRepObject,
 }
 
 
@@ -45,8 +51,8 @@ def objectFromDict(data: dict) -> Optional[BaseObject]:
 
 
 # ---- 固定图层（按对象类型自动归类的“族”）----
-# 图层 0“曲线”/1“模型”/2“图片”/3“标注”固定存在，不可删除、改名、调序：
-# 绘制/曲线类对象（含文字轮廓）自动归入“曲线”层；浮雕模型自动归入“模型”层；
+# 图层 0“曲线”/1“浮雕模型”/2“图片”/3“标注”固定存在，不可删除、改名、调序：
+# 绘制/曲线类对象（含文字轮廓）自动归入“曲线”层；浮雕模型自动归入“浮雕模型”层；
 # 参考图片（描图底图）自动归入“图片”层；尺寸标注对象自动归入“标注”层。
 # 用户可在任一固定层下新建“子图层”做同族细分归档，子图层同样具备显隐/锁定/
 # 颜色/重命名等图层属性。若“当前层”是该族的某个子图层，新建的同族对象会优先
@@ -56,20 +62,31 @@ LAYER_CURVES_ID = 0
 LAYER_MODEL_ID = 1
 LAYER_IMAGE_ID = 2
 LAYER_ANNOTATION_ID = 3
-LAYER_FIXED_COUNT = 4   # 固定层数量；id ≥ LAYER_FIXED_COUNT 的层全部为子图层
+LAYER_3D_MODEL_ID = 4
+LAYER_CNC_ID = 5        # 加工模具：固定层，专放 CNC 加工模型
+LAYER_FIXED_COUNT = 6   # 固定层数量；id ≥ LAYER_FIXED_COUNT 的层全部为子图层
 
 # (id, 默认名, 默认颜色)：曲线层沿用描边主色，模型层沿用模型默认轮廓色，
-# 图片层取中性紫（仅作图层标识色，图片本身按原始像素显示），标注层取绿色
+# 图片层取中性紫（仅作图层标识色，图片本身按原始像素显示），标注层取绿色，
+# 3D模型层取青绿（3D 模式挤出实体默认归此层，与曲线/浮雕模型区分）
 _FIXED_LAYERS = (
     (LAYER_CURVES_ID, "曲线", (255, 100, 0)),
-    (LAYER_MODEL_ID, "模型", (21, 182, 201)),
+    (LAYER_MODEL_ID, "浮雕模型", (21, 182, 201)),
     (LAYER_IMAGE_ID, "图片", (155, 89, 182)),
     (LAYER_ANNOTATION_ID, "标注", (46, 204, 113)),
+    (LAYER_3D_MODEL_ID, "3D模型", (0, 200, 200)),
+    (LAYER_CNC_ID, "加工模具", (216, 175, 68)),
 )
 
 
+# 固定层默认可见性：所有固定层默认可见
+_FIXED_LAYER_VISIBLE = (LAYER_CURVES_ID, LAYER_MODEL_ID, LAYER_IMAGE_ID,
+                        LAYER_ANNOTATION_ID, LAYER_3D_MODEL_ID,
+                        LAYER_CNC_ID)
+
+
 def _isFixedLayer(lid: int) -> bool:
-    """固定层判定：0 曲线 / 1 模型 / 2 图片 / 3 标注。
+    """固定层判定：0 曲线 / 1 浮雕模型 / 2 图片 / 3 标注 / 4 3D模型 / 5 加工模具。
     固定层不可删除、改名、调序，其下可挂子图层。"""
     return LAYER_CURVES_ID <= lid < LAYER_FIXED_COUNT
 
@@ -81,22 +98,106 @@ def isFixedLayerId(lid: int) -> bool:
 
 def _layerIdForObject(obj) -> int:
     """对象自动归属族根：浮雕模型(SURFACE) → 模型层；图片(IMAGE) → 图片层；
-    尺寸标注(DIMENSION) → 标注层；其余（含文字轮廓 PolyCurveObject.isText）
-    → 曲线层。"""
+    尺寸标注(DIMENSION) → 标注层；挤出实体(SOLID)/B-Rep 实体(BREP) →
+    3D模型层；其余（含 3D 曲线、文字轮廓 PolyCurveObject.isText）→ 曲线层。"""
     if obj.type() == ObjectType.SURFACE:
         return LAYER_MODEL_ID
     if obj.type() == ObjectType.IMAGE:
         return LAYER_IMAGE_ID
     if obj.type() == ObjectType.DIMENSION:
         return LAYER_ANNOTATION_ID
+    if obj.type() in (ObjectType.SOLID, ObjectType.BREP):
+        return LAYER_3D_MODEL_ID
     return LAYER_CURVES_ID
 
 
-# 撤销/重做按“对象域”拆成相互独立的两套历史：
-#   curve  → 非浮雕模型对象（曲线/点/文字…）的编辑；
-#   relief → 浮雕模型(SURFACE)对象（新建/区域浮雕/填色/雕刻/移动/删除…）的编辑。
-# 两套历史各自记录、各自撤销/重做，互不混入、互不清空。
-_HISTORY_DOMAINS = ("curve", "relief")
+# 撤销/重做按“对象域”拆成相互独立的多套历史：
+#   curve   → 2D/浮雕空间中非浮雕模型对象（曲线/点/文字…）的编辑；
+#   relief  → 浮雕模型(SURFACE)对象（新建/区域浮雕/填色/雕刻/移动/删除…）的编辑；
+#   curve3d → 3D 空间独立曲线的编辑（3D 模式单独绘制的曲线，与 2D/浮雕互不可见）。
+# 各套历史各自记录、各自撤销/重做，互不混入、互不清空；
+# curve3d 归入“曲线”撤销按钮（undoCurve/redoCurve 取 curve/curve3d 中较新者）。
+_HISTORY_DOMAINS = ("curve", "relief", "curve3d")
+_DOMAIN_CURVE3D = "curve3d"
+
+# 文档活动空间：2D/浮雕模式共用 "2d" 空间（曲线与浮雕模型互相可见）；
+# 3D 模式使用独立的 "3d" 空间（只包含 3D 模式里单独绘制的曲线，可带任意 Z），
+# 切到 3D 后看不到 2D/浮雕里的曲线和模型，反之亦然。
+# CNC 模式使用独立的 "cnc" 空间（毛坯 + CNC 模式下绘制的加工区域几何），
+# 与 2D/浮雕、3D 均互不可见，数据完全独立。
+SPACE_2D = "2d"
+SPACE_3D = "3d"
+SPACE_CNC = "cnc"
+
+
+_CURVE_GEOM_TYPES = {ObjectType.ARC, ObjectType.CIRCLE, ObjectType.ELLIPSE,
+                     ObjectType.RECTANGLE}
+
+
+def _num(o, name, default=0.0) -> float:
+    v = getattr(o, name, None)
+    if v is None:
+        return default
+    try:
+        return float(v()) if callable(v) else float(v)
+    except Exception:
+        return default
+
+
+def _px(p):
+    """统一取点坐标（Point3D 或列表）。"""
+    if hasattr(p, "x"):
+        return (p.x, p.y, p.z)
+    try:
+        return (p[0], p[1], p[2] if len(p) > 2 else 0.0)
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def _distinct2(pts) -> bool:
+    """是否存在两个不同点（有实际可见几何）。"""
+    if len(pts) < 2:
+        return False
+    x0, y0, z0 = _px(pts[0])
+    for p in pts[1:]:
+        x, y, z = _px(p)
+        if abs(x - x0) > 1e-9 or abs(y - y0) > 1e-9 or abs(z - z0) > 1e-9:
+            return True
+    return False
+
+
+def _countableObject(o) -> bool:
+    """对象是否计入图层数量：与画布可选中口径一致——空几何不计。
+    线/曲线系按采样几何（有实际可见线段）判定，不依赖 inputPoints；
+    圆/圆弧/椭圆按实际尺寸（半径等>0）判定。"""
+    t = getattr(o, "type", lambda: None)()
+    if t == ObjectType.CIRCLE:
+        return _num(o, "radius") > 1e-9
+    if t == ObjectType.ARC:
+        return (_num(o, "radius") > 1e-9
+                and abs(_num(o, "endAngle") - _num(o, "startAngle")) > 1e-9)
+    if t == ObjectType.ELLIPSE:
+        return _num(o, "majorAxis") > 1e-9 and _num(o, "minorAxis") > 1e-9
+    if t in (ObjectType.LINE, ObjectType.CURVE, ObjectType.NURBS_CURVE):
+        try:
+            if t == ObjectType.LINE:
+                pts = list(o.points())
+            else:
+                pts = list(o.getSampledPoints())
+            return _distinct2(pts)
+        except Exception:
+            return False
+    if t in (ObjectType.POLYCURVE, ObjectType.RECTANGLE):
+        try:
+            segs = list(o.segments()) if hasattr(o, "segments") else []
+            if not segs:
+                poly = o.toPolycurve()
+                segs = list(poly.segments()) if poly is not None else []
+            pts = [p for seg in segs for p in seg.get("points", [])]
+            return _distinct2(pts)
+        except Exception:
+            return False
+    return True
 
 
 @dataclass
@@ -128,8 +229,15 @@ class Document(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._objects: Dict[str, BaseObject] = {}
+        # 3D 空间独立对象表（3D 模式单独绘制的曲线，与 2D/浮雕空间互不可见）
+        self._objects3d: Dict[str, BaseObject] = {}
+        # CNC 空间独立对象表（毛坯 + CNC 模式下绘制的加工区域几何）
+        self._objectsCnc: Dict[str, BaseObject] = {}
+        self._space: str = SPACE_2D
         self._layers: Dict[int, Layer] = {
-            lid: Layer(lid, name, color=color) for lid, name, color in _FIXED_LAYERS}
+            lid: Layer(lid, name, color=color,
+                       visible=(lid in _FIXED_LAYER_VISIBLE))
+            for lid, name, color in _FIXED_LAYERS}
         self._layerOrder: List[int] = [lid for lid, _, _ in _FIXED_LAYERS]
         self._nextLayerId: int = LAYER_FIXED_COUNT
         self._activeLayerId: int = LAYER_CURVES_ID
@@ -186,42 +294,104 @@ class Document(QObject):
     def defaultLineWidth(self) -> float:
         return self._defaultLineWidth
 
-    def addObject(self, obj: BaseObject) -> None:
+    # ---------------- 活动空间（2D/浮雕 共用 2d；3D 模式独立 3d；CNC 独立 cnc） ----------------
+
+    def space(self) -> str:
+        """当前活动空间："2d"（2D/浮雕共用）、"3d"（3D 模式独立曲线）或 "cnc"（CNC 独立）。"""
+        return self._space
+
+    def setSpace(self, space: str) -> None:
+        """切换活动空间；各空间的选中集一并清空，避免跨空间残留选中。"""
+        if space not in (SPACE_2D, SPACE_3D, SPACE_CNC):
+            return
+        if space == self._space:
+            return
+        self.clearSelection()
+        for o in self._objects3d.values():
+            if o.isSelected():
+                o.setSelected(False)
+        for o in self._objectsCnc.values():
+            if o.isSelected():
+                o.setSelected(False)
+        self._space = space
+
+    def _activeStore(self) -> Dict[str, BaseObject]:
+        """当前活动空间的对象表。"""
+        if self._space == SPACE_3D:
+            return self._objects3d
+        if self._space == SPACE_CNC:
+            return self._objectsCnc
+        return self._objects
+
+    def is3DObject(self, oid: str) -> bool:
+        """对象是否属于 3D 空间（2D 场景据此跳过、不生成图元）。"""
+        return oid in self._objects3d
+
+    def isCncObject(self, oid: str) -> bool:
+        """对象是否属于 CNC 空间（2D 场景据此跳过、不生成图元）。"""
+        return oid in self._objectsCnc
+
+    def addObject(self, obj: BaseObject, space: Optional[str] = None) -> None:
+        """把对象加入指定空间（space=None 时加入当前活动空间）。"""
+        if space == SPACE_3D:
+            self._objects3d[obj.id()] = obj
+        elif space == SPACE_CNC:
+            self._objectsCnc[obj.id()] = obj
+        else:
+            self._activeStore()[obj.id()] = obj
         # 自动分层：先按类型落在对应固定层（“族”）；若“当前层”是该族的
         # 一个子图层，则优先落入该子图层，实现同族内的细分归档。
+        # 3D 空间的对象落入当前活动空间的独立对象表（同样归“曲线”族）。
         root = _layerIdForObject(obj)
         lid = root
         act = self._layers.get(self._activeLayerId)
         if act is not None and (act.id == root or act.parentId == root):
             lid = act.id
+        elif act is not None and root == LAYER_3D_MODEL_ID \
+                and act.id == LAYER_CNC_ID:
+            lid = act.id   # 3D 实体可落入“加工模具”固定层
         obj.setLayerId(lid)
         layer = self._layers.get(lid)
         if layer is not None:
             obj.setColor(layer.color)
             obj.setLayerLocked(layer.locked)   # 放入锁定层的新对象同样不可编辑
         obj.setLineWidth(self._defaultLineWidth)
-        self._objects[obj.id()] = obj
         self.objectAdded.emit(obj.id())
 
     def removeObject(self, oid: str) -> Optional[BaseObject]:
         obj = self._objects.pop(oid, None)
+        if obj is None:
+            obj = self._objects3d.pop(oid, None)
+        if obj is None:
+            obj = self._objectsCnc.pop(oid, None)
         if obj is not None:
             self.objectRemoved.emit(oid)
         return obj
 
     def object(self, oid: str) -> Optional[BaseObject]:
-        return self._objects.get(oid)
+        obj = self._objects.get(oid)
+        if obj is None:
+            obj = self._objects3d.get(oid)
+        if obj is None:
+            obj = self._objectsCnc.get(oid)
+        return obj
 
     def objects(self) -> List[BaseObject]:
-        return list(self._objects.values())
+        """当前活动空间的对象列表（3D 模式只含 3D 曲线，CNC 只含 CNC 对象）。"""
+        return list(self._activeStore().values())
+
+    def allObjects(self) -> List[BaseObject]:
+        """全部对象（跨空间）：导出、全局属性刷新等不区分空间的场景使用。"""
+        return (list(self._objects.values()) + list(self._objects3d.values())
+                + list(self._objectsCnc.values()))
 
     def isEmpty(self) -> bool:
         """文档内是否没有任何对象（用于“最后一个空文档不可关闭”等判定）。"""
-        return not self._objects
+        return not self._objects and not self._objects3d and not self._objectsCnc
 
     def visibleObjects(self) -> List[BaseObject]:
         out = []
-        for obj in self._objects.values():
+        for obj in self._activeStore().values():
             layer = self._layers.get(obj.layerId())
             if obj.isVisible() and (layer is None or layer.visible):
                 out.append(obj)
@@ -234,7 +404,7 @@ class Document(QObject):
         self.objectChanged.emit(oid)
 
     def _syncBoundDimensions(self, changedOid: Optional[str] = None) -> None:
-        """绑定标注跟随：把绑定到受影响对象的 XY 标注被测区域同步为其
+        """绑定标注跟随：把绑定到受影响对象的 XY/Z 标注被测区域同步为其
         现存绑定源对象的联合包围盒（保留字号/净空/子标注外拉距离）。
 
         changedOid 为 None 时全量同步（撤销/重做恢复后使用）。仅对仍绑定
@@ -242,15 +412,15 @@ class Document(QObject):
         用户解绑后（目标列表清空）也自然不再参与。
         """
         touched = []
-        for obj in list(self._objects.values()):
+        for obj in list(self.allObjects()):
             if obj.type() != ObjectType.DIMENSION:
                 continue
-            if obj.kind() != "xy":
+            if obj.kind() not in ("xy", "z"):
                 continue
             if changedOid is not None and changedOid not in obj.boundTargetIds():
                 continue
-            srcs = [self._objects[t] for t in obj.boundTargetIds()
-                    if t in self._objects]
+            srcs = [self.object(t) for t in obj.boundTargetIds()
+                    if self.object(t) is not None]
             if not srcs:
                 continue
             if obj.followTargetBounds(srcs):
@@ -277,11 +447,11 @@ class Document(QObject):
         return selected
 
     def selectedObjects(self) -> List[BaseObject]:
-        return [o for o in self._objects.values() if o.isSelected()]
+        return [o for o in self._activeStore().values() if o.isSelected()]
 
     def clearSelection(self) -> None:
         changed = False
-        for o in self._objects.values():
+        for o in self._activeStore().values():
             if o.isSelected():
                 o.setSelected(False)
                 changed = True
@@ -291,7 +461,7 @@ class Document(QObject):
     def selectObject(self, oid: str, append: bool = False) -> None:
         if not append:
             self.clearSelection()
-        obj = self._objects.get(oid)
+        obj = self._activeStore().get(oid)
         if obj is not None:
             obj.setSelected(True)
             self.selectionChanged.emit()
@@ -299,7 +469,7 @@ class Document(QObject):
     def groupSelected(self) -> int:
         """把当前选中对象编为一组（共享同一组 id）；返回编组对象数。
         跳过锁定对象；已在其他组的对象归入新组（重新编组）。"""
-        sel = [o for o in self._objects.values()
+        sel = [o for o in self._activeStore().values()
                if o.isSelected() and not o.isLocked()]
         if not sel:
             return 0
@@ -311,7 +481,7 @@ class Document(QObject):
 
     def ungroupSelected(self) -> int:
         """解除当前选中对象的组归属（清空组 id）；返回受影响对象数。"""
-        sel = [o for o in self._objects.values()
+        sel = [o for o in self._activeStore().values()
                if o.isSelected() and o.group()]
         for o in sel:
             o.setGroup("")
@@ -323,6 +493,21 @@ class Document(QObject):
 
     def layer(self, lid: int) -> Optional[Layer]:
         return self._layers.get(lid)
+
+    def layerObjectCount(self, lid: int, includeChildren: bool = True) -> int:
+        """图层对象数量：含/不含子图层（当前活动空间）。"""
+        ids = {lid}
+        if includeChildren:
+            ids.update(l.id for l in self._layers.values()
+                       if l.parentId == lid)
+        n = 0
+        for o in self._activeStore().values():
+            if o.layerId() not in ids:
+                continue
+            if not _countableObject(o):
+                continue   # 空几何对象（如命令激活时的空线）不计入
+            n += 1
+        return n
 
     def childLayers(self, parentId: int) -> List[Layer]:
         """某固定层下的全部子图层（按 _layerOrder 顺序）。"""
@@ -376,7 +561,7 @@ class Document(QObject):
         back = layer.parentId if parent is not None else LAYER_CURVES_ID
         self._layerOrder.remove(lid)
         del self._layers[lid]
-        for obj in self._objects.values():
+        for obj in self.allObjects():
             if obj.layerId() == lid:
                 obj.setLayerId(back)
                 self.objectChanged.emit(obj.id())
@@ -426,7 +611,7 @@ class Document(QObject):
         if layer is None:
             return
         layer.color = tuple(color)
-        for obj in self._objects.values():
+        for obj in self.allObjects():
             if obj.layerId() == lid:
                 obj.setColor(layer.color)
                 self.objectChanged.emit(obj.id())
@@ -454,7 +639,7 @@ class Document(QObject):
         # - 锁定层：对象整体挂“图层锁”（拾取/框选/操作轴按 obj.isLocked() 排除），
         #   解锁层即恢复可编辑；此锁独立于浮雕编辑锁（_locked），互不干扰。
         selChanged = False
-        for obj in self._objects.values():
+        for obj in self.allObjects():
             if obj.layerId() not in affected:
                 continue
             if (visible is not None and not visible and obj.isSelected()) \
@@ -472,7 +657,7 @@ class Document(QObject):
 
         对象新建时 addObject 已处理；此处覆盖 deserialize/重建后丢失的标记。
         """
-        for obj in self._objects.values():
+        for obj in self.allObjects():
             layer = self._layers.get(obj.layerId())
             obj.setLayerLocked(bool(layer is not None and layer.locked))
 
@@ -488,7 +673,7 @@ class Document(QObject):
             if layer is None:
                 continue
             mismatch = any(o.layerId() == fixedId and o.type() != ftype
-                           for o in self._objects.values())
+                           for o in self.allObjects())
             if not mismatch:
                 continue
             newId = max([LAYER_FIXED_COUNT - 1]
@@ -499,7 +684,7 @@ class Document(QObject):
                                         locked=layer.locked, color=layer.color,
                                         parentId=LAYER_CURVES_ID)
             self._layerOrder[self._layerOrder.index(fixedId)] = newId
-            for o in self._objects.values():
+            for o in self.allObjects():
                 if o.layerId() == fixedId:
                     o.setLayerId(newId)
                     self.objectChanged.emit(o.id())
@@ -507,10 +692,10 @@ class Document(QObject):
                 self._activeLayerId = newId
 
     def _ensureFixedLayers(self) -> None:
-        """读档 / 快照恢复后调用：保证固定层(0 曲线 / 1 模型 / 2 图片 / 3 标注)存在且置顶。
+        """读档 / 快照恢复后调用：保证固定层(0 曲线 / 1 浮雕模型 / 2 图片 / 3 标注)存在且置顶。
 
         - 固定层缺失时按默认名/颜色补齐；已存在则保留显隐/锁定/颜色状态，
-          但名称统一为“曲线”“模型”“图片”“标注”（兼容旧文件第一层叫“默认”）；
+          但名称统一为“曲线”“浮雕模型”“图片”“标注”（兼容旧文件第一层叫“默认”）；
         - 旧版本平级“额外图层”（未记录 parentId）兼容为“曲线”根下的子图层；
         - 固定层或子图层上残留类型不符的对象，按类型归位到对应固定层；
         - 引用不存在图层的对象同样按类型归入固定层；
@@ -536,7 +721,7 @@ class Document(QObject):
                   if i not in fixed_ids and i in self._layers]
         self._layerOrder = fixed_ids + extras
         # 对象归位：层不存在 → 按类型归位；固定层/子图层上类型与层不符 → 归对应固定层
-        for obj in self._objects.values():
+        for obj in self.allObjects():
             cur = obj.layerId()
             l = self._layers.get(cur)
             if l is None:
@@ -570,9 +755,13 @@ class Document(QObject):
         另一域对象与其历史互不干扰，保证“不能混合、相互独立”。
         走对象级 snapshot() 协议（默认=serialize；浮雕网格/位图为免压缩的
         原始字节快照），每项同时记录对象级内存计费供预算淘汰。
+        curve3d 域取 3D 空间对象表（全部为曲线类对象）。
         """
-        objs = sorted((o for o in self._objects.values()
-                       if self._domainOf(o) == kind), key=lambda o: o.id())
+        src = (self._objects3d.values() if kind == _DOMAIN_CURVE3D
+               else self._objects.values())
+        objs = sorted((o for o in src
+                       if kind == _DOMAIN_CURVE3D or self._domainOf(o) == kind),
+                      key=lambda o: o.id())
         entries = []
         for o in objs:
             snap = o.snapshot()
@@ -593,12 +782,12 @@ class Document(QObject):
             self._editBefore = {k: self._snapshotDomain(k) for k in _HISTORY_DOMAINS}
 
     def endEdit(self) -> None:
-        """结束操作：按“哪个域的对象发生变化”压入对应域的撤销栈。
+        """结束操作：按"哪个域的对象发生变化"压入对应域的撤销栈。
 
         - 改动浮雕模型(SURFACE) → 浮雕(relief)历史；仅动曲线/点/文字等 → 曲线(curve)历史；
         - 一个会话若同时改了曲线与模型，两套历史各记一项；
         - 快照无变化则忽略（不产生空撤销项）。
-        - 压栈只清空本域的“重做”，另一域的重做/撤销不受影响。
+        - 压栈只清空本域的"重做"，另一域的重做/撤销不受影响。
         - 压栈后按内存预算（设置-渲染性能-撤销历史内存预算）从最旧开始淘汰。
         """
         if self._editBefore is None:
@@ -606,6 +795,12 @@ class Document(QObject):
         before = self._editBefore
         changedKinds = []
         for kind in _HISTORY_DOMAINS:
+            # O(1) 预检：先用对象级 matchesSnapshot 签名判断该域是否有变，
+            # 无变即跳过 after 全量物化——浮雕场 snapshot 是 64MB 级
+            # memcpy + 字典全等 memcmp，未涉及该域的编辑（画线/改曲线）
+            # 不再为它白付一次
+            if not self._domainChanged(kind, before[kind]):
+                continue
             after = self._snapshotDomain(kind)
             if after != before[kind]:
                 size = (self._historyEntrySize(before[kind]) +
@@ -622,6 +817,32 @@ class Document(QObject):
                 self._enforceHistoryBudget(kind)
             self._setDirty(True)   # 多文件系统：内容有变即标记未保存
             self._emitHistoryState()
+
+    def _domainChanged(self, kind: str, beforeSnap: dict) -> bool:
+        """该域自 beforeSnap 之后是否有任何变化（对象集/内容/选中集）。
+
+        走 matchesSnapshot 协议：浮雕模型是 stamp/version O(1) 签名比较，
+        曲线类为 serialize 全等（与原来 endEdit 的二次快照+字典比较等价）。
+        """
+        src = (self._objects3d.values() if kind == _DOMAIN_CURVE3D
+               else self._objects.values())
+        objs = [o for o in src
+                if kind == _DOMAIN_CURVE3D or self._domainOf(o) == kind]
+        beforeById = {e["id"]: e for e in beforeSnap.get("objects", [])}
+        if len(objs) != len(beforeById):
+            return True
+        for o in objs:
+            entry = beforeById.get(o.id())
+            if entry is None:
+                return True
+            try:
+                same = o.matchesSnapshot(entry["snap"])
+            except Exception:
+                same = False
+            if not same:
+                return True
+        cur_sel = {o.id() for o in objs if o.isSelected()}
+        return cur_sel != set(beforeSnap.get("selected", []))
 
     @staticmethod
     def _historyEntrySize(snap: dict) -> int:
@@ -646,19 +867,20 @@ class Document(QObject):
 
     def _restoreDomain(self, kind: str, snap: dict) -> None:
         """把 kind 域的对象恢复为快照状态；另一域对象与图层等文档状态保持不变。"""
+        store = self._objects3d if kind == _DOMAIN_CURVE3D else self._objects
         target = {e["id"]: e for e in snap["objects"]}
         snap_sel = set(snap.get("selected", []))
         # 1) 移除快照中已不存在的该域对象
-        for oid in [oid for oid, o in self._objects.items()
-                    if self._domainOf(o) == kind]:
+        for oid in [oid for oid, o in store.items()
+                    if kind == _DOMAIN_CURVE3D or self._domainOf(o) == kind]:
             if oid not in target:
-                self._objects.pop(oid)
+                store.pop(oid)
                 self.objectRemoved.emit(oid)
         # 2) 与快照有差异的对象按快照重建（同 id 先移除再添加，驱动场景/视口刷新）；
         #    matchesSnapshot 未变（浮雕按 stamp/version O(1) 签名、其余按快照全等）
         #    的对象保留原实例，避免无谓重建（尤其浮雕模型网格缓存）。
         for oid, entry in target.items():
-            cur = self._objects.get(oid)
+            cur = store.get(oid)
             if cur is not None:
                 try:
                     same = cur.matchesSnapshot(entry["snap"])
@@ -666,17 +888,17 @@ class Document(QObject):
                     same = False
                 if same:
                     continue
-                self._objects.pop(oid)
+                store.pop(oid)
                 self.objectRemoved.emit(oid)
             obj = self._objectFromSnapshot(entry["snap"])
             if obj is None:
                 continue
-            self._objects[oid] = obj
+            store[oid] = obj
             self.objectAdded.emit(oid)
         # 3) 该域选择集与快照对齐；其余域选择保持不变
         changed = False
-        for oid, obj in list(self._objects.items()):
-            if self._domainOf(obj) != kind:
+        for oid, obj in list(store.items()):
+            if kind != _DOMAIN_CURVE3D and self._domainOf(obj) != kind:
                 continue
             want = oid in snap_sel
             if obj.isSelected() != want:
@@ -689,9 +911,18 @@ class Document(QObject):
         # 撤销/重做重建后对齐绑定标注：源对象几何回到快照状态，标注跟随刷新
         self._syncBoundDimensions()
 
-    def _objectFromSnapshot(self, snap: dict) -> Optional[BaseObject]:
-        """由撤销快照重建对象：类型工厂 + restoreSnapshot（默认=deserialize，
-        与 snapshot()/serialize 数据兼容）。未知类型返回 None。"""
+    def _objectFromSnapshot(self, snap) -> Optional[BaseObject]:
+        """由撤销快照重建对象：快照可能是对象实例（BRepObject 内存克隆）
+        或序列化 dict。未知类型返回 None。"""
+        if isinstance(snap, BaseObject):
+            # 内存克隆快照：恢复时再克隆一份——历史栈仍持有原快照实例，
+            # 直接把同一实例放回 store 的话，后续任何就地修改会静默改写
+            # 历史，且再次恢复时 matchesSnapshot 自比较恒真、恢复变 no-op。
+            # BrepShape/BrepObject.clone 共享不可变 part 与派生缓存，代价极低。
+            try:
+                return snap.clone()
+            except Exception:
+                return snap
         factory = _TYPE_FACTORY.get(snap.get("type"))
         if factory is None:
             return None
@@ -716,15 +947,25 @@ class Document(QObject):
         self._undoHistory[kind].append((before, after, self._nextSeq(), sz))
         if len(self._undoHistory[kind]) > self._undoDepth:
             self._undoHistory[kind].pop(0)
+        # 反复撤销→重做也会往 undo 栈压大浮雕条目，同样受预算淘汰
+        # （原来只有 endEdit 压栈时淘汰，重做路径可超预算）
+        self._enforceHistoryBudget(kind)
         self._restoreDomain(kind, after)
         self._emitHistoryState()
 
     def undoCurve(self) -> None:
-        """撤销曲线历史：只恢复曲线/点/文字等对象，浮雕模型与其历史不受影响。"""
-        self._undoOne("curve")
+        """撤销曲线历史：只恢复曲线/点/文字等对象（含 3D 空间曲线），
+        浮雕模型与其历史不受影响。"""
+        kind = self._newestKind({"curve": self._undoHistory["curve"],
+                                 _DOMAIN_CURVE3D: self._undoHistory[_DOMAIN_CURVE3D]})
+        if kind is not None:
+            self._undoOne(kind)
 
     def redoCurve(self) -> None:
-        self._redoOne("curve")
+        kind = self._newestKind({"curve": self._redoHistory["curve"],
+                                 _DOMAIN_CURVE3D: self._redoHistory[_DOMAIN_CURVE3D]})
+        if kind is not None:
+            self._redoOne(kind)
 
     def undoRelief(self) -> None:
         """撤销浮雕历史：只恢复浮雕模型(SURFACE)对象，曲线与其历史不受影响。"""
@@ -755,10 +996,12 @@ class Document(QObject):
             self._redoOne(kind)
 
     def canCurveUndo(self) -> bool:
-        return bool(self._undoHistory["curve"])
+        return bool(self._undoHistory["curve"]) or \
+            bool(self._undoHistory[_DOMAIN_CURVE3D])
 
     def canCurveRedo(self) -> bool:
-        return bool(self._redoHistory["curve"])
+        return bool(self._redoHistory["curve"]) or \
+            bool(self._redoHistory[_DOMAIN_CURVE3D])
 
     def canReliefUndo(self) -> bool:
         return bool(self._undoHistory["relief"])
@@ -788,24 +1031,68 @@ class Document(QObject):
         self._emitHistoryState()
 
     def clear(self) -> None:
-        ids = list(self._objects.keys())
+        ids = (list(self._objects.keys()) + list(self._objects3d.keys())
+               + list(self._objectsCnc.keys()))
         self._objects.clear()
+        self._objects3d.clear()
+        self._objectsCnc.clear()
         for oid in ids:
             self.objectRemoved.emit(oid)
 
     def save(self, path: str) -> None:
-        """将文档序列化为 JSON 文件（含图层与全部对象）。"""
+        """将文档序列化为 JSON 文件（含图层与全部对象，2D/3D/CNC 三空间
+        + CNC 模块完整状态：机床/毛坯/夹具/刀具表/路径条目）。
+
+        2D 空间：曲线、图片（像素内嵌）、浮雕模型（高度场+蒙版+幕帘
+        压缩内嵌）；3D 空间：B-Rep 实体/网格模型；CNC 空间：CNC 画布
+        对象 + 全部路径条目（参数、picked 引用、G 代码、刀路 IR）。
+        单个对象序列化失败（记录日志）不影响其余内容落盘。
+        """
+        def _safe(o):
+            try:
+                return o.serialize()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                return None
         data = {
             "activeLayerId": self._activeLayerId,
             "layers": [{"id": l.id, "name": l.name, "visible": l.visible,
                         "locked": l.locked, "color": list(l.color),
                         "parentId": l.parentId}
                        for l in self.layers()],
-            "objects": [o.serialize() for o in self._objects.values()],
+            "objects": [s for o in self._objects.values()
+                        if (s := _safe(o)) is not None],
+            "objects3d": [s for o in self._objects3d.values()
+                          if (s := _safe(o)) is not None],
+            # CNC 空间：跳过临时对象（毛坯等运行时生成物，不落盘）
+            "objectsCnc": [s for o in self._objectsCnc.values()
+                           if not getattr(o, "_cncTransient", False)
+                           and (s := _safe(o)) is not None],
         }
-        with open(path, "w", encoding="utf-8") as f:
+        # CNC 模块完整状态（路径/刀具/机床/毛坯/夹具）；导入失败时降级为空
+        try:
+            from core.cnc.state import CncState
+            data["cncState"] = CncState.instance().toSaveDict()
+        except Exception:
+            data["cncState"] = {}
+        # 原子写：先写同目录临时文件再 os.replace——磁盘满/序列化中途
+        # 失败时不至于留下截断损坏的主文件（旧版本完整可回退）。
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
         self._setDirty(False)
+
+    @staticmethod
+    def _safeObjectFromDict(data: dict):
+        """单对象反序列化：失败（记录日志）返回 None，不阻塞整体加载。"""
+        try:
+            return objectFromDict(data)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return None
 
     def load(self, path: str) -> None:
         """从 JSON 文件加载文档，替换当前全部内容。"""
@@ -831,16 +1118,43 @@ class Document(QObject):
             self._layers[layer.id] = layer
             self._layerOrder.append(layer.id)
             self._nextLayerId = max(self._nextLayerId, layer.id + 1)
+        # 旧文件可能缺新增的固定层（如 3D模型层）：补建缺失的固定层
+        for lid, name, color in _FIXED_LAYERS:
+            if lid not in self._layers:
+                self._layers[lid] = Layer(lid, name, color=color)
+                self._layerOrder.append(lid)
         if not self._layers:
             self._layers[0] = Layer(0, "默认")
             self._layerOrder = [0]
             self._nextLayerId = LAYER_FIXED_COUNT
         self._activeLayerId = int(data.get("activeLayerId", 0))
         for od in data.get("objects", []):
-            obj = objectFromDict(od)
+            obj = self._safeObjectFromDict(od)
             if obj is not None:
                 self._objects[obj.id()] = obj
                 self.objectAdded.emit(obj.id())
+        # 3D 空间独立曲线（旧文件无此键 = 空）
+        for od in data.get("objects3d", []):
+            obj = self._safeObjectFromDict(od)
+            if obj is not None:
+                self._objects3d[obj.id()] = obj
+                self.objectAdded.emit(obj.id())
+        # CNC 空间独立对象（旧文件无此键 = 空；毛坯等临时对象不落盘）
+        for od in data.get("objectsCnc", []):
+            obj = self._safeObjectFromDict(od)
+            if obj is not None:
+                self._objectsCnc[obj.id()] = obj
+                self.objectAdded.emit(obj.id())
+        # CNC 模块完整状态（机床/毛坯/夹具/刀具表/路径条目）：对象已在上方
+        # 全部恢复，这里做 picked 对象 id → 引用解析；旧文件无此键 = 跳过
+        cd = data.get("cncState")
+        if cd:
+            try:
+                from core.cnc.state import CncState
+                CncState.instance().restoreFromDict(cd, self)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 旧文件额外图层 id 与新增固定层冲突时先重编号让位
         self._migrateLegacyLayerIds()
         # 读档保证四个固定层存在并置顶，子图层原样保留

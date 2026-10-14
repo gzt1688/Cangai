@@ -1,4 +1,4 @@
-"""外轮廓几何：把一组选中曲线生成一条包裹全部的最大外轮廓（往外偏一段距离）。
+﻿"""外轮廓几何：把一组选中曲线生成一条包裹全部的最大外轮廓（往外偏一段距离）。
 
 完美复刻 Rhino 插件 ToolPage.ShowOuterOutline / SiliconeMoldFunctions.OffsetOutward 的算法：
 
@@ -459,3 +459,160 @@ def _rdp(pts: List[Point3D], tol: float) -> List[Point3D]:
         stack.append((first, idx))
         stack.append((idx, last))
     return [pts[i] for i in range(n) if keep[i]]
+
+
+# ---------------------------------------------------------------- 内轮廓：纯曲线布尔区域提取 ----
+
+def pointInPolygon(poly: List[Point3D], p: Point3D) -> bool:
+    """射线法内点测试：点是否位于闭合多边形内部（单环）。"""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i].x, poly[i].y
+        xj, yj = poly[j].x, poly[j].y
+        if (yi > p.y) != (yj > p.y):
+            xint = (xj - xi) * (p.y - yi) / (yj - yi) + xi
+            if p.x < xint:
+                inside = not inside
+        j = i
+    return inside
+
+
+def polygonArea(pts: List[Point3D]) -> float:
+    """闭合多边形的有向面积（鞋带公式），取绝对值返回。"""
+    a = 0.0
+    n = len(pts)
+    for i in range(n):
+        r = pts[i]
+        q = pts[(i + 1) % n]
+        a += r.x * q.y - q.x * r.y
+    return abs(a * 0.5)
+
+
+class RegionFinder:
+    """曲线布尔平面剖分：点击/悬停时动态求所在闭合面片边界（无栅格、无锯齿）。
+
+    3 个及以上闭合曲线相交（韦恩图）也能正确识别交叉重叠区域：
+    对点击点 p，先求"命中曲线集" S = 所有包含 p 的闭合曲线；
+    该面片 = (∩_{i∈S} 曲线i) − (∪_{j∉S} 曲线j) − 开放墙，
+    覆盖 A-only / AB 透镜 / ABC 中心等全部由曲线围成的闭合区域。
+    """
+
+    def __init__(self, closedPolys: List[List[Point3D]],
+                 openPolys: List[List[Point3D]], wall: float = 0.01) -> None:
+        import pyclipper as pc
+        self._pc = pc
+        self.z = closedPolys[0][0].z if closedPolys else 0.0
+        # 同步过滤：closedPts 与 closedPaths 必须严格等长同序（同一多边形的两个表示），
+        # 否则 regionAt 用 closedPts 的索引去访问 closedPaths 会越界。
+        self.closedPts: List[List[Point3D]] = []
+        self.closedPaths = []
+        for pts in closedPolys:
+            if len(pts) < 3:
+                continue
+            path = _toClipper(pts)
+            if len(path) < 3:
+                continue
+            if pc.Area(path) < 0:
+                path.reverse()
+            self.closedPts.append(pts)
+            self.closedPaths.append(path)
+        # 开放曲线 → 加厚成窄墙（ET_OPENROUND 胶囊，宽度 2*wall）
+        self.walls = []
+        wallU = max(int(round(max(wall, 0.0) * _SCALE)), 2)
+        if openPolys and wallU >= 2:
+            seen = set()
+            for pts in openPolys:
+                if len(pts) < 2:
+                    continue
+                path = _toClipper(pts)
+                if len(path) < 2:
+                    continue
+                co = pc.PyclipperOffset()
+                co.ArcTolerance = _arcTolerance(wall)
+                co.AddPath(path, pc.JT_ROUND, pc.ET_OPENROUND)
+                for r in co.Execute(wallU):
+                    key = tuple((q[0], q[1]) for q in r)
+                    if key not in seen:
+                        seen.add(key)
+                        self.walls.append(r)
+
+    @property
+    def valid(self) -> bool:
+        """是否有闭合曲线参与剖分。"""
+        return bool(self.closedPaths)
+
+    def regionAt(self, p: Point3D) -> Optional[List[Point3D]]:
+        """点击/悬停位置 p 所在闭合面片的边界（世界坐标、闭合、首尾重合）。
+
+        p 不在任何闭合曲线内 → None（外部）；面片 = ∩命中 − ∪未命中 − 开放墙，
+        返回包含 p 的外环。
+        """
+        if not self.closedPaths:
+            return None
+        hitIdx = [i for i, pts in enumerate(self.closedPts)
+                  if pointInPolygon(pts, p)]
+        if not hitIdx:
+            return None
+        hitSet = set(hitIdx)
+        hitPaths = [self.closedPaths[i] for i in hitIdx]
+        face = self._intersect(hitPaths)
+        if not face:
+            return None
+        others = [self.closedPaths[i]
+                  for i in range(len(self.closedPaths)) if i not in hitSet]
+        subs = list(self.walls) + others
+        if subs:
+            face = self._subtract(face, subs)
+        if not face:
+            return None
+        rings: List[List[Point3D]] = []
+        tree = self._diffTree(face, [])
+        _collectOuterRings(tree, rings, self.z)
+        for ring in rings:
+            if len(ring) >= 3 and pointInPolygon(ring, p):
+                return ring
+        return None
+
+    # ---------- Clipper 布尔封装 ----------
+
+    def _intersect(self, paths) -> list:
+        """多条路径求交集（subject 多路径按 NONZERO 合并后逐对与 clip 相交）。"""
+        pc = self._pc
+        result = [list(paths[0])]  # 路径列表（AddPaths 需要 list of paths）
+        for path in paths[1:]:
+            cl = pc.Pyclipper()
+            cl.AddPaths(result, pc.PT_SUBJECT, True)
+            cl.AddPath(path, pc.PT_CLIP, True)
+            result = cl.Execute(pc.CT_INTERSECTION,
+                                pc.PFT_NONZERO, pc.PFT_NONZERO)
+            if not result:
+                return []
+        return result
+
+    def _subtract(self, subjects, clips) -> list:
+        """subject − union(clips)，返回多边形列表。"""
+        pc = self._pc
+        cl = pc.Pyclipper()
+        cl.AddPaths(subjects, pc.PT_SUBJECT, True)
+        cl.AddPaths(clips, pc.PT_CLIP, True)
+        return cl.Execute(pc.CT_DIFFERENCE, pc.PFT_NONZERO, pc.PFT_NONZERO)
+
+    def _diffTree(self, subjects, clips):
+        """subject − union(clips)，返回 PolyTree（保留环的父子/孔洞层级）。"""
+        pc = self._pc
+        cl = pc.Pyclipper()
+        cl.AddPaths(subjects, pc.PT_SUBJECT, True)
+        if clips:
+            cl.AddPaths(clips, pc.PT_CLIP, True)
+        return cl.Execute2(pc.CT_DIFFERENCE, pc.PFT_NONZERO, pc.PFT_NONZERO)
+
+def _collectOuterRings(node, regions: List[List[Point3D]], z: float) -> None:
+    """PolyTree 中收集外环（IsHole=False）作为闭合区域；孔环跳过。"""
+    if node is None:
+        return
+    for child in node.Childs:
+        if not child.IsHole and len(child.Contour) >= 3:
+            regions.append(_worldFromClipper(child.Contour, z))
+        _collectOuterRings(child, regions, z)

@@ -18,7 +18,7 @@ class CommandParamHost(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setFixedWidth(220)
+        self.setFixedWidth(230)
         self.setStyleSheet(
             "QWidget#ParamHost { background:%s; border:1px solid %s;"
             " border-radius:4px; }" % (theme.BG_PANEL, theme.BORDER))
@@ -59,6 +59,10 @@ class CommandParamHost(QWidget):
     def _fitHeight(self) -> None:
         """按内容自适应高度，且不超过画布可视高度。
         （本部件由主窗口 move() 定位，不 adjustSize 会被裁得只剩标题栏）"""
+        lay = self.layout()
+        if lay is not None:
+            lay.invalidate()
+            lay.activate()
         self.adjustSize()
         parent = self.parentWidget()
         if parent is not None:

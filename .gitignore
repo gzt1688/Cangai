@@ -16,3 +16,26 @@ _test_*.png
 # 编辑器
 .vscode/
 .idea/
+
+# Build / packaging artifacts
+dist/
+build/
+
+# Vendored large third-party sources (obtain per docs at runtime)
+deps/
+vtracer-master/
+
+# Third-party copyrighted reference docs - do NOT publish
+精雕功能说明参考/
+
+# Dev debug artifacts
+_*.py
+_*.txt
+_*.stl
+_bg_tmp/
+.merkle-snapshot.json
+.arts/
+.workbuddy/
+# Private plugins (not published)
+plugins_private/
+_weave_fix/

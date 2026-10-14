@@ -67,64 +67,42 @@ class ImageTraceCommand(CommandInstance):
         if self._panel is None:
             self._panel = ImageTracePanel()
             self._panel.paramChanged.connect(self._schedule)
-            self._panel.sourceChanged.connect(self._loadSource)
             self._panel.commitRequested.connect(self.commitTraces)
             self._panel.cancelRequested.connect(self._onPanelCancel)
-            self._panel.setDocImages(self._scanDocImages())
-            if self._panel.currentSource() is not None:
-                self._loadSource()
-            else:
-                self._panel.setStatus("没有画布图片：点「浏览…」选择图片文件")
+            self._loadSource()
         return self._panel
 
     # ---------------- 来源 ----------------
 
-    def _scanDocImages(self) -> list:
-        entries = []
-        for obj in self._doc.objects():
-            if isinstance(obj, ImageObject) and obj.pixelSize()[0] > 0:
-                w, h = obj.pixelSize()
-                entries.append((obj.id(), f"{w}×{h}"))
-        return entries
-
     def refreshDocImages(self) -> None:
-        """重新扫描画布图片（命令激活期间新放入的图片立即可选）。"""
+        """命令激活期间画布新放入图片时自动采用。"""
         if self._panel is None:
             return
-        had = self._panel.currentSource()
-        self._panel.setDocImages(self._scanDocImages())
-        cur = self._panel.currentSource()
-        if cur != had and cur is not None:
+        if self._image is None:
             self._loadSource()
 
     def _loadSource(self) -> None:
+        """自动取画布上第一张图片作为识别来源（曲线叠加到图片平面）。"""
         self._image = None
         self._imgObjId = None
+        for obj in self._doc.objects():
+            if isinstance(obj, ImageObject) and obj.pixelSize()[0] > 0:
+                try:
+                    img = QImage.fromData(obj.imageData())
+                except Exception:
+                    img = None
+                if img is not None and not img.isNull():
+                    self._imgObjId = obj.id()
+                    self._image = img
+                break
         if self._panel is None:
             return
-        src = self._panel.currentSource()
-        if src is None:
-            self._panel.setStatus("请选择画布图片或点「浏览…」选择图片文件")
-            return
-        try:
-            if src[0] == "doc":
-                obj = self._doc.object(src[1])
-                if obj is None or not isinstance(obj, ImageObject):
-                    self._panel.setStatus("画布图片已不存在，请重新选择")
-                    return
-                self._imgObjId = obj.id()
-                img = QImage.fromData(obj.imageData())
-            else:
-                img = QImage(src[1])
-            if img is None or img.isNull():
-                self._panel.setStatus("图片无法解码，请换一张图片")
-                return
-            self._image = img
-        except Exception as e:
-            self._panel.setStatus(f"载入图片失败：{e}")
+        if self._image is None:
+            self._panel.setSourceImage(None)
+            self._panel.setStatus("请先用「图片」按钮在画布放置图片，再转线稿")
             return
         self._panel.setSourceImage(self._image, autoParams=True)
-        self._panel.setStatus("已载入图片，正在识别…")
+        self._panel.setStatus("已载入画布图片，正在识别…")
         self._schedule()
 
     # ---------------- 识别调度 ----------------
@@ -184,11 +162,9 @@ class ImageTraceCommand(CommandInstance):
                 self._panel.setStatus("未识别到线条：试试调低阈值、勾选反色，"
                                       "或把「小区域」调小")
             else:
-                extra = ("（叠加在图片上）" if self._mapped
-                         else f"（宽度 {self._panel.outputWidth():g}）")
                 self._panel.setStatus(
                     f"{res.contours} 条曲线 · {res.controlPoints} 控制点 · "
-                    f"{res.elapsedMs:.0f} ms {extra}")
+                    f"{res.elapsedMs:.0f} ms（叠加在图片上）")
         self._updatePreviewPath()
 
     def _updatePreviewPath(self) -> None:
@@ -226,16 +202,31 @@ class ImageTraceCommand(CommandInstance):
             if self._panel is not None:
                 self._panel.setStatus("没有可生成的曲线：请先选择图片或调整参数")
             return
-        obj = PolyCurveObject()
+        # 按识别颜色分组（VTracer 彩色模式每色一个对象并着色；其余全部无色一组）
+        groups: dict = {}
+        order: list = []
         for s in self._result.strokes:
-            obj.addSegment({
-                "points": [[x, y, 0.0] for x, y in s.points],
-                "inputPoints": [[x, y, 0.0] for x, y in s.fitPoints],
-            })
-        self._doc.addObject(obj)
+            key = tuple(s.color) if s.color else None
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(s)
+        for key in order:
+            obj = PolyCurveObject()
+            for s in groups[key]:
+                obj.addSegment({
+                    "points": [[x, y, 0.0] for x, y in s.points],
+                    "inputPoints": [[x, y, 0.0] for x, y in s.fitPoints],
+                })
+            self._doc.addObject(obj)
+            if key is not None:
+                obj.setColor(key)
         if self._manager is not None:
-            self._manager.notifyResult(
-                f"图片转线稿：已生成 {len(self._result.strokes)} 条曲线")
+            msg = (f"图片转线稿：已生成 {len(self._result.strokes)} 条曲线"
+                   if len(order) == 1 else
+                   f"图片转线稿：已生成 {len(self._result.strokes)} 条曲线"
+                   f"（{len(order)} 个颜色组）")
+            self._manager.notifyResult(msg)
         self.finish()
 
     # ---------------- 交互与收尾 ----------------

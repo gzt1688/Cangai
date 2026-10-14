@@ -24,6 +24,11 @@ class VerticalTabButton(QPushButton):
     def labelText(self) -> str:
         return self._text
 
+    def setVerticalText(self, text: str) -> None:
+        """更新竖排文本：同步 _text（供 sizeHint 用）并逐字竖排显示。"""
+        self._text = text
+        self.setText("\n".join(text))
+
     def sizeHint(self) -> QSize:
         fm = self.fontMetrics()
         chars = max(len(self._text), 1)

@@ -17,7 +17,8 @@ _LOG_PATH = os.path.join(
 )
 
 _file = None
-_enabled = False          # 默认关闭：需要排查时调 enable() 打开
+_enabled = True           # 开启：dbg() 只在渲染异常/回退等罕见事件时写文件，开销可忽略；
+                          # 复现"闪/透明"等问题后把项目根目录 render_debug.log 发来即可定位
 
 
 def enable(on: bool = True) -> None:

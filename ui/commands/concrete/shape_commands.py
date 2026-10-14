@@ -120,6 +120,10 @@ def _applyPoints(obj: LineObject, pts: List[Point3D]) -> None:
 # ==================== Rectangle ====================
 
 class RectangleCommand(CommandInstance):
+    # 预览路径即完整轮廓（视图平面坐标）：顶视/透视按构造平面投影，
+    # 侧视按视图平面 (u,v) 映射，不画尾段
+    previewPlaneBased = True
+
     def name(self) -> str:
         return "Rectangle"
 
@@ -165,11 +169,16 @@ class RectangleCommand(CommandInstance):
     def _onPanelSize(self, length: float, width: float) -> None:
         if self._first is None or length <= 0 or width <= 0:
             return
-        f = self._first
-        # 保持当前拖动象限（未拖动时默认右上）
-        dx = 1.0 if (self._second is None or self._second.x >= f.x) else -1.0
-        dy = 1.0 if (self._second is None or self._second.y >= f.y) else -1.0
-        self._second = Point3D(f.x + dx * length, f.y + dy * width, f.z)
+        fp = self._planePts([self._first])[0]
+        # 保持当前拖动象限（未拖动时默认右上）；象限按视图平面 (u,v) 度量
+        du, dv = 1.0, 1.0
+        if self._second is not None:
+            sp = self._planePts([self._second])[0]
+            du = 1.0 if sp.x >= fp.x else -1.0
+            dv = 1.0 if sp.y >= fp.y else -1.0
+        self._second = self._planeToWorld(
+            [Point3D(fp.x + du * length, fp.y + dv * width, 0.0)],
+            self._first)[0]
         self._rebuild()
 
     def _onPanelChamferType(self, t: int) -> None:
@@ -199,25 +208,28 @@ class RectangleCommand(CommandInstance):
     # ---------- 内部 ----------
 
     def _buildPoints(self, p1: Point3D, p2: Point3D) -> List[Point3D]:
-        """按当前参数（波浪优先于倒角）生成轮廓点列。"""
+        """按当前参数（波浪优先于倒角）生成轮廓点列——视图平面 (u,v) 坐标
+        （顶视/2D 画布即 XY；侧视 XZ/YZ），世界坐标在 _rebuild 统一映射。"""
+        pp1, pp2 = self._planePts([p1, p2])
         if self._waveEnabled and self._panel is not None:
             return buildWaveRectanglePoints(
-                p1, p2, self._panel.waveType(),
+                pp1, pp2, self._panel.waveType(),
                 self._panel.longWaveCount(), self._panel.shortWaveCount(),
                 self._panel.sideWaveHeight(), self._panel.cornerWaveHeight(),
                 self._panel.cornerWaveWidth(), self._panel.cornerChamfer())
-        return buildRectanglePoints(p1, p2, self._chamferType,
+        return buildRectanglePoints(pp1, pp2, self._chamferType,
                                     list(self._cornerRadii))
 
     def _rebuild(self) -> None:
         if self._first is None or self._second is None:
             return
         pts = self._buildPoints(self._first, self._second)
-        _applyPoints(self._obj, pts)
+        _applyPoints(self._obj, self._planeToWorld(pts, self._first))
         self._doc.notifyObjectChanged(self._obj.id())
         if self._panel is not None and pts:
-            self._panel.setSize(abs(self._second.x - self._first.x),
-                                abs(self._second.y - self._first.y))
+            fp = self._planePts([self._first])[0]
+            sp = self._planePts([self._second])[0]
+            self._panel.setSize(abs(sp.x - fp.x), abs(sp.y - fp.y))
 
     def cancel(self) -> None:
         if self._obj is not None and len(self._obj.points()) < 3:
@@ -279,6 +291,9 @@ class RectangleCommand(CommandInstance):
 # ==================== Polygon ====================
 
 class PolygonCommand(CommandInstance):
+    # 预览路径即完整轮廓（视图平面坐标）：同矩形，不画尾段
+    previewPlaneBased = True
+
     def name(self) -> str:
         return "Polygon"
 
@@ -330,7 +345,9 @@ class PolygonCommand(CommandInstance):
 
     def _onPanelCenter(self, x: float, y: float) -> None:
         if self._center is not None:
-            self._center = Point3D(x, y, self._center.z)
+            # 面板中心为视图平面 (u,v) 坐标（顶视/2D 即世界 XY），映射回世界
+            self._center = self._planeToWorld(
+                [Point3D(x, y, 0.0)], self._center)[0]
             self._rebuild()
 
     def _onPanelSides(self, n: int) -> None:
@@ -363,13 +380,19 @@ class PolygonCommand(CommandInstance):
     def _points(self) -> List[Point3D]:
         if self._center is None:
             return []
-        return buildPolygonPoints(self._center, self._sides, self._radius,
+        # 视图平面 (u,v) 坐标构建（顶视/2D 即 XY；侧视 XZ/YZ），
+        # 世界坐标在 _rebuild 统一映射
+        cp = self._planePts([self._center])[0]
+        return buildPolygonPoints(cp, self._sides, self._radius,
                                   self._star, self._innerRadius,
                                   self._filletRadius)
 
     def _rebuild(self) -> None:
         pts = self._points()
-        _applyPoints(self._obj, pts)
+        if pts:
+            _applyPoints(self._obj, self._planeToWorld(pts, self._center))
+        else:
+            _applyPoints(self._obj, [])
         self._doc.notifyObjectChanged(self._obj.id())
         if pts:
             self._setPreviewPath(QPainterPath())  # 已有实体，清掉预览
@@ -393,9 +416,11 @@ class PolygonCommand(CommandInstance):
         if self._center is None:
             self._center = Point3D(wp.x, wp.y, wp.z)
             if self._panel is not None:
-                self._panel.setCenter(wp.x, wp.y)
+                u, v = self._uv(wp)
+                self._panel.setCenter(u, v)
             return
-        r = math.hypot(wp.x - self._center.x, wp.y - self._center.y)
+        # 半径按视图平面 (u,v) 度量（侧视：前视 XZ / 右视 YZ）
+        r = self._uvDist(wp, self._center)
         if self._editMode:
             # 编辑模式再点空白：半径点跳到新位置（同矩形，可重新定大小）
             if r > 1e-6:
@@ -418,7 +443,7 @@ class PolygonCommand(CommandInstance):
             # 大小已锁定：移动只更新光标点（同矩形编辑模式）
             self._setCursorMarker(wp)
             return
-        r = math.hypot(wp.x - self._center.x, wp.y - self._center.y)
+        r = self._uvDist(wp, self._center)
         if r > 1e-6:
             self._radius = r
             if self._panel is not None:

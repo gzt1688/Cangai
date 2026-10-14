@@ -14,18 +14,24 @@ class PolyCurveObject(BaseObject):
         # 文字轮廓标记：文字命令创建的轮廓置 True（数据识别用）；
         # 文字轮廓仍是曲线对象，自动归入“曲线”固定层
         self.isText: bool = False
+        # 采样缓存：捕捉在鼠标移动时对每对象每帧调 getSampledPoints 2-3 次
+        # （MIDPOINT/NEAREST/交点），文字轮廓正是 PolyCurve，不缓存每帧全量重建
+        self._sampledPts: List[Point3D] = []
+        self._dirty = True
 
     def segments(self) -> List[dict]:
         return self._segments
 
     def addSegment(self, seg: dict) -> None:
         self._segments.append(seg)
+        self._dirty = True
 
     def _transformPoints(self, key: str, fn) -> None:
         """对每段指定点集（points/inputPoints）应用变换 fn。"""
         for seg in self._segments:
             if key in seg:
                 seg[key] = [fn(p) for p in seg[key]]
+        self._dirty = True
 
     def translate(self, dx: float, dy: float, dz: float) -> None:
         fn = lambda p: [p[0] + dx, p[1] + dy, p[2] + dz]
@@ -86,6 +92,7 @@ class PolyCurveObject(BaseObject):
         self._segments = []
         for s in data.get("segments", []):
             self._segments.append(self._copySeg(s))
+        self._dirty = True
 
     def _segmentControlPoints_(self, i: int) -> List[Point3D]:
         """第 i 段对外可见控制点：首段含首点，后续段跳过与前段共享的断开点。"""
@@ -165,6 +172,7 @@ class PolyCurveObject(BaseObject):
             self._rebuildSegment(si - 1)
         if local == n - 1 and si < len(self._segments) - 1:
             self._rebuildSegment(si + 1)
+        self._dirty = True
 
     def _rebuildSegment(self, si: int) -> None:
         """按该段控制点重采样外观（与画曲线预览一致的 Catmull-Rom）。
@@ -205,8 +213,15 @@ class PolyCurveObject(BaseObject):
                 SnapType.POINT, SnapType.VERTEX]
 
     def getSampledPoints(self) -> List[Point3D]:
-        """所有段采样点顺序拼接（供捕捉最近点用）。"""
-        out: List[Point3D] = []
-        for seg in self._segments:
-            out.extend([Point3D(p[0], p[1], p[2]) for p in seg.get("points", [])])
-        return out
+        """所有段采样点顺序拼接（供捕捉最近点用），带脏标记缓存。"""
+        if self._dirty or not self._sampledPts:
+            out: List[Point3D] = []
+            for seg in self._segments:
+                out.extend([Point3D(p[0], p[1], p[2]) for p in seg.get("points", [])])
+            self._sampledPts = out
+            self._dirty = False
+        return self._sampledPts
+
+    def points(self) -> List[Point3D]:
+        """所有段采样点（供框选顶点判定用，与 LineObject.points() 对齐）。"""
+        return self.getSampledPoints()

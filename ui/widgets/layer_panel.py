@@ -17,6 +17,10 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QHBoxLayout,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from core.document import LAYER_CURVES_ID, isFixedLayerId
+from i18n import tr, languageChanged
+
+# 表头中文原文（retranslateUi 用）
+_LAYER_HEADERS = ["名称", "数量", "显示", "锁定", "颜色"]
 
 
 class LayerPanel(QWidget):
@@ -32,23 +36,18 @@ class LayerPanel(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(4)
 
-        hint = QLabel("对象按类型自动归入「曲线/模型/图片」固定层，"
-                      "「标注」为标注功能预留层，可在固定层下新建子图层细分管理")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#8a8a8a; font-size:11px; padding:2px 4px;")
-        layout.addWidget(hint)
 
         tool = QHBoxLayout()
         tool.setContentsMargins(0, 0, 0, 0)
         tool.setSpacing(4)
-        self._btnNew = QPushButton("新建", self)
-        self._btnDelete = QPushButton("删除", self)
-        self._btnUp = QPushButton("向上", self)
-        self._btnDown = QPushButton("向下", self)
-        self._btnNew.setToolTip("在所属固定层下新建子图层")
-        self._btnDelete.setToolTip("删除当前子图层（固定层不可删除）")
-        self._btnUp.setToolTip("同一固定层内上移当前子图层")
-        self._btnDown.setToolTip("同一固定层内下移当前子图层")
+        self._btnNew = QPushButton(tr("新建"), self)
+        self._btnDelete = QPushButton(tr("删除"), self)
+        self._btnUp = QPushButton(tr("向上"), self)
+        self._btnDown = QPushButton(tr("向下"), self)
+        self._btnNew.setToolTip(tr("在所属固定层下新建子图层"))
+        self._btnDelete.setToolTip(tr("删除当前子图层（固定层不可删除）"))
+        self._btnUp.setToolTip(tr("同一固定层内上移当前子图层"))
+        self._btnDown.setToolTip(tr("同一固定层内下移当前子图层"))
         for b in (self._btnNew, self._btnDelete, self._btnUp, self._btnDown):
             b.setFixedSize(48, 24)
             b.setFocusPolicy(Qt.NoFocus)
@@ -62,12 +61,11 @@ class LayerPanel(QWidget):
         self._btnDown.clicked.connect(lambda: self._onMoveLayer(1))
 
         self._tree = QTreeWidget(self)
-        self._tree.setHeaderLabels(["名称", "当前", "显示", "锁定", "颜色"])
+        self._tree.setHeaderLabels([tr(h) for h in _LAYER_HEADERS])
         self._tree.setColumnWidth(0, 100)
         self._tree.setColumnWidth(1, 40)
         self._tree.setColumnWidth(2, 40)
         self._tree.setColumnWidth(3, 40)
-        self._tree.setColumnWidth(4, 40)
         self._tree.setAlternatingRowColors(True)
         self._tree.setRootIsDecorated(True)
         self._tree.setIndentation(12)
@@ -83,15 +81,52 @@ class LayerPanel(QWidget):
         self._tree.installEventFilter(self)
         header = self._tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in range(1, 5):
-            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        # 数量/显示/锁定列固定 44px（原 ResizeToContents 约 28px）：
+        # 名称列是弹性列吃掉剩余宽度，中间三列各放宽 16px = 名称列缩窄约 48px，
+        # 视觉上明显变窄；Interactive 允许用户手动拖动微调
+        for i in range(1, 4):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+            self._tree.setColumnWidth(i, 44)
+        # 颜色列固定窄宽（色块按钮 22px 足够），ResizeToContents 会被
+        # 表头文字"颜色"撑宽，挤占名称列。宽度须在切到 Fixed 模式后设置，
+        # 否则冻结的是 ResizeToContents 算出的旧宽度
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self._tree.setColumnWidth(4, 30)
+        # 默认 stretchLastSection 会拖拽最后一列吃掉剩余宽度，须关闭，
+        # 否则颜色列的固定宽度不生效（剩余宽度应给名称列）
+        header.setStretchLastSection(False)
         layout.addWidget(self._tree)
+        languageChanged().connect(self.retranslateUi)
+
+    def retranslateUi(self) -> None:
+        """语言切换：重设按钮、表头，并重建树以刷新行内 tooltip。"""
+        self._btnNew.setText(tr("新建"))
+        self._btnDelete.setText(tr("删除"))
+        self._btnUp.setText(tr("向上"))
+        self._btnDown.setText(tr("向下"))
+        self._btnNew.setToolTip(tr("在所属固定层下新建子图层"))
+        self._btnDelete.setToolTip(tr("删除当前子图层（固定层不可删除）"))
+        self._btnUp.setToolTip(tr("同一固定层内上移当前子图层"))
+        self._btnDown.setToolTip(tr("同一固定层内下移当前子图层"))
+        self._tree.setHeaderLabels([tr(h) for h in _LAYER_HEADERS])
+        self._refreshLayerUI()
 
     # ---------------- 绑定与刷新 ----------------
 
     def setDocument(self, doc) -> None:
         """绑定文档：图层数据以 Document 为准（当前层/显隐/锁定/颜色联动）。"""
+        if self._doc is not None and self._doc is not doc:
+            try:
+                self._doc.objectAdded.disconnect(self.refreshLater)
+                self._doc.objectRemoved.disconnect(self.refreshLater)
+                self._doc.objectChanged.disconnect(self.refreshLater)
+            except RuntimeError:
+                pass
         self._doc = doc
+        if doc is not None:
+            doc.objectAdded.connect(self.refreshLater)
+            doc.objectRemoved.connect(self.refreshLater)
+            doc.objectChanged.connect(self.refreshLater)
         self._refreshLayerUI()
 
     def refreshLater(self) -> None:
@@ -182,20 +217,22 @@ class LayerPanel(QWidget):
             item.setFont(0, f)
         else:  # 子图层名称可编辑
             item.setFlags(item.flags() | Qt.ItemIsEditable)
+        if isCurrent:
+            # 当前层行高亮（取消勾选框后用背景表示）
+            item.setBackground(0, QColor(0, 120, 215, 40))
+            item.setForeground(0, QColor(0, 84, 160))
 
-        cur = QCheckBox()
-        cur.setChecked(isCurrent)
-        cur.setToolTip("设为当前层：新建的同族对象将放入该层")
-        cur.setFocusPolicy(Qt.NoFocus)
-        cur.setStyleSheet("QCheckBox::indicator { width:16px; height:16px; }")
-        cur.checkStateChanged.connect(
-            lambda st, lid=layer.id: self._onCurrentToggled(lid, st))
-        self._tree.setItemWidget(item, 1, cur)
+        # 数量列：该图层（含子图层）对象数；点击行 = 设为当前层
+        cnt = QLabel(str(self._doc.layerObjectCount(layer.id)))
+        cnt.setAlignment(Qt.AlignCenter)
+        cnt.setToolTip(tr("该图层（含子图层）的对象数量"))
+        cnt.setStyleSheet("background:transparent;")
+        self._tree.setItemWidget(item, 1, cnt)
 
         bulb = QLabel("💡" if layer.visible else "●")
         bulb.setAlignment(Qt.AlignCenter)
         bulb.setCursor(Qt.PointingHandCursor)
-        bulb.setToolTip("显示 / 隐藏该图层（固定层会联动其子图层）")
+        bulb.setToolTip(tr("显示 / 隐藏该图层（固定层会联动其子图层）"))
         bulb.setStyleSheet("font-size:20px; background:transparent;")
         bulb.setProperty("layerId", layer.id)
         bulb.setProperty("layerAction", "visible")
@@ -205,7 +242,7 @@ class LayerPanel(QWidget):
         lock = QLabel("🔒" if layer.locked else "🔓")
         lock.setAlignment(Qt.AlignCenter)
         lock.setCursor(Qt.PointingHandCursor)
-        lock.setToolTip("锁定 / 解锁该图层（固定层会联动其子图层）")
+        lock.setToolTip(tr("锁定 / 解锁该图层（固定层会联动其子图层）"))
         lock.setStyleSheet("font-size:17px; background:transparent;")
         lock.setProperty("layerId", layer.id)
         lock.setProperty("layerAction", "lock")
@@ -213,9 +250,9 @@ class LayerPanel(QWidget):
         self._tree.setItemWidget(item, 3, lock)
 
         colorBtn = QPushButton()
-        colorBtn.setFixedSize(26, 20)
+        colorBtn.setFixedSize(22, 20)
         colorBtn.setFocusPolicy(Qt.NoFocus)
-        colorBtn.setToolTip("修改该图层颜色（同层对象颜色随之更新）")
+        colorBtn.setToolTip(tr("修改该图层颜色（同层对象颜色随之更新）"))
         colorBtn.setStyleSheet(
             f"background-color:{'#{:02x}{:02x}{:02x}'.format(*layer.color)};"
             "border:1px solid #999;")
@@ -252,17 +289,6 @@ class LayerPanel(QWidget):
 
     # ---------------- 交互处理 ----------------
 
-    def _onCurrentToggled(self, lid: int, state) -> None:
-        if self._doc is None:
-            return
-        if not state:
-            self.refreshLater()   # 不允许取消当前层勾选，恢复原样
-            return
-        if self._doc.activeLayerId() != lid:
-            self._doc.setLayerActive(lid)   # 静默同步，由下方刷新统一重建
-        self.layerDataChanged.emit()
-        self.refreshLater()
-
     def _onColorClicked(self, lid: int) -> None:
         if self._doc is None:
             return
@@ -270,7 +296,7 @@ class LayerPanel(QWidget):
         if layer is None:
             return
         c = QColor(*layer.color)
-        nc = QColorDialog.getColor(c, self, f"修改「{layer.name}」图层颜色")
+        nc = QColorDialog.getColor(c, self, tr(f"修改「{layer.name}」图层颜色"))
         if not nc.isValid():
             return
         # Document 同步更新该图层既有对象颜色并触发刷新

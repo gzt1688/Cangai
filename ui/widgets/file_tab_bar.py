@@ -1,7 +1,7 @@
 """文件标签栏：画布右下角悬浮的多文件切换标签。
 
 - 点击标签切换文档；“＋”新建文档；
-- 右键标签弹出菜单（关闭文件）——不设 × 按钮，保持标签简洁；
+- 右键标签弹出菜单（重命名 / 关闭文件）——不设 × 按钮，保持标签简洁；
 - 样式沿用画布浮层（ViewSwitchBar）的浅色方案：未选灰底、选中主题色。
 标签数量随文档增减整体重建（文档数很少，重建成本可忽略）。
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QMenu
 from PySide6.QtCore import Qt, Signal
 import ui.styles.theme as theme
+from i18n import tr, languageChanged
 
 
 def _tabStyle(selected: bool) -> str:
@@ -34,6 +35,7 @@ def _plusStyle() -> str:
 
 class FileTabBar(QWidget):
     currentChanged = Signal(int)    # 点击标签切换文档
+    renameRequested = Signal(int)   # 标签右键菜单“重命名”
     closeRequested = Signal(int)    # 标签右键菜单“关闭文件”
     newRequested = Signal()         # 点击“＋”新建文档
 
@@ -49,12 +51,17 @@ class FileTabBar(QWidget):
 
         self._plusBtn = QPushButton("＋", self)
         self._plusBtn.setFixedSize(22, 20)
-        self._plusBtn.setToolTip("新建文件")
+        self._plusBtn.setToolTip(tr("新建文件"))
         self._plusBtn.setCursor(Qt.PointingHandCursor)
         self._plusBtn.setStyleSheet(_plusStyle())
         self._plusBtn.clicked.connect(self.newRequested.emit)
         self._row.addWidget(self._plusBtn)
         self.adjustSize()
+        languageChanged().connect(self.retranslateUi)
+
+    def retranslateUi(self) -> None:
+        """语言切换：重设 tooltip（标签文本由 setTabs 重建）。"""
+        self._plusBtn.setToolTip(tr("新建文件"))
 
     def setTabs(self, titles: list, dirtyFlags: list, current: int,
                 closableFlags: list = None) -> None:
@@ -81,7 +88,8 @@ class FileTabBar(QWidget):
             nameBtn.setFixedHeight(20)
             nameBtn.setCursor(Qt.PointingHandCursor)
             nameBtn.setToolTip(
-                f"{title}（右键：关闭文件）" if closable else f"{title}（最后一个文档，不可关闭）")
+                tr(f"{title}（右键：重命名/关闭文件）") if closable
+                else tr(f"{title}（右键：重命名；最后一个文档，不可关闭）"))
             nameBtn.setStyleSheet(_tabStyle(selected))
             nameBtn.clicked.connect(lambda _, k=i: self.currentChanged.emit(k))
             nameBtn.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -95,19 +103,28 @@ class FileTabBar(QWidget):
         self.adjustSize()
 
     def _showTabMenu(self, index: int, globalPos) -> None:
-        """标签右键菜单：关闭文件。"""
+        """标签右键菜单：重命名 / 关闭文件。"""
+        menu = self._buildTabMenu(index)
+        chosen = menu.exec(globalPos)
+        menu.deleteLater()   # 用完即销毁：避免每次右键累积一个 QMenu
+        if chosen is None:
+            return
+        # 父级标签栏样式表为透明背景，构建菜单时已设显式样式（否则黑底看不清）
+        if chosen.text() == tr("重命名"):
+            self.renameRequested.emit(index)
+        elif chosen.text() == tr("关闭文件"):
+            self.closeRequested.emit(index)
+
+    def _buildTabMenu(self, index: int) -> QMenu:
+        """构建标签右键菜单；最后一个空文档的“关闭文件”置灰。"""
         menu = QMenu(self)
-        # 父级标签栏样式表为透明背景，若不加显式样式，弹出菜单会黑底黑字看不清
         menu.setStyleSheet((
             "QMenu { background:#e8e8e8; color:#000000; border:1px solid #a0a0a0; }"
             "QMenu::item { background:transparent; color:#000000; padding:3px 18px; }"
             "QMenu::item:selected { background:%s; color:#ffffff; }"
         ) % theme.PRIMARY)
-        act = menu.addAction("关闭文件")
-        # 最后一个空文档不可关闭：禁用该项（灰色不可点）
+        menu.addAction(tr("重命名"))
+        act = menu.addAction(tr("关闭文件"))
         if index < 0 or index >= len(self._closable) or not self._closable[index]:
             act.setEnabled(False)
-        chosen = menu.exec(globalPos)
-        menu.deleteLater()   # 用完即销毁：避免每次右键累积一个 QMenu
-        if chosen is act:
-            self.closeRequested.emit(index)
+        return menu

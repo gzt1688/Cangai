@@ -142,6 +142,9 @@ class DimensionGraphicsItem(QGraphicsPathItem):
             self._paintSelectionBox(painter, hl)
 
     def _paintSelectionBox(self, painter, color: str) -> None:
+        from core import app_settings
+        if not app_settings.show_selection_box:
+            return
         try:
             bb = self._obj.getBoundingBox()
         except Exception:

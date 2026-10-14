@@ -4,17 +4,21 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QButtonGroup
 
 import ui.styles.theme as theme
+from i18n import tr, languageChanged
 
 
-# 画布工作模式：2D 绘图 / 浮雕 / 3D 预览（三选一，互斥）
-CANVAS_MODES = [("2d", "2D"), ("relief", "浮雕"), ("3d", "3D")]
+# 画布工作模式：2D 绘图 / 浮雕 / 3D 画布 / CNC（四选一互斥）
+# text 字段为中文原文（retranslateUi 时 tr() 查表；2D/3D/CNC 原样保留）
+CANVAS_MODES = [("2d", "2D"), ("relief", "浮雕"), ("3d", "3D"),
+                ("cnc", "CNC")]
 
 _BTN_W = 62
 _BTN_H = 26
 
 
 class CanvasModeBar(QWidget):
-    """画布上方居中的模式切换条：2D / 浮雕 / 3D，三个按钮互斥。"""
+    """画布上方居中的模式切换条：2D / 浮雕 / 3D / CNC，互斥。
+    四个模式均为真实模式（CNC 复用 2D 画布视口，选 2D 曲线生成刀路）。"""
 
     modeChanged = Signal(str)
 
@@ -31,7 +35,7 @@ class CanvasModeBar(QWidget):
         self._group.setExclusive(True)
         self._buttons: dict[str, QPushButton] = {}
         for key, text in CANVAS_MODES:
-            btn = QPushButton(text)
+            btn = QPushButton(tr(text))
             btn.setCheckable(True)
             btn.setFixedSize(_BTN_W, _BTN_H)
             btn.setCursor(Qt.PointingHandCursor)
@@ -44,6 +48,14 @@ class CanvasModeBar(QWidget):
         self.refreshStyle()
 
         self.setFixedSize(_BTN_W * len(CANVAS_MODES) + 2, _BTN_H + 2)
+        languageChanged().connect(self.retranslateUi)
+
+    def retranslateUi(self) -> None:
+        """语言切换：重设模式按钮文本。"""
+        for key, text in CANVAS_MODES:
+            btn = self._buttons.get(key)
+            if btn is not None:
+                btn.setText(tr(text))
 
     def _onButtonClicked(self, btn: QPushButton) -> None:
         for key, b in self._buttons.items():

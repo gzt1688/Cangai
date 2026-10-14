@@ -60,6 +60,30 @@ class NurbsCurveObject(BaseObject):
     def setClosed(self, c: bool) -> None:
         self._closed = c
 
+    def serialize(self) -> dict:
+        d = super().serialize()
+        d["segments"] = [{
+            "controlPoints": [[cp.x, cp.y, cp.z, cp.weight]
+                             for cp in seg.controlPoints],
+            "degree": seg.degree,
+            "knotVector": list(seg.knotVector),
+        } for seg in self._segments]
+        d["closed"] = self._closed
+        return d
+
+    def deserialize(self, data: dict) -> None:
+        super().deserialize(data)
+        self._closed = bool(data.get("closed", False))
+        self._segments = []
+        for sd in data.get("segments", []):
+            cps = [ControlPoint(float(cp[0]), float(cp[1]), float(cp[2]),
+                                float(cp[3]) if len(cp) > 3 else 1.0)
+                   for cp in sd.get("controlPoints", [])]
+            knots = [float(k) for k in sd.get("knotVector", [])]
+            self._segments.append(NurbsSegment(cps, int(sd.get("degree", 3)),
+                                               knots))
+        self._invalidateSampleCache()
+
     def getSampledPoints(self, samplesPerSeg: int = 100) -> List[Point3D]:
         """采样折线（按内容缓存：包围盒/路径长度/图元重建每次调用不再全量重算）。"""
         if self._sampleCache is not None and self._sampleCachePerSeg == samplesPerSeg:

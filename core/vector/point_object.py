@@ -1,5 +1,6 @@
 """点对象模型。"""
 from __future__ import annotations
+import math
 from .base_object import BaseObject
 from .geometry_types import Point3D, BoundingBox3D, ObjectType
 from ..snap.snap_types import SnapType

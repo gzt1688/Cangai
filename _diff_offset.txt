@@ -1,7 +1,0 @@
-﻿
-InputObject                                                      SideIndicator
------------                                                      -------------
-f:\softai\Cangai\cangai_relief\core\vector\offset_geometry.py    =>           
-f:\softai\Cangai\备份\cangai_relief\core\vector\offset_geometry.py <=           
-
-

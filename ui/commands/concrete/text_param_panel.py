@@ -105,19 +105,31 @@ class TextParamPanel(ParamPanelBase):
         from core.text.font import FontManager
         fm = FontManager.instance()
         self._cbBuiltin.blockSignals(True)
-        self._cbSystem.blockSignals(True)
         self._cbBuiltin.clear()
         self._cbBuiltin.addItem("-- 选择内置字体 --", "")
         for name, path in fm.listBuiltinFonts():
             self._cbBuiltin.addItem(name, path)
+        self._cbBuiltin.blockSignals(False)
+        if self._cbBuiltin.count() > 1:
+            idx = self._cbBuiltin.findText("细圆单线")
+            if idx < 0:
+                idx = 1
+            self._cbBuiltin.setCurrentIndex(idx)
+        # 系统字体延迟加载：扫描系统字体目录+fontTools 读族名较慢，
+        # 先占位让面板立即打开，事件循环空闲时再填充
+        self._cbSystem.addItem("-- 加载中 --", "")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._loadSystemFonts)
+
+    def _loadSystemFonts(self) -> None:
+        from core.text.font import FontManager
+        fm = FontManager.instance()
+        self._cbSystem.blockSignals(True)
         self._cbSystem.clear()
         self._cbSystem.addItem("-- 选择系统字体 --", "")
         for name, path in fm.listSystemFonts():
             self._cbSystem.addItem(name, path)
-        self._cbBuiltin.blockSignals(False)
         self._cbSystem.blockSignals(False)
-        if self._cbBuiltin.count() > 1:
-            self._cbBuiltin.setCurrentIndex(1)
 
     def _onBuiltinChanged(self) -> None:
         if self._cbBuiltin.currentIndex() > 0:

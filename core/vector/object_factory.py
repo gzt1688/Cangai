@@ -13,6 +13,7 @@ from .nurbs_curve_object import NurbsCurveObject
 from .poly_curve_object import PolyCurveObject
 from .relief_model_object import ReliefModelObject
 from .dimension_object import DimensionObject
+from .brep_object import BRepObject
 
 def createFromType(typeStr: str) -> Optional[BaseObject]:
     try:
@@ -37,6 +38,8 @@ def createFromType(typeStr: str) -> Optional[BaseObject]:
         return PolyCurveObject()
     if t == ObjectType.SURFACE:
         return ReliefModelObject()
+    if t == ObjectType.BREP:
+        return BRepObject()
     if t == ObjectType.DIMENSION:
         return DimensionObject()
     return None

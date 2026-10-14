@@ -4,10 +4,10 @@ from PySide6.QtWidgets import (QStatusBar, QLabel, QPushButton, QDoubleSpinBox)
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor
 import ui.styles.theme as theme
+from i18n import tr, languageChanged
 
 
 class StatusBarWidget(QStatusBar):
-    planeModeChanged = Signal(bool)
     orthoToggled = Signal(bool)
     editCurveToggled = Signal(bool)
 
@@ -19,11 +19,10 @@ class StatusBarWidget(QStatusBar):
         self.setSizeGripEnabled(False)
         self.setFixedHeight(28)
 
-        self._btnPlane = QPushButton("工作平面")
-        self._btnPlane.setCheckable(True)
-        self._btnPlane.setChecked(True)
-        self._btnPlane.setFixedHeight(22)
-        self._btnPlane.setMinimumWidth(72)
+        # 坐标前缀：原“工作平面”开关无任何功能，改为只读标签
+        self._lblCoord = QLabel(tr("坐标"))
+        self._lblCoord.setFixedWidth(48)
+        self._lblCoord.setStyleSheet("color: #666;")
 
         self._lblX = QLabel("X: 0.000")
         self._lblY = QLabel("Y: 0.000")
@@ -31,9 +30,9 @@ class StatusBarWidget(QStatusBar):
         for lbl in (self._lblX, self._lblY, self._lblZ):
             lbl.setFixedWidth(88)
 
-        self._btnOrtho = QPushButton("正交")
-        self._btnEditCurve = QPushButton("编辑曲线")
-        self._btnGizmo = QPushButton("操作轴")
+        self._btnOrtho = QPushButton(tr("正交"))
+        self._btnEditCurve = QPushButton(tr("编辑曲线"))
+        self._btnGizmo = QPushButton(tr("操作轴"))
         _toggleStyle = self._btnStyle()
         for b, w in [(self._btnOrtho, 50), (self._btnEditCurve, 72),
                      (self._btnGizmo, 62)]:
@@ -41,14 +40,14 @@ class StatusBarWidget(QStatusBar):
             b.setFixedHeight(22)
             b.setMinimumWidth(w)
             b.setStyleSheet(_toggleStyle)
-        self._btnOrtho.setChecked(True)
+        self._btnOrtho.setChecked(False)
         self._btnGizmo.setChecked(True)
         # 编辑曲线开关：打开后选中曲线才显示控制点，可点选/框选/拖动控制点
         self._btnEditCurve.setToolTip(
-            "编辑曲线：打开后选中曲线显示控制点，点选/框选控制点即编辑，"
-            "可用操作轴批量变换控制点")
+            tr("编辑曲线：打开后选中曲线显示控制点，点选/框选控制点即编辑，"
+               "可用操作轴批量变换控制点"))
 
-        self._lblLineW = QLabel("线宽:")
+        self._lblLineW = QLabel(tr("线宽:"))
         self._spinLineW = QDoubleSpinBox()
         self._spinLineW.setRange(0.5, 20.0)
         self._spinLineW.setSingleStep(0.5)
@@ -57,11 +56,11 @@ class StatusBarWidget(QStatusBar):
         self._spinLineW.setFixedHeight(22)
 
         # 长度/面积：标题为开关按钮，关闭时不计算直接显示 "--"
-        self._btnLen = QPushButton("长度")
-        self._btnArea = QPushButton("面积")
+        self._btnLen = QPushButton(tr("长度"))
+        self._btnArea = QPushButton(tr("面积"))
         for b, w in [(self._btnLen, 48), (self._btnArea, 48)]:
             b.setCheckable(True)
-            b.setChecked(True)
+            b.setChecked(False)
             b.setFixedHeight(22)
             b.setMinimumWidth(w)
             b.setStyleSheet(self._btnStyle())
@@ -72,7 +71,7 @@ class StatusBarWidget(QStatusBar):
         self._lastLen: float | None = None
         self._lastArea: float | None = None
 
-        self.addWidget(self._btnPlane)
+        self.addWidget(self._lblCoord)
         self.addWidget(self._lblX)
         self.addWidget(self._lblY)
         self.addWidget(self._lblZ)
@@ -93,6 +92,19 @@ class StatusBarWidget(QStatusBar):
         self._spinLineW.valueChanged.connect(self.lineWidthChanged.emit)
         self._btnLen.toggled.connect(self._onMeasureToggled)
         self._btnArea.toggled.connect(self._onMeasureToggled)
+        languageChanged().connect(self.retranslateUi)
+
+    def retranslateUi(self) -> None:
+        self._lblCoord.setText(tr("坐标"))
+        self._btnOrtho.setText(tr("正交"))
+        self._btnEditCurve.setText(tr("编辑曲线"))
+        self._btnGizmo.setText(tr("操作轴"))
+        self._lblLineW.setText(tr("线宽:"))
+        self._btnLen.setText(tr("长度"))
+        self._btnArea.setText(tr("面积"))
+        self._btnEditCurve.setToolTip(
+            tr("编辑曲线：打开后选中曲线显示控制点，点选/框选控制点即编辑，"
+               "可用操作轴批量变换控制点"))
 
     def isOrthoChecked(self) -> bool:
         return self._btnOrtho.isChecked()

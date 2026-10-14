@@ -47,7 +47,9 @@ class GridManager:
         return self._config.spacing / max(1, self._config.subdivisions)
 
     def snapToGrid(self, p) -> "tuple[float,float]":
-        s = self.minorSpacing() if self._config.snapEnabled else self._config.spacing
+        if not self._config.snapEnabled:
+            return (float(p[0]), float(p[1]))   # 关闭吸附：原样返回
+        s = self.minorSpacing()
         return (round(p[0] / s) * s, round(p[1] / s) * s)
 
     def isOnGrid(self, p) -> bool:

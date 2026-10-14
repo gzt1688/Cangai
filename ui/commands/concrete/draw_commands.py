@@ -196,16 +196,21 @@ class LineCommand(CommandInstance):
 
     def _onPanelDrawParam(self) -> None:
         """按参数画点：一键沿（上段方向 ± 指定角度）画一段指定长度。
-        角度为 0 时沿当前光标方向；仅一次性生效，不改变后续绘制。"""
+        角度为 0 时沿当前光标方向；仅一次性生效，不改变后续绘制。
+        方向按当前视图绘制平面 (u,v) 度量（侧视 = XZ/YZ 平面）。"""
         if self._obj is None or self._panel is None:
             return
         pts = self._obj.points()
         length = self._panel.lengthValue()
         if not pts or length <= 0:
             return
+        ax = self._viewAxes()
+        last = pts[-1]
+        if ax != (0, 1):
+            self._addPointAt(self._planeStepPoint(last, length))
+            return
         angleDeg = self._panel.angleValue()
         ccw = self._panel.angleCCW()
-        last = pts[-1]
         if angleDeg > 0:
             if len(pts) >= 2:
                 prev = pts[-2]
@@ -224,6 +229,20 @@ class LineCommand(CommandInstance):
             dirA = math.atan2(dy, dx)
         self._addPointAt(Point3D(last.x + length * math.cos(dirA),
                                  last.y + length * math.sin(dirA), last.z))
+
+    def _planeStepPoint(self, last: Point3D, length: float) -> Point3D:
+        """侧视参数画点：沿当前光标在视图平面上的方向走 length。"""
+        ax = self._viewAxes()
+        if self._preview is None:
+            return last
+        lu, lv = self._uv(last)
+        du = self._comp(self._preview, ax[0]) - lu
+        dv = self._comp(self._preview, ax[1]) - lv
+        L = math.hypot(du, dv)
+        if L < 1e-10:
+            return last
+        return self._mkUVW(ax, lu + du / L * length, lv + dv / L * length,
+                           self._comp(last, 3 - ax[0] - ax[1]))
 
     # ---------------- 内部 ----------------
     def _updateCloseState(self) -> None:
@@ -300,8 +319,12 @@ class LineCommand(CommandInstance):
                 self._panel.setLength(segLen)
                 if len(pts) >= 2:
                     prev = pts[-2]
-                    v1x, v1y = last.x - prev.x, last.y - prev.y
-                    v2x, v2y = cursor.x - last.x, cursor.y - last.y
+                    # 偏转角按当前视图绘制平面 (u,v) 度量（侧视 = XZ/YZ）
+                    ax = self._viewAxes()
+                    v1x = self._comp(last, ax[0]) - self._comp(prev, ax[0])
+                    v1y = self._comp(last, ax[1]) - self._comp(prev, ax[1])
+                    v2x = self._comp(cursor, ax[0]) - self._comp(last, ax[0])
+                    v2y = self._comp(cursor, ax[1]) - self._comp(last, ax[1])
                     len1 = math.hypot(v1x, v1y)
                     len2 = math.hypot(v2x, v2y)
                     if len1 > 1e-10 and len2 > 1e-10:
@@ -319,10 +342,13 @@ class LineCommand(CommandInstance):
             self._setPreviewPath(QPainterPath())
             self._setCursorMarker(cursor)
             return
-        path = _linePath([pts[-1], cursor])
+        # 路径坐标 = 视图平面 (u,v)（顶视/2D 画布即 XY；侧视 XZ/YZ，
+        # 由 3D 视口路径分支映射回世界平面）
+        path = self._uvPath([pts[-1], cursor])
         if self._panel is not None and self._panel.isAnglePreviewChecked() \
                 and len(pts) >= 2:
-            self._appendAngleArc(path, pts[-2], pts[-1], cursor)
+            self._appendAngleArc(path, *self._planePts(
+                [pts[-2], pts[-1], cursor]))
         # 预览尾段与已确认段同色（对象色），避免点击落点时青→橙变色闪烁/双线感
         self._setPreviewPath(path, solid=True,
                              color=self._obj.color() if self._obj else None)
@@ -561,8 +587,15 @@ class CircleCommand(CommandInstance):
         self._waveInner = 0.0
         self._waveBulge = 0.0
         self._waveObj = None        # 锁定后创建的波浪折线对象
-        self._obj = CircleObject(0, 0, 0, 0.0)
-        self._doc.addObject(self._obj)
+        self._side = self._isSideView()   # 侧视（前视/右视）烘焙模式
+        self._radius = 0.0          # 侧视烘焙模式的半径状态
+        if self._side:
+            # 圆基元是 XY 平面对象：侧视下不建占位圆，确认时按视图平面
+            # 烘焙成闭合多段曲线（避免得到投影错误的平躺圆）
+            self._obj = None
+        else:
+            self._obj = CircleObject(0, 0, 0, 0.0)
+            self._doc.addObject(self._obj)
 
     def paramPanel(self):
         if self._panel is None:
@@ -615,10 +648,7 @@ class CircleCommand(CommandInstance):
         if not self._waveMode:
             return
         if self._waveLocked and self._waveObj is not None:
-            pts = buildWaveCirclePoints(self._center, self._waveInner,
-                                        self._waveBulge, self._waveArcCount,
-                                        self._waveChamfer, self._waveType,
-                                        self._waveChamferRounded)
+            pts = self._waveWorldPoints(self._waveInner, self._waveBulge)
             if len(pts) >= 3:
                 lst = self._waveObj.points()
                 lst.clear()
@@ -626,20 +656,17 @@ class CircleCommand(CommandInstance):
                 self._waveObj.setClosed(True)
                 self._doc.notifyObjectChanged(self._waveObj.id())
         elif self._center is not None and self._lastCursor is not None:
-            d = math.hypot(self._lastCursor.x - self._center.x,
-                           self._lastCursor.y - self._center.y)
+            d = self._uvDist(self._lastCursor, self._center)
             self._showWavePreview(d)
 
     def _showWavePreview(self, d: float) -> None:
         """按拖动距离 d 生成波浪预览（内圆=0.6d，外凸=d）。"""
-        if d < 1e-9:
+        if d < 1e-9 or self._center is None:
             return
-        pts = buildWaveCirclePoints(self._center, d * 0.6, d,
-                                    self._waveArcCount, self._waveChamfer,
-                                    self._waveType, self._waveChamferRounded)
+        pts = self._waveWorldPoints(d * 0.6, d)
         if len(pts) < 3:
             return
-        path = _linePath(pts)
+        path = self._uvPath(pts)
         path.closeSubpath()
         self._setPreviewPath(path, solid=True,
                              color=self._obj.color() if self._obj else None)
@@ -651,10 +678,7 @@ class CircleCommand(CommandInstance):
             return
         self._waveInner = d * 0.6
         self._waveBulge = d
-        pts = buildWaveCirclePoints(self._center, self._waveInner,
-                                    self._waveBulge, self._waveArcCount,
-                                    self._waveChamfer, self._waveType,
-                                    self._waveChamferRounded)
+        pts = self._waveWorldPoints(self._waveInner, self._waveBulge)
         if len(pts) < 3:
             return
         # 替换掉标准模式的占位圆对象，产出闭合波浪折线
@@ -672,30 +696,107 @@ class CircleCommand(CommandInstance):
 
     def _onPanelDiameter(self, d: float) -> None:
         if self._center is not None and d > 0:
-            self._obj.setRadius(d * 0.5)
-            self._doc.notifyObjectChanged(self._obj.id())
+            self._setRadius(d * 0.5)
+            if self._obj is not None:
+                self._doc.notifyObjectChanged(self._obj.id())
+            else:
+                # 侧视烘焙模式：无占位对象，直接刷新预览
+                self._setPreviewPath(
+                    self._circlePreviewPath(self._radius), solid=True)
 
     def _onPanelConfirmed(self) -> None:
         if self._waveMode:
             if self._waveLocked:
                 self.finish()
             return
-        if self._center is not None and self._obj.radius() > 0:
-            self.finish()
+        self._confirmStandard()
 
     def cancel(self) -> None:
         # 波浪圆未确认完成就取消：删掉已成型的波浪对象与占位圆，不留幽灵对象
         if self._waveObj is not None:
             self._doc.removeObject(self._waveObj.id())
             self._waveObj = None
-        if self._obj is not None and self._obj.radius() < 1e-9:
+        if self._obj is not None:
+            # 占位圆尚未经第二点/面板确认：拖动期间已实时写入半径，
+            # 只判零半径会让 Esc 后残留真半径的幽灵圆（并落入撤销记录）
             self._doc.removeObject(self._obj.id())
             self._obj = None
         super().cancel()
 
+    # ---------- 半径状态与侧视烘焙 ----------
+
+    def _setRadius(self, r: float) -> None:
+        """更新半径：常规模式写占位圆对象；侧视烘焙模式只记状态。"""
+        self._radius = r
+        if self._obj is not None:
+            self._obj.setRadius(r)
+
+    def _curRadius(self) -> float:
+        return self._obj.radius() if self._obj is not None else self._radius
+
+    def _circlePreviewPath(self, r: float) -> QPainterPath:
+        """标准圆预览路径。侧视烘焙模式路径坐标 = 视图平面 (u,v)，
+        由 3D 视口映射到 XZ/YZ 平面投影；常规模式即世界 XY。"""
+        path = QPainterPath()
+        if self._center is None or r <= 0:
+            return path
+        if self._obj is None:
+            cu, cv = self._uv(self._center)
+            path.addEllipse(cu - r, cv - r, r * 2, r * 2)
+        else:
+            path.addEllipse(self._center.x - r, self._center.y - r,
+                            r * 2, r * 2)
+        return path
+
+    def _waveWorldPoints(self, inner: float, bulge: float) -> List[Point3D]:
+        """波浪圆点列：常规视图直接生成（XY 平面）；侧视在视图平面生成后
+        映射回世界坐标（波浪几何是 XY 平面数学）。"""
+        if self._obj is not None:
+            return buildWaveCirclePoints(self._center, inner, bulge,
+                                         self._waveArcCount,
+                                         self._waveChamfer, self._waveType,
+                                         self._waveChamferRounded)
+        ax = self._viewAxes()
+        w = self._comp(self._center, 3 - ax[0] - ax[1])
+        cu, cv = self._uv(self._center)
+        plane = buildWaveCirclePoints(Point3D(cu, cv, 0.0), inner, bulge,
+                                      self._waveArcCount, self._waveChamfer,
+                                      self._waveType,
+                                      self._waveChamferRounded)
+        return [self._mkUVW(ax, p.x, p.y, w) for p in plane]
+
+    def _bakeSideCircle(self, r: float) -> None:
+        """侧视画圆确认：按视图平面采样烘焙闭合多段曲线
+        （采样点/控制点逐字存储，保存重载不变形）。"""
+        if self._center is None or r <= 1e-12:
+            return
+        ax = self._viewAxes()
+        w = self._comp(self._center, 3 - ax[0] - ax[1])
+        cu, cv = self._uv(self._center)
+        samples = [self._mkUVW(ax, cu + r * math.cos(2.0 * math.pi * i / 128),
+                               cv + r * math.sin(2.0 * math.pi * i / 128), w)
+                   for i in range(128 + 1)]
+        controls = [self._mkUVW(ax, cu + r * math.cos(2.0 * math.pi * i / 8),
+                                cv + r * math.sin(2.0 * math.pi * i / 8), w)
+                    for i in range(8 + 1)]
+        poly = PolyCurveObject()
+        poly.addSegment({
+            "points": [[p.x, p.y, p.z] for p in samples],
+            "inputPoints": [[p.x, p.y, p.z] for p in controls]})
+        self._doc.addObject(poly)
+
+    def _confirmStandard(self) -> bool:
+        """标准圆确认：侧视烘焙曲线后结束；常规模式定型占位圆后结束。"""
+        if self._center is None or self._curRadius() <= 1e-12:
+            return False
+        if self._obj is None:
+            self._bakeSideCircle(self._radius)
+        self.finish()
+        return True
+
     def _syncPanel(self) -> None:
         if self._panel is not None:
-            self._panel.setDiameter(self._obj.radius() * 2.0)
+            self._panel.setDiameter(self._curRadius() * 2.0)
 
     # ---------- 键盘直接输入直径 ----------
 
@@ -706,15 +807,14 @@ class CircleCommand(CommandInstance):
         except ValueError:
             d = 0.0
         if d > 0:
-            self._obj.setRadius(d * 0.5)
+            self._setRadius(d * 0.5)
         self._syncPanel()
-        self._doc.notifyObjectChanged(self._obj.id())
+        if self._obj is not None:
+            self._doc.notifyObjectChanged(self._obj.id())
         if self._center is not None:
-            r = self._obj.radius()
-            path = QPainterPath()
-            path.addEllipse(self._center.x - r, self._center.y - r, r * 2, r * 2)
-            self._setPreviewPath(path, solid=True,
-                                 color=self._obj.color() if self._obj else None)
+            self._setPreviewPath(
+                self._circlePreviewPath(self._curRadius()), solid=True,
+                color=self._obj.color() if self._obj else None)
         if self._manager is not None:
             self._manager.promptChanged.emit(self.prompt())
 
@@ -741,10 +841,7 @@ class CircleCommand(CommandInstance):
     def onEnter(self) -> bool:
         if self._waveMode:
             return self.onRightClick(Point3D())
-        if self._center is not None and self._obj.radius() > 0:
-            self.finish()
-            return True
-        return False
+        return self._confirmStandard()
 
     def onMousePress(self, wp: Point3D, mods) -> None:
         if self._waveMode:
@@ -753,19 +850,22 @@ class CircleCommand(CommandInstance):
                 return
             if not self._waveLocked:
                 self._lastCursor = wp
-                self._lockWaveSize(math.hypot(wp.x - self._center.x,
-                                              wp.y - self._center.y))
+                self._lockWaveSize(self._uvDist(wp, self._center))
             return
         if self._center is None:
             self._center = Point3D(wp.x, wp.y, wp.z)
-            self._obj.setCenter(self._center)
-            self._doc.notifyObjectChanged(self._obj.id())
+            if self._obj is not None:
+                self._obj.setCenter(self._center)
+                self._doc.notifyObjectChanged(self._obj.id())
             return
-        r = math.hypot(wp.x - self._center.x, wp.y - self._center.y)
-        self._obj.setRadius(r)
+        # 常规视图保持 3D 距离语义（捕捉可带真实 Z）；侧视按视图平面度量
+        r = wp.distanceTo(self._center) if not self._side \
+            else self._uvDist(wp, self._center)
+        self._setRadius(r)
         self._syncPanel()
-        self._doc.notifyObjectChanged(self._obj.id())
-        self.finish()
+        if self._obj is not None:
+            self._doc.notifyObjectChanged(self._obj.id())
+        self._confirmStandard()
 
     def onMouseMove(self, wp: Point3D, mods) -> None:
         if self._panel is not None:
@@ -776,21 +876,23 @@ class CircleCommand(CommandInstance):
                 self._setPreviewPath(QPainterPath())
                 self._setCursorMarker(wp)
             elif not self._waveLocked:
-                d = math.hypot(wp.x - self._center.x, wp.y - self._center.y)
+                d = self._uvDist(wp, self._center)
                 self._showWavePreview(d)
             return
         if self._center is None:
             self._setPreviewPath(QPainterPath())
             self._setCursorMarker(wp)
             return
-        r = math.hypot(wp.x - self._center.x, wp.y - self._center.y)
-        self._obj.setRadius(r)
+        # 常规视图保持 3D 距离语义（捕捉可带真实 Z）；侧视按视图平面度量
+        r = wp.distanceTo(self._center) if not self._side \
+            else self._uvDist(wp, self._center)
+        self._setRadius(r)
         self._syncPanel()
-        self._doc.notifyObjectChanged(self._obj.id())
-        path = QPainterPath()
-        path.addEllipse(self._center.x - r, self._center.y - r, r * 2, r * 2)
-        self._setPreviewPath(path, solid=True,
-                             color=self._obj.color() if self._obj else None)
+        if self._obj is not None:
+            self._doc.notifyObjectChanged(self._obj.id())
+        self._setPreviewPath(
+            self._circlePreviewPath(r), solid=True,
+            color=self._obj.color() if self._obj else None)
 
     def onRightClick(self, wp: Point3D) -> bool:
         if self._waveMode:
@@ -798,10 +900,7 @@ class CircleCommand(CommandInstance):
                 self.finish()
                 return True
             return False
-        if self._center is not None and self._obj.radius() > 0:
-            self.finish()
-            return True
-        return False
+        return self._confirmStandard()
 
 
 class ArcCommand(CommandInstance):
@@ -810,6 +909,10 @@ class ArcCommand(CommandInstance):
 
     def commandTitle(self) -> str:
         return "圆弧参数"
+
+    # 预览路径即完整形状（视图平面坐标）：3D 视口按路径分支绘制，
+    # 不走"已定点→光标"尾段分支（尾段会盖掉弧形预览）
+    previewPlaneBased = True
 
     def lastInputPoint(self):
         return self._pts[-1] if self._pts else None
@@ -828,8 +931,14 @@ class ArcCommand(CommandInstance):
         self._panel = None
         self._lastCursor = None
         self._mode = 0   # 0=起点-终点-弧上点（默认） 1=起点-弧上点-终点
-        self._obj = ArcObject(0, 0, 0, 0.0, 0.0, 0.0)
-        self._doc.addObject(self._obj)
+        self._side = self._isSideView()   # 侧视（前视/右视）烘焙模式
+        if self._side:
+            # 弧基元是 XY 平面对象：侧视下不建占位弧，三点齐后按视图平面
+            # 烘焙成多段曲线（避免得到投影错误的平躺弧）
+            self._obj = None
+        else:
+            self._obj = ArcObject(0, 0, 0, 0.0, 0.0, 0.0)
+            self._doc.addObject(self._obj)
 
     def paramPanel(self):
         if self._panel is None:
@@ -860,6 +969,10 @@ class ArcCommand(CommandInstance):
     def _addPoint(self, p: Point3D) -> None:
         self._pts.append(p)
         if len(self._pts) == 3:
+            if self._side:
+                self._bakeSideArc()
+                self.finish()
+                return
             if self._mode == 0:
                 # 收集顺序：起点、终点、弧上点 → setThreePoints(起,弧,终)
                 ok = self._obj.setThreePoints(self._pts[0], self._pts[2],
@@ -872,6 +985,42 @@ class ArcCommand(CommandInstance):
             self.finish()
             return
         self._updatePreview(p)
+
+    def _bakeSideArc(self) -> None:
+        """侧视画弧确认：三点在视图平面解算圆弧，采样烘焙多段曲线。
+        收集顺序语义与常规模式一致（mode 0 = 起/终/弧上）。"""
+        if self._mode == 0:
+            p1, p2, p3 = self._pts[0], self._pts[2], self._pts[1]
+        else:
+            p1, p2, p3 = self._pts[0], self._pts[1], self._pts[2]
+        q1, q2, q3 = self._planePts([p1, p2, p3])
+        res = computeArcFromThreePoints(q1, q2, q3)
+        if res is None:
+            return   # 共线退化：不产出误导性直线
+        center, radius, sa, ea = res
+        span = ea - sa
+        while span < 0:
+            span += 2 * math.pi
+        ma = math.atan2(q2.y - center.y, q2.x - center.x)
+        delta = ma - sa
+        while delta < 0:
+            delta += 2 * math.pi
+        if delta > span:
+            span -= 2 * math.pi
+        ax = self._viewAxes()
+
+        def _arcPt(t):
+            a = sa + span * t
+            return self._mkUVW(ax, center.x + radius * math.cos(a),
+                               center.y + radius * math.sin(a), center.z)
+
+        samples = [_arcPt(i / 64) for i in range(64 + 1)]
+        controls = [_arcPt(i / 4) for i in range(4 + 1)]
+        poly = PolyCurveObject()
+        poly.addSegment({
+            "points": [[p.x, p.y, p.z] for p in samples],
+            "inputPoints": [[p.x, p.y, p.z] for p in controls]})
+        self._doc.addObject(poly)
 
     def onMousePress(self, wp: Point3D, mods) -> None:
         self._addPoint(Point3D(wp.x, wp.y, wp.z))
@@ -889,19 +1038,21 @@ class ArcCommand(CommandInstance):
             self._setCursorMarker(wp)
             return
         if n == 1:
-            # 橡皮带：起点 → 光标，光标处叠加光标点（原版同交互）
-            path = QPainterPath()
-            path.moveTo(self._pts[0].x, self._pts[0].y)
-            path.lineTo(wp.x, wp.y)
+            # 橡皮带：起点 → 光标（侧视路径坐标 = 视图平面 (u,v)），
+            # 光标处叠加光标点（原版同交互）
+            path = self._uvPath([self._pts[0], wp])
             self._setPreviewPath(path, solid=True,
                                  color=self._obj.color() if self._obj else None)
             self._setCursorMarker(wp)
             return
         if self._mode == 0:
-            # 起点、终点已定，光标为弧上点（退化时不画）
-            path = _arcPathThrough(self._pts[0], wp, self._pts[1])
+            # 起点、终点已定，光标为弧上点（退化时不画）；
+            # 平面坐标解算：常规视图即 XY，侧视图即 (u,v) 视图平面
+            path = _arcPathThrough(*self._planePts(
+                [self._pts[0], wp, self._pts[1]]))
         else:
-            path = _arcPathThrough(self._pts[0], self._pts[1], wp)
+            path = _arcPathThrough(*self._planePts(
+                [self._pts[0], self._pts[1], wp]))
         self._setPreviewPath(path, solid=True,
                              color=self._obj.color() if self._obj else None)
         if not path.isEmpty():
@@ -930,8 +1081,8 @@ class EllipseCommand(CommandInstance):
     def commandTitle(self) -> str:
         return "椭圆参数"
 
-    def lastInputPoint(self):
-        return self._pts[-1] if self._pts else None
+    # 预览路径即完整形状（视图平面坐标）：同圆弧，走路径分支绘制
+    previewPlaneBased = True
 
     def prompt(self) -> str:
         n = len(self._pts)
@@ -945,8 +1096,22 @@ class EllipseCommand(CommandInstance):
         super().start()
         self._pts: List[Point3D] = []
         self._panel = None
-        self._obj = EllipseObject(0, 0, 0, 0.0, 0.0)
-        self._doc.addObject(self._obj)
+        self._side = self._isSideView()   # 侧视（前视/右视）烘焙模式
+        if self._side:
+            # 椭圆基元是 XY 平面对象：侧视下不建占位椭圆，三点齐后按
+            # 视图平面烘焙成多段曲线（避免得到投影错误的平躺椭圆）
+            self._obj = None
+        else:
+            self._obj = EllipseObject(0, 0, 0, 0.0, 0.0)
+            self._doc.addObject(self._obj)
+
+    def cancel(self) -> None:
+        # 未凑齐三点/未设轴的占位椭圆（零轴退化）不留在文档里，避免
+        # 幽灵对象随保存写入文件（对照 Arc 的取消清理）
+        if self._obj is not None and self._obj.majorAxis() < 1e-9:
+            self._doc.removeObject(self._obj.id())
+            self._obj = None
+        super().cancel()
 
     def paramPanel(self):
         if self._panel is None:
@@ -956,30 +1121,58 @@ class EllipseCommand(CommandInstance):
         return self._panel
 
     def _onPanelAxes(self, major: float, minor: float) -> None:
+        if self._obj is None:
+            return   # 侧视烘焙模式：轴由三点点击确定，面板调整不参与
         if self._pts and major > 0 and minor > 0:
             self._obj.setCenter(self._pts[0])
             self._obj.setAxes(major, minor)
             self._doc.notifyObjectChanged(self._obj.id())
 
     def _onPanelConfirmed(self) -> None:
+        if self._obj is None:
+            return
         if (self._pts and self._obj.majorAxis() > 0
                 and self._obj.minorAxis() > 0):
             self.finish()
+
+    def _bakeSideEllipse(self, c: Point3D, major: float,
+                         minor: float) -> None:
+        """侧视画椭圆确认：按视图平面采样烘焙闭合多段曲线
+        （轴对齐视图平面 u/v 轴，与常规视图 addEllipse 行为一致）。"""
+        if major <= 1e-12 or minor <= 1e-12:
+            return
+        ax = self._viewAxes()
+        w = self._comp(c, 3 - ax[0] - ax[1])
+        cu, cv = self._uv(c)
+        samples = [self._mkUVW(ax, cu + major * math.cos(2.0 * math.pi * i / 128),
+                               cv + minor * math.sin(2.0 * math.pi * i / 128), w)
+                   for i in range(128 + 1)]
+        controls = [self._mkUVW(ax, cu + major * math.cos(2.0 * math.pi * i / 8),
+                                cv + minor * math.sin(2.0 * math.pi * i / 8), w)
+                    for i in range(8 + 1)]
+        poly = PolyCurveObject()
+        poly.addSegment({
+            "points": [[p.x, p.y, p.z] for p in samples],
+            "inputPoints": [[p.x, p.y, p.z] for p in controls]})
+        self._doc.addObject(poly)
 
     def onMousePress(self, wp: Point3D, mods) -> None:
         self._pts.append(Point3D(wp.x, wp.y, wp.z))
         if len(self._pts) == 3:
             c = self._pts[0]
-            major = math.hypot(self._pts[1].x - c.x, self._pts[1].y - c.y)
-            minor = math.hypot(wp.x - c.x, wp.y - c.y)
-            self._obj.setCenter(c)
-            self._obj.setAxes(major, minor)
+            major = self._uvDist(self._pts[1], c)
+            minor = self._uvDist(wp, c)
+            if self._side:
+                self._bakeSideEllipse(c, major, minor)
+            else:
+                self._obj.setCenter(c)
+                self._obj.setAxes(major, minor)
+                self._doc.notifyObjectChanged(self._obj.id())
             if self._panel is not None:
                 self._panel.setAxes(major, minor)
-            self._doc.notifyObjectChanged(self._obj.id())
             self.finish()
             return
-        if len(self._pts) == 1:
+        if len(self._pts) == 1 and self._obj is not None:
             self._obj.setCenter(self._pts[0])
             self._doc.notifyObjectChanged(self._obj.id())
 
@@ -992,16 +1185,16 @@ class EllipseCommand(CommandInstance):
             self._setCursorMarker(wp)
             return
         self._hideCursorMarker()
+        # 平面坐标度量（常规视图即 XY；侧视即视图平面 u/v）
+        cu, cv = self._uv(self._pts[0])
         path = QPainterPath()
         if n == 1:
-            major = math.hypot(wp.x - self._pts[0].x, wp.y - self._pts[0].y)
-            path.addEllipse(self._pts[0].x - major, self._pts[0].y - major,
-                            major * 2, major * 2)
+            major = self._uvDist(wp, self._pts[0])
+            path.addEllipse(cu - major, cv - major, major * 2, major * 2)
         elif n == 2:
-            c = self._pts[0]
-            major = math.hypot(self._pts[1].x - c.x, self._pts[1].y - c.y)
-            minor = math.hypot(wp.x - c.x, wp.y - c.y)
-            path.addEllipse(c.x - major, c.y - minor, major * 2, minor * 2)
+            major = self._uvDist(self._pts[1], self._pts[0])
+            minor = self._uvDist(wp, self._pts[0])
+            path.addEllipse(cu - major, cv - minor, major * 2, minor * 2)
         self._setPreviewPath(path, solid=True,
                              color=self._obj.color() if self._obj else None)
 
@@ -1020,6 +1213,7 @@ class CurveCommand(CommandInstance):
     其末点作为下一段起点续画，连续两次右键结束。"""
 
     _SEG_SAMPLES = 20   # 每段采样数（密度足够消除锯齿）
+    previewPlaneBased = True    # 3D 预览按构造平面投影整条路径（含已画段）
 
     def name(self) -> str:
         return "Curve"
@@ -1146,7 +1340,7 @@ class CurveCommand(CommandInstance):
                 allPts = ctrl   # 点数不足：直线预览（续画段起点→光标同全新段）
             else:
                 allPts = catmullRom(ctrl, self._SEG_SAMPLES)
-        return _linePath(allPts)
+        return self._uvPath(allPts)
 
     def _segmentSamples(self) -> List[Point3D]:
         """计算当前段的固化采样（与绘制预览完全一致，断开/结束时调用）。
@@ -1196,7 +1390,7 @@ class CurveCommand(CommandInstance):
         for s in self._segments:
             if len(s) < 2:
                 continue
-            sub = _linePath(s)
+            sub = self._uvPath(s)
             path.addPath(sub)
         return path
 
@@ -1204,6 +1398,13 @@ class CurveCommand(CommandInstance):
         if self._pts:
             wp = self._orthoPoint(wp, self._pts[-1])
         self._pts.append(Point3D(wp.x, wp.y, wp.z))
+        # 吸附回起点 → 自动闭合：即使未开面板"闭合"，首尾重合即视为
+        # 闭合曲线（否则固化采样末段截断，闭合判定失败，无法挤出环）
+        if (not self._closed and len(self._pts) >= 3
+                and self._pts[-1].distanceTo(self._pts[0]) < 1e-4):
+            self._closed = True
+            if self._panel is not None:
+                self._panel.setClosed(True)
         self._updateSnapProxy()
 
     def onMouseMove(self, wp: Point3D, mods) -> None:
@@ -1220,7 +1421,7 @@ class CurveCommand(CommandInstance):
             # 闭合预览：闭环无冻结，补回起点成环整体计算（低频操作可接受）
             temp = self._pts + [Point3D(wp.x, wp.y, wp.z), self._pts[0]]
             sampled = catmullRom(temp, self._SEG_SAMPLES) if len(temp) >= 3 else temp
-            path = _linePath(sampled)
+            path = self._uvPath(sampled)
         else:
             path = self._incrementalPath(Point3D(wp.x, wp.y, wp.z))
         path.addPath(self._committedPreview())   # 拼上已断开段（结束前未入文档）

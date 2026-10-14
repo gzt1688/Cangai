@@ -5,6 +5,7 @@ from PySide6.QtCore import QObject, Signal
 
 from core.vector.geometry_types import Point3D
 from .command_instance import CommandInstance
+from .mode_policy import modeAllows, refusalHint
 
 
 class CommandManager(QObject):
@@ -13,6 +14,9 @@ class CommandManager(QObject):
     promptChanged = Signal(str)
     resultMessage = Signal(str)
     commandRepeated = Signal(str)
+    # 预览失效：命令的画布预览（笔刷圈等）变化但不经鼠标事件时发出，
+    # 由可见视口连接并立即重绘（否则要等下次鼠标移动才刷新）
+    previewInvalidated = Signal()
 
     _instance = None
 
@@ -24,6 +28,9 @@ class CommandManager(QObject):
         self._lastCommandName = ""
         self._doc = None
         self._view = None
+        self._viewProbe = None   # 活动画布视口（3D 模式下提供 canvasMode/viewMode）
+        self._modeProbe = None   # 画布模式探测（返回 "2d"/"relief"/"3d"/"cnc"）
+        self._lastRefusal = ""   # 最近一次被模式门禁拒绝的原因（空=无）
 
     @classmethod
     def instance(cls) -> "CommandManager":
@@ -34,6 +41,22 @@ class CommandManager(QObject):
     def setContext(self, doc, view) -> None:
         self._doc = doc
         self._view = view
+
+    def setViewProbe(self, probe) -> None:
+        """注入活动画布视口（如 Viewport3D）：命令判断视图方向（前视/右视
+        侧视平面绘制）时查询它；上下文 _view 始终是 2D 画布（预览图元宿主），
+        两者职责分离。"""
+        self._viewProbe = probe
+
+    def setModeProbe(self, probe) -> None:
+        """注入画布模式探测（无参可调用，返回 "2d"/"relief"/"3d"/"cnc"）：
+        executeCommand 据此按 mode_policy 允许矩阵做中央门禁——按钮置灰之外的
+        兜底（右键重复命令/AI API/快捷键等旁路入口全部经过这里）。"""
+        self._modeProbe = probe
+
+    def lastRefusal(self) -> str:
+        """最近一次被模式门禁拒绝的提示；无拒绝时为空串。"""
+        return self._lastRefusal
 
     def register(self, name: str, factory: Callable[[], CommandInstance],
                  meta: Optional[dict] = None) -> None:
@@ -68,6 +91,15 @@ class CommandManager(QObject):
         """发布操作结果反馈（由视图左下角悬浮提示区显示）。"""
         self.resultMessage.emit(text)
 
+    def invalidatePreview(self) -> None:
+        """命令预览（笔刷圈等）已变化：让可见视口立即重绘。
+
+        命令的预览路径挂在 2D 场景图元上，快捷键/面板改参时命令只能
+        刷到隐藏的 2D 视图；浮雕模式真正可见的是 3D 视口，由它连接
+        本信号即时重绘（修复"改笔刷大小圆圈不更新"）。
+        """
+        self.previewInvalidated.emit()
+
     def hasActive(self) -> bool:
         return self._active is not None and self._active.isAlive()
 
@@ -83,14 +115,27 @@ class CommandManager(QObject):
         return self._active.name()
 
     def executeCommand(self, name: str, *args) -> bool:
-        """启动命令；额外参数透传给工厂（如 Image 命令的图片路径）。"""
+        """启动命令；额外参数透传给工厂（如 Image 命令的图片路径）。
+        启动前按画布模式允许矩阵（mode_policy）门禁：当前模式不允许的命令
+        直接拒绝（发布提示并返回 False），不创建命令实例。"""
         if self._active is not None and self._active.isAlive():
             return False
         factory = self._factories.get(name)
         if factory is None:
             return False
+        self._lastRefusal = ""
+        mode = ""
+        try:
+            mode = self._modeProbe() if self._modeProbe is not None else ""
+        except Exception:
+            mode = ""
+        if mode and not modeAllows(name, mode):
+            self._lastRefusal = refusalHint(name, mode)
+            self.resultMessage.emit(self._lastRefusal)
+            return False
         cmd = factory(*args)
         cmd.setContext(self._doc, self._view)
+        cmd.setModeView(self._viewProbe)   # 活动画布视口（3D 侧视判定用）
         cmd._manager = self   # 面板直接调 finish 时能回通知收尾
         self._active = cmd
         self._lastCommandName = name   # 供右键单击重复上一命令

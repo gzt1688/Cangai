@@ -91,6 +91,10 @@ class View2DAdapter:
         vp = self._view.viewport()
         return float(vp.width()), float(vp.height())
 
+    def viewportWidget(self):
+        """2D 画布的视口 QWidget（用于把像素坐标换算成全局屏幕坐标）。"""
+        return self._view.viewport()
+
     def project(self, p):
         q = self._view.mapFromScene(QPointF(p[0], p[1]))
         return (float(q.x()), float(q.y()))
@@ -99,8 +103,9 @@ class View2DAdapter:
         q = self._view.mapToScene(QPoint(int(round(mx)), int(round(my))))
         return (q.x(), q.y(), 0.0)
 
-    def dragPlanePoint(self, mx, my):
-        """拖动取点：2D 画布即 XY 平面（z=0）。"""
+    def dragPlanePoint(self, mx, my, axis=-1, plane=-1, center=None):
+        """拖动取点：2D 画布即 XY 平面（z=0）；axis/plane/center 仅 3D
+        适配器使用（Z 向拖动取焦点平面），此处接收并忽略以统一调用签名。"""
         return self.screenToPlane(mx, my, None)
 
     def worldHeight(self, center) -> float:
@@ -123,6 +128,10 @@ class View3DAdapter:
 
     def viewportSize(self):
         return float(self._vp.width()), float(self._vp.height())
+
+    def viewportWidget(self):
+        """3D/浮雕视口的 QWidget（用于把像素坐标换算成全局屏幕坐标）。"""
+        return self._vp
 
     def project(self, p):
         w, h = self.viewportSize()
@@ -161,10 +170,14 @@ class View3DAdapter:
         t = num / denom
         return (eye[0] + t * d[0], eye[1] + t * d[1], eye[2] + t * d[2])
 
-    def dragPlanePoint(self, mx, my):
-        """拖动取点：射线与 z=0 平面求交。曲线均为 XY 平面几何，
-        拖动必须落在 z=0（透视下焦点平面映射非线性，对象会不跟手）；
-        视线近平行平面时退回焦点平面。"""
+    def dragPlanePoint(self, mx, my, axis=-1, plane=-1, center=None):
+        """拖动取点。Z 向拖动（Z 轴 / XZ / YZ 平面约束）取"过操作轴中心、
+        垂直视线"的焦点平面——否则射线与 z=0 平面求交 Z 分量恒 0，
+        Z 轴移动完全失效；其余保持 z=0 平面（透视下焦点平面映射非线性，
+        XY 平面对象拖动必须落 z=0 才跟手），视线近平行时退回焦点平面。"""
+        if axis == 2 or plane in (1, 2):
+            pt = center if center is not None else (0.0, 0.0, 0.0)
+            return self.screenToPlane(mx, my, pt)
         p = self._vp._screenToXYPlane(float(mx), float(my))
         if p is not None:
             return (p.x, p.y, p.z)
@@ -230,11 +243,15 @@ class GizmoManager(QObject):
         self._origBbox = (1.0, 1.0, 1.0)
         # 悬停高亮
         self._hover = None
+        # 单击精确输入小浮层（非模态，需持有引用防止提前回收）
+        self._inputDialog = None
 
         # 信号槽保存引用：setDocument 换绑文档时需按引用断开（lambda 直接断开会误伤）
         self._onDocAdded = lambda *_: self.refresh()
         self._onDocRemoved = lambda *_: self.refresh()
+        self._onObjChanged = lambda *_: self.refresh()
         doc.selectionChanged.connect(self.refresh)
+        doc.objectChanged.connect(self._onObjChanged)
         doc.objectAdded.connect(self._onDocAdded)
         doc.objectRemoved.connect(self._onDocRemoved)
 
@@ -246,12 +263,14 @@ class GizmoManager(QObject):
             return
         try:
             self._doc.selectionChanged.disconnect(self.refresh)
+            self._doc.objectChanged.disconnect(self._onObjChanged)
             self._doc.objectAdded.disconnect(self._onDocAdded)
             self._doc.objectRemoved.disconnect(self._onDocRemoved)
         except (RuntimeError, TypeError):
             pass
         self._doc = doc
         doc.selectionChanged.connect(self.refresh)
+        doc.objectChanged.connect(self._onObjChanged)
         doc.objectAdded.connect(self._onDocAdded)
         doc.objectRemoved.connect(self._onDocRemoved)
         self._hover = None
@@ -501,11 +520,11 @@ class GizmoManager(QObject):
         if not self._dragging:
             return False
         if self._mode == "move":
-            self._finishMoveDrag()
+            self._finishMoveDrag(adapter, pos)
         elif self._mode == "rotate":
-            self._finishRotateDrag()
+            self._finishRotateDrag(adapter, pos)
         elif self._mode == "scale":
-            self._finishScaleDrag()
+            self._finishScaleDrag(adapter, pos)
         self._doc.endEdit()
         return True
 
@@ -558,8 +577,17 @@ class GizmoManager(QObject):
         return delta
 
     def _doMoveDrag(self, adapter, pos) -> None:
-        prev = adapter.dragPlanePoint(self._lastScreen.x(), self._lastScreen.y())
-        cur = adapter.dragPlanePoint(pos.x(), pos.y())
+        # Z 向拖动（Z 轴 / XZ / YZ 平面约束）取"过拖动起始中心、垂直视线"
+        # 的焦点平面（锚点固定为拖动开始时的中心，透视下平面不随位移漂移）；
+        # 其余保持 z=0 平面（XY 平面对象拖动必须落 z=0 才跟手）
+        anchor = self._dragStartCenter
+        prev = adapter.dragPlanePoint(self._lastScreen.x(),
+                                      self._lastScreen.y(),
+                                      self._activeAxis, self._activePlane,
+                                      anchor)
+        cur = adapter.dragPlanePoint(pos.x(), pos.y(),
+                                     self._activeAxis, self._activePlane,
+                                     anchor)
         self._lastScreen = pos
         if prev is None or cur is None:
             return
@@ -573,26 +601,43 @@ class GizmoManager(QObject):
         self._center = _add(self._center, delta, 1.0)
         adapter.redraw()
 
-    def _finishMoveDrag(self) -> None:
+    def _finishMoveDrag(self, adapter=None, pos=None) -> None:
         duration = time.monotonic() * 1000.0 - self._pressTime
         axis = self._activeAxis
         dist = _len3(self._totalDelta)
         self._cleanupDrag()
         if duration < CLICK_THRESHOLD_MS and dist < MOVE_THRESHOLD and axis >= 0:
-            self._showMoveDialog(axis)
+            self._showMoveDialog(axis, adapter, pos)
             return
         self.refresh()
 
-    def _showMoveDialog(self, axis: int) -> None:
-        dlg = GizmoInputDialog("移动距离", "距离:", 0.0, -9999.999, 9999.999,
-                               decimals=3)
-        if dlg.exec():
-            if dlg.copyRequested():
-                self._cloneSelection()
-            v = dlg.value()
-            d = (_DIRS[axis][0] * v, _DIRS[axis][1] * v, _DIRS[axis][2] * v)
+    def _showMoveDialog(self, axis: int, adapter=None, pos=None) -> None:
+        dlg = GizmoInputDialog("移动距离", "距离", 0.0, -9999.9, 9999.9,
+                               decimals=1, spacingTitle=True,
+                               persistKey="move")
+        self._showDialogAt(dlg, adapter, pos)
+        dlg.accepted.connect(lambda: self._applyMoveDialog(axis, dlg))
+        self._openInputDialog(dlg)
+
+    def _applyMoveDialog(self, axis: int, dlg) -> None:
+        # 单击弹出的精确输入在鼠标释放（endEdit）之后应用，需自带撤销事务
+        self._doc.beginEdit()
+        v = dlg.value()
+        d = (_DIRS[axis][0] * v, _DIRS[axis][1] * v, _DIRS[axis][2] * v)
+        if not dlg.copyRequested():
             self._translateSelection(d)
-        self.refresh()
+            self._doc.endEdit()
+            return
+        # 间距模式：复制步距 = 净间距 + 物体在该轴尺寸（相邻份边到边净距 = 输入值）
+        if dlg.spacingMode():
+            size = self._bboxSize[axis] if self._bboxSize else 0.0
+            v += size if v >= 0 else -size
+            d = (_DIRS[axis][0] * v, _DIRS[axis][1] * v, _DIRS[axis][2] * v)
+        # 连续复制：每轮克隆当前选中的最新一份，再沿轴平移一个间隔
+        for _ in range(dlg.copyCount()):
+            self._cloneSelection()
+            self._translateSelection(d)
+        self._doc.endEdit()
 
     # ---------------- 旋转 ----------------
     def _screenAngle(self, adapter, pos) -> float:
@@ -661,25 +706,36 @@ class GizmoManager(QObject):
         self._feedbackDeg = display
         adapter.redraw()
 
-    def _finishRotateDrag(self) -> None:
+    def _finishRotateDrag(self, adapter=None, pos=None) -> None:
         duration = time.monotonic() * 1000.0 - self._pressTime
         absRotation = abs(self._accumDeg)
         self._feedbackDeg = 0.0
         self._cleanupDrag()
         # 单击检测（与原版一致）：时间短且旋转角度小 → 弹出输入框
         if duration < CLICK_THRESHOLD_MS and absRotation < MOVE_THRESHOLD:
-            self._showRotateDialog()
+            self._showRotateDialog(adapter, pos)
             return
         self.refresh()
 
-    def _showRotateDialog(self) -> None:
-        dlg = GizmoInputDialog("旋转角度", "角度:", 0.0, -9999.999, 9999.999,
-                               suffix="°", decimals=1)
-        if dlg.exec():
-            if dlg.copyRequested():
-                self._cloneSelection()
-            self._rotateSelectionZ(math.radians(dlg.value()))
-        self.refresh()
+    def _showRotateDialog(self, adapter=None, pos=None) -> None:
+        dlg = GizmoInputDialog("旋转角度", "角度", 0.0, -9999.999, 9999.999,
+                               suffix="°", decimals=1, persistKey="rotate")
+        self._showDialogAt(dlg, adapter, pos)
+        dlg.accepted.connect(lambda: self._applyRotateDialog(dlg))
+        self._openInputDialog(dlg)
+
+    def _applyRotateDialog(self, dlg) -> None:
+        self._doc.beginEdit()
+        rad = math.radians(dlg.value())
+        if not dlg.copyRequested():
+            self._rotateSelectionZ(rad)
+            self._doc.endEdit()
+            return
+        # 连续复制：每轮克隆最新一份再绕中心旋转一个角度（环列）
+        for _ in range(dlg.copyCount()):
+            self._cloneSelection()
+            self._rotateSelectionZ(rad)
+        self._doc.endEdit()
 
     # ---------------- 缩放 ----------------
     def _startScaleDrag(self, adapter, pos, axis, mods) -> None:
@@ -699,7 +755,8 @@ class GizmoManager(QObject):
         self._hover = None
 
     def _doScaleDrag(self, adapter, pos) -> None:
-        cur = adapter.dragPlanePoint(pos.x(), pos.y())
+        cur = adapter.dragPlanePoint(pos.x(), pos.y(),
+                                     self._activeAxis, -1, self._center)
         if cur is None or abs(self._startAxisDist) < 1e-6:
             return
         neg = tuple(-v for v in _DIRS[self._activeAxis])
@@ -721,45 +778,86 @@ class GizmoManager(QObject):
         self._curScale = factor
         adapter.redraw()
 
-    def _finishScaleDrag(self) -> None:
+    def _finishScaleDrag(self, adapter=None, pos=None) -> None:
         duration = time.monotonic() * 1000.0 - self._pressTime
         isClick = duration < CLICK_THRESHOLD_MS and abs(self._curScale - 1.0) < 0.005
         axis = self._activeAxis
         self._cleanupDrag()
         if isClick and axis >= 0:
-            self._showScaleDialog(axis)
+            self._showScaleDialog(axis, adapter, pos)
             return
         self.refresh()
 
-    def _showScaleDialog(self, axis: int) -> None:
-        dlg = GizmoInputDialog("缩放尺寸", "数值:", 1.0, -999999.0, 999999.0,
-                               decimals=3, scaleModes=True)
-        if dlg.exec():
-            if dlg.copyRequested():
-                self._cloneSelection()
-            size = self._bboxSize[axis]
-            v = dlg.value()
-            mode = dlg.scaleMode()
-            if mode == 0:
-                factor = v / size if size > 1e-6 else 1.0
-            elif mode == 1:
-                newSize = size + v
-                factor = newSize / size if size > 1e-6 and newSize > 1e-6 else 1.0
-            else:
-                factor = v
-            if abs(factor) < 1e-9:
-                factor = 1e-9
-            if dlg.uniformAxis():
-                self._scaleSelection(factor, factor, factor)
-            else:
-                sx = sy = sz = 1.0
-                if axis == 0:
-                    sx = factor
-                elif axis == 1:
-                    sy = factor
-                else:
-                    sz = factor
-                self._scaleSelection(sx, sy, sz)
+    def _showScaleDialog(self, axis: int, adapter=None, pos=None) -> None:
+        dlg = GizmoInputDialog("缩放尺寸", "尺寸", 1.0, -999999.0, 999999.0,
+                               decimals=3, scaleModes=True,
+                               persistKey="scale")
+        self._showDialogAt(dlg, adapter, pos)
+        dlg.accepted.connect(lambda: self._applyScaleDialog(axis, dlg))
+        self._openInputDialog(dlg)
+
+    def _applyScaleDialog(self, axis: int, dlg) -> None:
+        self._doc.beginEdit()
+        size = self._bboxSize[axis]
+        v = dlg.value()
+        mode = dlg.scaleMode()
+        if mode == 0:
+            factor = v / size if size > 1e-6 else 1.0
+        elif mode == 1:
+            newSize = size + v
+            factor = newSize / size if size > 1e-6 and newSize > 1e-6 else 1.0
+        else:
+            factor = v
+        if abs(factor) < 1e-9:
+            factor = 1e-9
+        uniform = dlg.uniformAxis()
+        if not dlg.copyRequested():
+            self._scaleByFactor(factor, axis, uniform)
+            self._doc.endEdit()
+            return
+        # 连续复制：每轮克隆最新一份再应用同一比例（副本逐份等比递进）
+        for _ in range(dlg.copyCount()):
+            self._cloneSelection()
+            self._scaleByFactor(factor, axis, uniform)
+        self._doc.endEdit()
+
+    def _scaleByFactor(self, factor: float, axis: int, uniform: bool) -> None:
+        if uniform:
+            self._scaleSelection(factor, factor, factor)
+            return
+        sx = sy = sz = 1.0
+        if axis == 0:
+            sx = factor
+        elif axis == 1:
+            sy = factor
+        else:
+            sz = factor
+        self._scaleSelection(sx, sy, sz)
+
+    def _showDialogAt(self, dlg, adapter, pos) -> None:
+        """把单击精确输入小浮层定位到鼠标右下方。
+
+        adapter/pos 为视口像素坐标（释放鼠标时的位置）；先换算成全局屏幕坐标，
+        再交给对话框按边缘自动翻转定位。两者为空时保持默认位置。
+        """
+        if adapter is not None and pos is not None:
+            vw = adapter.viewportWidget()
+            gp = vw.mapToGlobal(QPoint(int(round(pos.x())), int(round(pos.y()))))
+            dlg.showAt(gp)
+
+    def _openInputDialog(self, dlg) -> None:
+        """非模态显示输入小浮层（确认/取消在对话框内部通过外部点击/按键处理）。"""
+        if self._inputDialog is not None:
+            self._inputDialog.reject()
+        self._inputDialog = dlg
+        dlg.finished.connect(lambda _r: self._closeInputDialog(dlg))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _closeInputDialog(self, dlg) -> None:
+        if self._inputDialog is dlg:
+            self._inputDialog = None
         self.refresh()
 
     def _cleanupDrag(self) -> None:
