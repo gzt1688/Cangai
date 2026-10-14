@@ -209,18 +209,204 @@ def weave(ny: int, nx: int, *, bands: int = 8, width: float = 0.72,
     return np.maximum(h_band, v_band).astype(np.float32)
 
 
-def weave_along_curve(
+def _curve_intersections(dense_a: np.ndarray, cum_a: np.ndarray,
+                         dense_b: np.ndarray, cum_b: np.ndarray):
+    """两条密集折线的全部交叉点：返回 (s_a, s_b) 弧长列表。
+
+    线段相交判定向量化（O(nA·nB) 一次广播）；nA/nB 为折线段数。
+    """
+    a1, a2 = dense_a[:-1], dense_a[1:]
+    b1, b2 = dense_b[:-1], dense_b[1:]
+    r = a2 - a1                                   # (nA,2)
+    s = b2 - b1                                   # (nB,2)
+    r = r[:, None, :]                             # (nA,1,2)
+    s = s[None, :, :]                             # (1,nB,2)
+    d = b1[None, :, :] - a1[:, None, :]           # (nA,nB,2)
+    denom = r[..., 0] * s[..., 1] - r[..., 1] * s[..., 0]
+    ok = np.abs(denom) > 1e-12
+    denom = np.where(ok, denom, 1.0)
+    t = (d[..., 0] * s[..., 1] - d[..., 1] * s[..., 0]) / denom
+    u = (d[..., 0] * r[..., 1] - d[..., 1] * r[..., 0]) / denom
+    hit = ok & (t >= 0.0) & (t <= 1.0) & (u >= 0.0) & (u <= 1.0)
+    if not hit.any():
+        return []
+    ia, ib = np.nonzero(hit)
+    seg_a = np.linalg.norm(dense_a[1:] - dense_a[:-1], axis=1)
+    seg_b = np.linalg.norm(dense_b[1:] - dense_b[:-1], axis=1)
+    s_a = cum_a[:-1][ia] + t[ia, ib] * seg_a[ia]
+    s_b = cum_b[:-1][ib] + u[ia, ib] * seg_b[ib]
+    return list(zip(s_a.tolist(), s_b.tolist()))
+
+
+def _top_along(s: np.ndarray, s_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
+    """沿带高度调制：交叉点处取 v_k，相邻交叉间 smoothstep 过渡。"""
+    if len(s_arr) == 0:
+        return np.ones_like(s)
+    if len(s_arr) == 1:
+        return np.full_like(s, v_arr[0])
+    s_c = np.clip(s, s_arr[0], s_arr[-1])
+    k = np.clip(np.searchsorted(s_arr, s_c, side="right") - 1,
+                0, len(s_arr) - 2)
+    s0, s1 = s_arr[k], s_arr[k + 1]
+    t = np.clip((s_c - s0) / max(float(s1 - s0), 1e-9), 0.0, 1.0)
+    tt = (t * t * (3.0 - 2.0 * t)).astype(np.float64)
+    return v_arr[k] + (v_arr[k + 1] - v_arr[k]) * tt
+
+
+def weave_along_curves(
     hf,
-    poly: np.ndarray,
+    polys: list,
     *,
-    width_mm: float | None = None,
-    pitch_u: float | None = None,
-    pitch_v: float | None = None,
-    width_frac: float = 0.72,
+    width_mm: float = 8.0,
     low: float = 0.16,
-    angle_deg: float = 45.0,
     samples_per_mm: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """沿群组曲线编织：每条曲线 = 一根带的中心线，返回 (field, mask)。
+
+    用户预先画好相互交叉的一组曲线并群组；带贴着每条曲线走，交叉处
+    一带满高在上、另一带沉底（low）从两侧露出——与整面平纹编织同款。
+
+    上下分配（plain weave 一致性）：沿每根带第 k 个交叉处，带上/下由
+    (k + φ带) 偶/奇 决定；φ带 通过交叉约束 φA⊕φB = 1⊕kA⊕kB 做 BFS
+    2-着色传播。网格状排布下有精确解（等效 (i+j)%2）；奇圈冲突时该
+    交叉回退为小索引带在上。
+
+    实现：每条曲线按 samples_per_mm 重采样后在自身 ROI 内用 scipy EDT
+    一次算出每格垂距与最近弧长；各带场做 max 合成。
+    """
+    ny, nx = hf.ny, hf.nx
+    field = np.zeros((ny, nx), np.float32)
+    mask = np.zeros((ny, nx), bool)
+    if not polys or len(polys) == 0:
+        return field, mask
+
+    sp = float(hf.spacing)
+    width = max(float(width_mm), sp * 2.0)
+    half_w = width * 0.5
+    low = float(np.clip(low, 0.0, 0.6))
+
+    # ---- 弧长重采样 ----
+    curves = []                      # (dense, cum)
+    for poly in polys:
+        pts = np.asarray(poly, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 2:
+            curves.append(None)
+            continue
+        seg = np.linalg.norm(np.diff(pts[:, :2], axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(cum[-1])
+        if total < 1e-6:
+            curves.append(None)
+            continue
+        step = 1.0 / max(float(samples_per_mm), 0.05)
+        ns = max(2, int(total / step) + 1)
+        s_query = np.linspace(0.0, total, ns)
+        dense = np.stack([np.interp(s_query, cum, pts[:, 0]),
+                          np.interp(s_query, cum, pts[:, 1])], axis=1)
+        curves.append((dense, cum))
+    valid = [i for i, c in enumerate(curves) if c is not None]
+    if not valid:
+        return field, mask
+
+    # ---- 交叉点检测（两两曲线）----
+    # crossings[i] = [(s_i, other, s_other), ...]
+    crossings: dict[int, list] = {i: [] for i in valid}
+    for a in range(len(valid)):
+        ia = valid[a]
+        da, ca = curves[ia]
+        for b in range(a + 1, len(valid)):
+            ib = valid[b]
+            db, cb = curves[ib]
+            for s_a, s_b in _curve_intersections(da, ca, db, cb):
+                crossings[ia].append((s_a, ib, s_b))
+                crossings[ib].append((s_b, ia, s_a))
+
+    # 交叉点按弧长排序 + 去重（近于半带宽的交叉合并），得每带局部索引 k
+    min_sep = width * 0.5
+    locals_k: dict[int, list] = {}      # i -> [(s, k)]
+    for i in valid:
+        lst = sorted(crossings[i], key=lambda c: c[0])
+        kept: list[tuple[float, int]] = []
+        for s, _j, _sj in lst:
+            if kept and s - kept[-1][0] < min_sep:
+                continue
+            kept.append((s, len(kept)))
+        locals_k[i] = kept
+
+    # ---- 相位 2-着色（BFS）：φA⊕φB = 1⊕kA⊕KB（mod 2）----
+    phi: dict[int, int] = {}
+    for root in valid:
+        if root in phi:
+            continue
+        phi[root] = 0
+        queue = [root]
+        while queue:
+            i = queue.pop()
+            for s_i, j, _sj in crossings[i]:
+                # 该交叉在 j 带上的局部索引
+                kj = _local_index(locals_k[j], _sj_of(crossings[j], j, i, s_i))
+                w = (1 + _k_of(locals_k[i], s_i) + kj) & 1
+                want = phi[i] ^ w
+                if j not in phi:
+                    phi[j] = want
+                    queue.append(j)
+                # 已着色但不一致：奇圈冲突，保持现状（后续按小索引兜底）
+
+    # ---- 每带高度调制 top(s) + 场合成 ----
+    from scipy.ndimage import distance_transform_edt, median_filter
+    for i in valid:
+        dense, cum = curves[i]
+        kept = locals_k[i]
+        if kept:
+            s_arr = np.array([s for s, _k in kept], dtype=np.float64)
+            k_arr = np.array([k for _s, k in kept], dtype=np.int64)
+            ph = phi.get(i, 0)
+            v_arr = np.where((k_arr + ph) % 2 == 0, 1.0, low)
+        else:
+            s_arr = np.zeros(0)
+            v_arr = np.zeros(0)
+
+        # ROI
+        x0 = max(0.0, float(dense[:, 0].min()) - width)
+        x1 = min(float(hf.origin[0] + (nx - 1) * sp),
+                 float(dense[:, 0].max()) + width)
+        y0 = max(0.0, float(hf.origin[1] - 0.0) + 0.0, 0.0)  # placeholder
+        y0 = max(0.0, float(dense[:, 1].min()) - width)
+        y1 = min(float(hf.origin[1] + (ny - 1) * sp),
+                 float(dense[:, 1].max()) + width)
+        c0 = int((x0 - hf.origin[0]) / sp)
+        c1 = min(nx, int((x1 - hf.origin[0]) / sp) + 2)
+        r0 = int((y0 - hf.origin[1]) / sp)
+        r1 = min(ny, int((y1 - hf.origin[1]) / sp) + 2)
+        if c1 - c0 < 2 or r1 - r0 < 2:
+            continue
+        lw, lh = c1 - c0, r1 - r0
+
+        # 曲线打标 → EDT 距离 + 最近弧长
+        feats = np.ones((lh, lw), dtype=bool)
+        arc = np.zeros((lh, lw), dtype=np.float64)
+        gcols = np.clip(((dense[:, 0] - hf.origin[0]) / sp - c0).astype(int),
+                        0, lw - 1)
+        grows = np.clip(((dense[:, 1] - hf.origin[1]) / sp - r0).astype(int),
+                        0, lh - 1)
+        feats[grows, gcols] = False
+        step = 1.0 / max(float(samples_per_mm), 0.05)
+        arc[grows, gcols] = np.linspace(0.0, float(cum[-1]), len(dense))
+        dist, idx = distance_transform_edt(feats, return_indices=True)
+        s_map = median_filter(arc[idx[0], idx[1]], size=3, mode="nearest")
+
+        d_mm = dist * sp
+        dome = np.sqrt(np.clip(1.0 - (d_mm / half_w) ** 2, 0.0, 1.0))
+        top = _top_along(s_map, s_arr, v_arr) if kept else 1.0
+        band = dome * top
+        # 带边缘柔化收口
+        band = band * _smoothstep(half_w, half_w * 0.82, d_mm)
+
+        roi = field[r0:r1, c0:c1]
+        np.maximum(roi, band.astype(np.float32), out=roi)
+        mask[r0:r1, c0:c1] |= d_mm <= half_w
+
+    return np.clip(field, 0.0, 1.0), mask
     """沿曲线编织（复刻精雕"编织带纹理"的路径版）：返回 (field, mask)。
 
     field ∈ [0,1] 仅在 mask 内有效（mask=曲线两侧 width_mm 带内）。
@@ -295,6 +481,8 @@ def weave_along_curve(
     # 两族斜股交叉：w1 = d·cosθ + s·sinθ，w2 = d·sinθ − s·cosθ（θ 默认 45°）。
     # 相比"沿曲线 + 垂直曲线"两族，斜股不会在中心线退化成恒定 d 的
     # 平板——这才是编织带的经典形态（斜向股线来回穿插）。
+    # 股截面 = 半圆（dome），沿股长正弦起伏：交织处上股满高、下股沉底
+    # （与整面编织 weave() 同款形态）。
     d_mm = dist * sp
     s_mm = s_map
     th = math.radians(float(np.clip(angle_deg, 10.0, 80.0)))
@@ -303,20 +491,23 @@ def weave_along_curve(
     # 第二族错半周期：否则 d=0（曲线中心线）上两族同相 → 中心线恒为满高脊
     w2 = d_mm * stt - s_mm * ct + pitch_v * 0.5
 
-    def _ribbon(v: np.ndarray, pitch: float) -> np.ndarray:
-        t = np.abs(((v / pitch + 0.5) % 1.0) - 0.5) * 2.0
-        return 1.0 - _smoothstep(flat, 1.0, t)
+    u1 = w1 / pitch_u
+    u2 = w2 / pitch_v
+    width_frac = float(np.clip(width_frac, 0.3, 0.95))
+    e1 = np.abs(u1 - np.round(u1)) * 2.0           # 0=股中心 → 1=半节距
+    dome1 = np.sqrt(np.clip(1.0 - (e1 / width_frac) ** 2, 0.0, 1.0))
+    e2 = np.abs(u2 - np.round(u2)) * 2.0
+    dome2 = np.sqrt(np.clip(1.0 - (e2 / width_frac) ** 2, 0.0, 1.0))
 
-    prof1 = _ribbon(w1, pitch_u)               # +45° 股
-    prof2 = _ribbon(w2, pitch_v)               # −45° 股
-    parity = ((np.floor(w1 / pitch_u).astype(np.int32)
-               + np.floor(w2 / pitch_v).astype(np.int32)) % 2) == 0
-    over_prof = np.where(parity, prof1, prof2)
-    under_prof = np.where(parity, prof2, prof1)
-    ratio = float(np.clip(ratio, 0.0, 1.0))
-    field = over_prof + under_prof * (1.0 - over_prof) * ratio
-    if bevel > 0:
-        field = field * (1.0 - bevel) + bevel * 0.5 * (prof1 + prof2)
+    low = float(np.clip(low, 0.0, 0.6))
+    mid = 0.5 * (1.0 + low)
+    amp = 0.5 * (1.0 - low)
+    k1 = np.floor(u1)
+    k2 = np.floor(u2)
+    # 交织起伏：族1 在 u2=k2 交织处 (k1+k2) 偶 → 上（满高），奇 → 沉底
+    top1 = mid + amp * np.sin(np.pi * (u2 - k1))
+    top2 = mid + amp * np.sin(np.pi * (u1 - k2))
+    field = np.maximum(dome1 * top1, dome2 * top2)
     # 带边缘柔化收口
     mask = d_mm <= width * 0.5
     field = field * _smoothstep(width * 0.5, width * 0.5 * 0.82, d_mm)
@@ -545,8 +736,6 @@ def apply_texture(hf, params: TextureFillParams,
             width_mm=getattr(params, "weave_width_mm", 8.0),
             pitch_u=getattr(params, "weave_pitch_mm", 3.0),
             pitch_v=getattr(params, "weave_pitch_mm", 3.0),
-            ratio=getattr(params, "ratio", 0.42),
-            flat=getattr(params, "flat", 0.55),
             angle_deg=getattr(params, "weave_angle", 45.0),
         )
         mask = mask & mask_c
