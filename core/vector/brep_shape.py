@@ -310,6 +310,39 @@ def bdKernelReady() -> bool:
     return "build123d" in sys.modules
 
 
+# 内核导入失败原因（成功保持 None）。用于区分"预热中"与"根本装不上"：
+# 后者若仍按预热中提示，界面会永远停在"几何内核预热中"（打包漏
+# build123d 时的实际表现），且窗口模式下 traceback 无处可见。
+_bdImportError: str | None = None
+
+
+def bdKernelError() -> str | None:
+    """build123d 导入失败原因；None = 未失败（可能仍在导入）。"""
+    return _bdImportError
+
+
+def _logBdError(text: str) -> None:
+    """把内核导入失败写入 crash.log（窗口模式下 stderr 不可见）。"""
+    import sys
+    try:
+        m = sys.modules.get("main")
+        f = getattr(m, "_CRASH_LOG_FILE", None)
+        if f is not None:
+            f.write(text)
+            f.flush()
+            return
+    except Exception:
+        pass
+    try:
+        base = (os.path.dirname(os.path.abspath(sys.executable))
+                if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(base, "crash.log"), "a", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
+
 def _stagedImportBd():
     """分步导入 build123d：把一次 3~4s 的导入拆成几大步，每步之间
     time.sleep(0) 让出 GIL，后台线程执行时主线程事件循环照常跑，
@@ -320,6 +353,7 @@ def _stagedImportBd():
     微卡，其余时间主线程基本流畅。"""
     import time
     import sys
+    global _bdImportError
     src = os.path.join(os.path.dirname(__file__), "..", "..",
                        "deps", "build123d-0.11.1", "src")
     src = os.path.normpath(src)
@@ -328,15 +362,57 @@ def _stagedImportBd():
     try:
         import OCP  # noqa: F401  包本体
         time.sleep(0.005)
+        # lib3mf：build123d.mesher 顶层 `from lib3mf import Lib3MF`，但只在
+        # 3MF 导出时用到；其原生 dll 是打包最易漏的一环（漏了整条 3D 内核
+        # 导入都会失败）。缺失时用空桩顶替，保证建模/挤出/布尔照常可用。
+        try:
+            import lib3mf  # noqa: F401
+        except Exception:
+            import types
+            import traceback as _tb
+            _ph: dict = {}
+
+            def _placeholder(name, _cache=_ph):
+                """按名字缓存的占位类型：同名恒同一对象，可作 dict 键。"""
+                if name not in _cache:
+                    _cache[name] = type(name, (), {})
+                return _cache[name]
+
+            class _EnumNS:
+                """ModelUnit/ObjectType 这类枚举容器：任意成员给占位值。"""
+                def __getattr__(self, name):
+                    return _placeholder(name)
+
+            sub = types.ModuleType("lib3mf.Lib3MF")
+            sub.ModelUnit = _EnumNS()
+            sub.ObjectType = _EnumNS()
+            # 其余符号（Wrapper/MeshObject 等）只出现在注解或导出时才用，
+            # 统一给占位类型，保证 build123d.mesher 类体执行通过
+            sub.__getattr__ = lambda name: _placeholder(name)  # noqa: ARG005
+            stub = types.ModuleType("lib3mf")
+            stub.Lib3MF = sub
+            stub.__path__ = []
+            sys.modules["lib3mf"] = stub
+            sys.modules["lib3mf.Lib3MF"] = sub
+            _logBdError("\n=== lib3mf 缺失，已用空桩（仅 3MF 导出受影响）"
+                        " @ %s ===\n%s\n"
+                        % (time.strftime("%Y-%m-%dT%H:%M:%S"),
+                           _tb.format_exc()))
+        time.sleep(0.005)
         # build_enums 是最大的 Python 依赖链（含 geometry/topology
         # 大量类定义，约 2~3s），单独一步 + 让出，主线程期间可响应
         import build123d.build_enums  # noqa: F401
         time.sleep(0.005)
         # 顶层 import：内部其余子模块此时依赖已缓存，几乎零耗时
         import build123d  # noqa: F401
+        _bdImportError = None
     except Exception:
         import traceback
+        tb = traceback.format_exc()
+        _bdImportError = tb.strip().splitlines()[-1] if tb.strip() else "未知错误"
         traceback.print_exc()
+        _logBdError("\n=== 3D 内核导入失败 @ %s ===\n%s\n"
+                    % (time.strftime("%Y-%m-%dT%H:%M:%S"), tb))
 
 
 class BrepShape:
@@ -358,9 +434,16 @@ class BrepShape:
         self._faceCache: Optional[list] = None
         # 纯网格 shape（全面无解析曲面，STL 导入）：triangulate 时置 True
         self._meshOnly = False
+        # _meshOnly 是否已按当前 part 判定过（part 不可变，判定可缓存）
+        self._meshOnlyKnown = False
         # 纯网格 shape 的累积仿射（4×4，None=identity）：绕开 OCCT 变换
         # （见 _meshXfUpdate 注释），triangulate/boundingBox 读取时施加
         self._meshXf = None
+        # B-Rep 交互预览仿射（4×4，None=未在预览）：拖动期间 translate/
+        # rotate/scale 只累积矩阵不碰 OCCT，释放时 commitPreview 一次性
+        # 烘焙——每帧从「BRepBuilderAPI_Transform + 全量重三角化」降为
+        # numpy 矩阵乘（实测 130~1400×，拖动卡顿的根因治疗）
+        self._previewXf = None
         # 纯网格 shape 的本地三角化缓存（不含仿射；变换读取时施加，
         # 移动/缩放拖动每帧只做矩阵乘，不重跑管线）
         self._meshTriCache = None
@@ -436,6 +519,125 @@ class BrepShape:
     def fromPart(part) -> "BrepShape":
         return BrepShape(part)
 
+    @staticmethod
+    def fromPrimitive(kind: str, p: dict) -> "BrepShape":
+        """标准体基元 → BrepShape（build123d 内核）。
+
+        kind: "box" | "cylinder" | "cone" | "torus"
+        p 参数字典（PrimitiveParamPanel.params() 产出）：
+          公共: cx/cy（中心）、cz（基准高度）、rot（绕 Z 旋转，度），
+                align（"bottom" 底面对齐 | "center" 中心对齐），
+                edge_mode（"none"|"chamfer"|"fillet"）、edge_val、
+                edge_scope（1 仅顶边 | 2 顶+底边 | 3 全部边）
+          box: l/w/h/draft（拔模角度，度）
+          cylinder: d（直径）/h/draft
+          cone: d1（底径）/d2（顶径，0=尖锥）/h
+          torus: dmaj（环中心直径）/dmin（管直径）/axis（"z"|"x"|"y"）
+
+        全部在原点构建（底面 z=0 / 环心在原点），倒角/圆角按边中点 Z
+        相对包围盒顶/底筛选，最后平移到 (cx, cy, cz)。"""
+        import math
+        from core.vector.geometry_types import Point3D
+        bd = _import_bd()
+        p = dict(p)
+        cx = float(p.get("cx", 0.0))
+        cy = float(p.get("cy", 0.0))
+        cz = float(p.get("cz", 0.0))
+        center_align = (p.get("align") == "center")
+
+        if kind == "box":
+            l = float(p["l"]); w = float(p["w"]); h = float(p["h"])
+            draft = float(p.get("draft", 0.0))
+            # 矩形轮廓点（绕 Z 旋转后平移到 cx,cy）→ 复用挤出管线的
+            # taper 挤出（含 DPrism 失败回退放样），底面 z=0
+            a = math.radians(float(p.get("rot", 0.0)))
+            ca, sa = math.cos(a), math.sin(a)
+            hl, hw = l * 0.5, w * 0.5
+            corners = ((hl, hw), (-hl, hw), (-hl, -hw), (hl, -hw))
+            pts = [Point3D(cx + x * ca - y * sa, cy + x * sa + y * ca, 0.0)
+                   for x, y in corners]
+            part = BrepShape.fromExtrude(pts, h, draft, None,
+                                         "polygon").part()
+            zoff = (cz - h * 0.5) if center_align else cz
+            dx, dy = 0.0, 0.0   # cx/cy 已烘焙进轮廓点，最终只补 Z
+
+        elif kind == "cylinder":
+            r = float(p["d"]) * 0.5
+            h = float(p["h"])
+            draft = float(p.get("draft", 0.0))
+            if abs(draft) > 1e-9:
+                # 拔模圆柱 = 圆台（顶半径按 tan 换算），免 taper 布尔
+                rt = r - h * math.tan(math.radians(draft))
+                if rt <= 1e-6:
+                    raise ValueError("拔模角度过大：顶部收缩为零")
+                part = bd.Cone(r, rt, h, align=(bd.Align.CENTER,
+                                                bd.Align.CENTER,
+                                                bd.Align.MIN))
+            else:
+                part = bd.Cylinder(r, h, align=(bd.Align.CENTER,
+                                                bd.Align.CENTER,
+                                                bd.Align.MIN))
+            zoff = (cz - h * 0.5) if center_align else cz
+            dx, dy = cx, cy
+
+        elif kind == "cone":
+            d1 = float(p["d1"]); d2 = float(p["d2"]); h = float(p["h"])
+            if d2 < 0:
+                raise ValueError("顶直径不能为负")
+            part = bd.Cone(d1 * 0.5, d2 * 0.5, h,
+                           align=(bd.Align.CENTER, bd.Align.CENTER,
+                                  bd.Align.MIN))
+            zoff = (cz - h * 0.5) if center_align else cz
+            dx, dy = cx, cy
+
+        elif kind == "torus":
+            mj = float(p["dmaj"]) * 0.5
+            mn = float(p["dmin"]) * 0.5
+            if mn * 1.1 >= mj:
+                raise ValueError("管径过大：需小于环径的 90%")
+            rot3 = {"z": (0, 0, 0), "x": (0, 90, 0), "y": (90, 0, 0)}[
+                p.get("axis", "z")]
+            part = bd.Torus(mj, mn, rotation=rot3)   # 默认居中（环心在原点）
+            # 轴 Z（水平躺放）：Z 向半高 = 管半径；轴 X/Y（立式）：
+            # 环面最低/最高点 = mj+mn（环心线到 mj，管面再外扩 mn）
+            base = (mj + mn) if p.get("axis", "z") in ("x", "y") else mn
+            zoff = cz if center_align else cz + base
+            # 圆环无平面边：不做倒角/圆角，直接定位返回
+            return BrepShape(part.moved(bd.Pos(cx, cy, zoff)))
+
+        else:
+            raise ValueError(f"未知标准体类型：{kind}")
+
+        # ---- 倒角 / 圆角（按边中点 Z 相对包围盒顶/底筛选）----
+        em = p.get("edge_mode") or "none"
+        ev = float(p.get("edge_val", 0.0))
+        scope = int(p.get("edge_scope", 1))
+        if em in ("chamfer", "fillet") and ev > 1e-9:
+            bb = part.bounding_box()
+            z0, z1 = bb.min.Z, bb.max.Z
+            ztol = max(1e-6, (z1 - z0) * 1e-3)
+            if scope >= 3:
+                edges = list(part.edges())
+            else:
+                edges = []
+                for e in part.edges():
+                    z = e.center().Z
+                    near_top = abs(z - z1) <= ztol
+                    near_bot = abs(z - z0) <= ztol
+                    if ((scope == 1 and near_top)
+                            or (scope == 2 and (near_top or near_bot))):
+                        edges.append(e)
+            if edges:
+                try:
+                    if em == "chamfer":
+                        part = part.chamfer(ev, None, edges)
+                    else:
+                        part = part.fillet(ev, edges)
+                except Exception:
+                    raise ValueError("倒角/圆角失败：数值过大或边不适合")
+
+        return BrepShape(part.moved(bd.Pos(dx, dy, zoff)))
+
     def part(self):
         return self._part
 
@@ -470,9 +672,9 @@ class BrepShape:
                 self._triangulateLocal()
             return self._applyMeshXf(self._meshTriCache)
         if self._meshCache is not None:
-            return self._meshCache
+            return self._applyMeshXf(self._meshCache)
         self._triangulateLocal()
-        return self._meshCache
+        return self._applyMeshXf(self._meshCache)
 
     def _triangulateLocal(self) -> None:
         """三角化管线（不含实例仿射），结果存 _meshTriCache（纯网格）或
@@ -610,6 +812,7 @@ class BrepShape:
         # 即硬边），曲面区仍全平滑。
         mesh_shaded = False
         self._meshOnly = bool(n_faces) and n_no_surf == n_faces
+        self._meshOnlyKnown = True    # 同一次面遍历已判定，避免重复遍历
         if n_faces and n_no_surf == n_faces:
             try:
                 verts, tris, vn = _meshShadedNormals(verts, tris)
@@ -750,23 +953,41 @@ class BrepShape:
                 "faceRanges": ranges,
             }
 
+    def _pendingAffine(self):
+        """组合待施加仿射：纯网格累积 _meshXf ⊕ 交互预览 _previewXf。
+
+        两者互斥出现（纯网格 shape 不进 B-Rep 预览态），同时存在时
+        _meshXf 为外层（左乘）。None = 无待施加变换。
+        """
+        a, b = self._meshXf, self._previewXf
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a @ b
+
     def _applyMeshXf(self, base: dict) -> dict:
-        """把实例仿射 `_meshXf` 施加到本地三角化缓存（廉价 numpy 运算）。
+        """把待施加仿射（_meshXf/_previewXf）作用到本地三角化缓存。
 
         顶点：仿射变换；法向：逆转置变换后归一化（仿射变换下表面法向
-        的正确变换，旋转/平移/缩放都成立）。返回新 dict（不修改缓存）。"""
-        if self._meshXf is None:
+        的正确变换，旋转/平移/缩放都成立）。纯平移快路：线性段为单位
+        阵时法向不变，跳过逆置（移动拖动每帧的大头）。返回新 dict
+        （不修改缓存）。"""
+        m = self._pendingAffine()
+        if m is None:
             return base
-        m = self._meshXf
         lin = m[:3, :3]
         verts = base["verts"] @ lin.T + m[:3, 3]
-        try:
-            nrm = base["normals"] @ np.linalg.inv(lin).T
-            ln = np.linalg.norm(nrm, axis=1)
-            ln[ln < 1e-18] = 1.0
-            nrm = nrm / ln[:, None]
-        except Exception:
+        if np.allclose(lin, np.eye(3)):
             nrm = base["normals"]
+        else:
+            try:
+                nrm = base["normals"] @ np.linalg.inv(lin).T
+                ln = np.linalg.norm(nrm, axis=1)
+                ln[ln < 1e-18] = 1.0
+                nrm = nrm / ln[:, None]
+            except Exception:
+                nrm = base["normals"]
         return {"verts": verts, "normals": nrm, "tris": base["tris"],
                 "faceRanges": base["faceRanges"]}
 
@@ -780,21 +1001,26 @@ class BrepShape:
         self._vertsCache = None
         self._faceCache = None
         self._vertsCache = None
+        self._meshOnlyKnown = False   # part 已变，纯网格判定需重算
 
     def facePoints(self) -> List[List[Point3D]]:
         """全部三角片（面填充绘制用；与 triangulate 的 tris 一致）。
 
-        基于 triangulate 缓存，结果再缓存（渲染每帧 topology 重查）。"""
-        if self._faceCache is not None:
+        基于 triangulate 缓存，结果再缓存（渲染每帧 topology 重查）。
+        有待施加仿射时旁路缓存（缓存为基准几何，直接返回会丢变换）。"""
+        pending = self._pendingAffine() is not None
+        if self._faceCache is not None and not pending:
             return self._faceCache
         m = self.triangulate()
         if m is None:
-            self._faceCache = []
-            return self._faceCache
+            if not pending:
+                self._faceCache = []
+            return []
         verts, tris = m["verts"], m["tris"]
         out = [[Point3D(float(verts[i][0]), float(verts[i][1]),
                         float(verts[i][2])) for i in t] for t in tris]
-        self._faceCache = out
+        if not pending:
+            self._faceCache = out
         return out
 
     def triangles(self) -> np.ndarray:
@@ -924,18 +1150,16 @@ class BrepShape:
                     out.append((tuple(vv[elo[ea]]), tuple(vv[ehi[ea]])))
                 self._polyCache = out
                 base = out
-            # 本地折线 → 实例仿射（变换每次重建拓扑时施加）
-            if self._meshXf is None:
+            # 本地折线 → 待施加仿射（变换每次重建拓扑时施加）
+            xf = self._pendingAffine()
+            if xf is None:
                 return [list(p) for p in base]
-            lin = self._meshXf[:3, :3]
-            off = self._meshXf[:3, 3]
-            res = []
-            for poly in base:
-                arr = np.asarray(poly, dtype=np.float64) @ lin.T + off
-                res.append([tuple(p) for p in arr])
-            return res
+            return self._affinePolys(base, xf)
         if self._polyCache is not None:
-            return self._polyCache
+            xf = self._pendingAffine()
+            if xf is None:
+                return self._polyCache
+            return self._affinePolys(self._polyCache, xf)
         out = []
         for e in self.edges():
             pts = []
@@ -976,20 +1200,48 @@ class BrepShape:
             if pts:
                 out.append(pts)
         self._polyCache = out
-        return out
+        # 待施加仿射（纯网格累积/交互预览）：基准折线一次性矩阵乘后返回
+        xf = self._pendingAffine()
+        if xf is None:
+            return out
+        return self._affinePolys(out, xf)
+
+    @staticmethod
+    def _affinePolys(polys, xf: np.ndarray):
+        """折线集合施加仿射：全部点堆叠成一次矩阵乘后按长度切回。
+
+        逐点 tuple 化在 1200 边实体上实测 48ms/帧（拖动卡顿源之一）；
+        堆叠后只剩每条折线一次切片（视图，无拷贝）。返回 list[ndarray]，
+        消费方（投影/拾取）按序列用，与 tuple 列表等价。"""
+        if not polys:
+            return []
+        lin = xf[:3, :3]
+        off = xf[:3, 3]
+        lens = [len(p) for p in polys]
+        flat = np.concatenate(
+            [np.asarray(p, dtype=np.float64).reshape(-1, 3) for p in polys])
+        flat = flat @ lin.T + off
+        res = []
+        i = 0
+        for n in lens:
+            res.append(flat[i:i + n])
+            i += n
+        return res
 
     def edgePolylines(self) -> List[List[Tuple[float, float, float]]]:
         return self.featureEdgePolylines()
 
     def verts(self) -> List[Tuple[float, float, float]]:
-        if self._vertsCache is not None:
+        # 有待施加仿射时缓存旁路（缓存是基准几何，直接返回会丢变换）
+        if self._vertsCache is not None and self._pendingAffine() is None:
             return self._vertsCache
         m = self.triangulate()
         if m is None:
             self._vertsCache = []
             return self._vertsCache
         out = [tuple(v) for v in m["verts"]]
-        self._vertsCache = out
+        if self._pendingAffine() is None:
+            self._vertsCache = out
         return out
 
     # ---------------- 包围盒 ----------------
@@ -1000,13 +1252,14 @@ class BrepShape:
         bb = self._part.bounding_box()
         corners = [(bb.min.X, bb.min.Y, bb.min.Z),
                    (bb.max.X, bb.max.Y, bb.max.Z)]
-        # 纯网格 shape 的实例仿射：基准包围盒 8 角施加累积矩阵
-        if self._meshXf is not None:
+        # 待施加仿射（纯网格累积/交互预览）：基准包围盒 8 角施加矩阵
+        xf = self._pendingAffine()
+        if xf is not None:
             cs = [(x, y, z)
                   for x in (bb.min.X, bb.max.X)
                   for y in (bb.min.Y, bb.max.Y)
                   for z in (bb.min.Z, bb.max.Z)]
-            arr = (self._meshXf @ np.array(
+            arr = (xf @ np.array(
                 [(*c, 1.0) for c in cs]).T).T[:, :3]
             corners = [(arr[:, 0].min(), arr[:, 1].min(), arr[:, 2].min()),
                        (arr[:, 0].max(), arr[:, 1].max(), arr[:, 2].max())]
@@ -1025,6 +1278,10 @@ class BrepShape:
         m[:3, 3] = (float(dx), float(dy), float(dz))
         if self._meshXfUpdate(m):
             return
+        if self._previewXf is not None:
+            # 交互预览中：只累积仿射，不碰 OCCT（释放时一次性烘焙）
+            self._previewXf = m @ self._previewXf
+            return
         # transform=True 烘焙进几何。默认 moved(location) 只挂 location，
         # 后续 scale 会绕"location 位置"缩放并把几何/位置错位组合——
         # 实测 T(-60) 后 S(.5) 把 z∈[-60,60] 映成 [-120,-60]（应在
@@ -1036,12 +1293,16 @@ class BrepShape:
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
         if self._part is None:
             return
-        # Rodrigues 旋转矩阵（绕过原点、方向 (ax,ay,az)，度）
+        # Rodrigues 旋转矩阵（绕过原点、方向 (ax,ay,az)，**弧度**）。
+        # 单位约定与 CurveObject/PolySolid/BaseObject 全家一致——调用方
+        # （gizmo 拖动 / edit_commands 旋转 / circularArray）传的都是弧度；
+        # 旧代码按度解读导致 B-Rep 旋转实际只转 1/57（弧度值被当度数），
+        # build123d 侧才需要转回度。
         ln = math.sqrt(ax * ax + ay * ay + az * az)
         if ln < 1e-12:
             return
         ux, uy, uz = ax / ln, ay / ln, az / ln
-        t = math.radians(angle)
+        t = float(angle)
         c, s = math.cos(t), math.sin(t)
         C = 1.0 - c
         m = np.array([
@@ -1051,10 +1312,14 @@ class BrepShape:
             [0.0, 0.0, 0.0, 1.0]])
         if self._meshXfUpdate(m):
             return
+        if self._previewXf is not None:
+            self._previewXf = m @ self._previewXf
+            return
         bd = _import_bd()
         axis = bd.Axis((0.0, 0.0, 0.0), (ax, ay, az))
         # 同 translate：烘焙几何（默认挂 location，与 scale 组合会错位）
-        self._part = self._part.rotate(axis, float(angle), transform=True)
+        self._part = self._part.rotate(axis, math.degrees(t),
+                                       transform=True)
         self._clearCache()
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
@@ -1063,23 +1328,143 @@ class BrepShape:
         m = np.diag([float(sx), float(sy), float(sz), 1.0])
         if self._meshXfUpdate(m):
             return
+        if self._previewXf is not None:
+            self._previewXf = m @ self._previewXf
+            return
         # 显式绕世界原点缩放（BaseObject.scaleAround 用 T/S/T 包裹实现
         # 绕心缩放）。about=None 时绕"location 位置"——与挂 location 的
         # 平移/旋转组合会产生双重偏移（见 translate 注释）。
         self._part = self._part.scale((sx, sy, sz), about=(0.0, 0.0, 0.0))
         self._clearCache()
 
+    # ---------------- 交互预览（拖动期绕开 OCCT） ----------------
+
+    def beginPreview(self) -> None:
+        """进入交互预览态：后续 translate/rotate/scale 只把 4×4 仿射
+        累积进 _previewXf（读取路径廉价施加），不碰 OCCT。
+
+        拖动每帧成本从「BRepBuilderAPI_Transform + 全量重三角化 +
+        边重采样」（实测 15ms~3.9s/帧）降为 numpy 矩阵乘（<10ms），
+        释放时 commitPreview 一次性烘焙，几何与直接变换严格一致。
+        """
+        if self._part is None:
+            return
+        if self._previewXf is None:
+            self._previewXf = np.eye(4)
+
+    def inPreview(self) -> bool:
+        return self._previewXf is not None
+
+    @staticmethod
+    def _decomposeAffine(lin: np.ndarray):
+        """线性段分解（R 正交、S 对角），返回 (R, s, mode) 或 None。
+
+        col 模式：归一化列 → L = R·diag(s)（旋转在缩放之左，复合线性
+        段呈「先旋转后缩放」序）；row 模式：归一化行 → L = diag(s)·R
+        （「先缩放后旋转」序）。gizmo 单次拖动模式单一（移动/旋转/缩放
+        不混），两种序覆盖全部真实场景；都不正交（镜像/剪切）返回 None，
+        调用方走整体矩阵烘焙。"""
+        for mode in ("col", "row"):
+            if mode == "col":
+                s = np.linalg.norm(lin, axis=0)
+                safe = np.where(s > 1e-12, s, 1.0)
+                R = lin / safe
+            else:
+                s = np.linalg.norm(lin, axis=1)
+                safe = np.where(s > 1e-12, s, 1.0)
+                R = (lin.T / safe).T
+            if np.allclose(R @ R.T, np.eye(3), atol=1e-6) and \
+                    abs(float(np.linalg.det(R)) - 1.0) < 1e-6:
+                return R, s, mode
+        return None
+
+    def commitPreview(self) -> bool:
+        """把累积仿射一次性烘焙进 Part（拖动释放/确认时调用）。
+
+        分解 T·R·S 后依次走本类的 scale/rotate/translate（transform=True
+        烘焙）——与「每步直接烘焙」严格同源（回归验证几何一致），不引入
+        新的 OCCT API 面。镜像/剪切等病态复合回退 transform_geometry
+        （GTransform 整体矩阵烘焙）。返回是否有烘焙。
+        """
+        if self._previewXf is None or self._part is None:
+            return False
+        xf = self._previewXf
+        self._previewXf = None
+        if np.allclose(xf, np.eye(4), atol=1e-12):
+            return False        # 空拖动：无变化
+        lin = xf[:3, :3]
+        t = xf[:3, 3]
+        dec = self._decomposeAffine(lin)
+        if dec is None:
+            # 病态复合：整体矩阵烘焙（gp_GTrsf 支持任意仿射）
+            bd = _import_bd()
+            m = bd.Matrix([[float(xf[r, c]) for c in range(4)]
+                           for r in range(4)])
+            self._part = self._part.transform_geometry(m)
+            self._clearCache()
+            return True
+        R, s, mode = dec
+        need_scale = not np.allclose(s, 1.0, atol=1e-12)
+        need_rotate = not np.allclose(R, np.eye(3), atol=1e-9)
+
+        def _do_rotate():
+            ang = math.acos(max(-1.0, min(1.0, (float(np.trace(R)) - 1.0)
+                                          / 2.0)))
+            s2 = 2.0 * math.sin(ang)
+            if s2 > 1e-9:
+                axis = ((R[2, 1] - R[1, 2]) / s2,
+                        (R[0, 2] - R[2, 0]) / s2,
+                        (R[1, 0] - R[0, 1]) / s2)
+            else:
+                # 180°：轴取 (R+I) 最长列（对称部分主方向）
+                M = R + np.eye(3)
+                k = int(np.argmax(np.linalg.norm(M, axis=0)))
+                col = M[:, k]
+                n = float(np.linalg.norm(col))
+                axis = (float(col[0] / n), float(col[1] / n),
+                        float(col[2] / n)) if n > 1e-12 else (0.0, 0.0, 1.0)
+            self.rotate(ang, axis[0], axis[1], axis[2])
+
+        # 复合矩阵语义：先做的变换在右。col 模式 L=R·diag(s)（缩放先、
+        # 旋转后）；row 模式 L=diag(s)·R（旋转先、缩放后）。
+        if mode == "col":
+            if need_scale:
+                self.scale(float(s[0]), float(s[1]), float(s[2]))
+            if need_rotate:
+                _do_rotate()
+        else:
+            if need_rotate:
+                _do_rotate()
+            if need_scale:
+                self.scale(float(s[0]), float(s[1]), float(s[2]))
+        # T → 平移
+        if np.any(np.abs(t) > 1e-12):
+            self.translate(float(t[0]), float(t[1]), float(t[2]))
+        return True
+
+    def discardPreview(self) -> None:
+        """丢弃预览仿射（Esc 取消拖动）：恢复到进入预览前的几何。"""
+        self._previewXf = None
+
     # ---------------- 纯网格 shape 的 numpy 仿射 ----------------
 
     def _isMeshOnlyShape(self) -> bool:
-        """全部面无解析曲面（STL 导入的纯网格面）。"""
+        """全部面无解析曲面（STL 导入的纯网格面）。
+
+        结果是 part 的纯函数（part 不可变），缓存到 _meshOnlyKnown——
+        triangulate/_meshXfUpdate/featureEdgePolylines 每次都调它，
+        402 面实体一次全量 Surface_s 遍历实测 ~16ms，拖动每帧都付。"""
         if self._part is None:
             return False
+        if self._meshOnlyKnown:
+            return self._meshOnly
         try:
             from OCP.BRep import BRep_Tool
             faces = list(self._part.faces())
-            return bool(faces) and all(
+            self._meshOnly = bool(faces) and all(
                 BRep_Tool.Surface_s(f.wrapped) is None for f in faces)
+            self._meshOnlyKnown = True
+            return self._meshOnly
         except Exception:
             return False
 
@@ -1185,6 +1570,9 @@ class BrepShape:
         o._meshOnly = self._meshOnly
         o._meshXf = (None if self._meshXf is None
                      else self._meshXf.copy())
+        # 预览仿射随拷贝（撤销快照若在拖动中产生，恢复后几何一致）
+        o._previewXf = (None if self._previewXf is None
+                        else self._previewXf.copy())
         o._meshTriCache = self._meshTriCache
         return o
 

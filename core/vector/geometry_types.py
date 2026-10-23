@@ -28,6 +28,7 @@ class ObjectType(Enum):
     SURFACE = 13
     DIMENSION = 14
     BREP = 15      # OCC B-Rep 实体（BRepObject，持有 TopoDS_Shape）
+    REVCLOUD = 16  # 修订云线（RevcloudObject：bulge 弧闭合多段线）
 
 
 class CurveMode(Enum):

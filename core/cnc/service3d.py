@@ -232,46 +232,67 @@ def _surface_mesh(o) -> dict | None:
 # 水线切片：三角网格与水平面求交 → 闭合多边形（shapely）
 # --------------------------------------------------------------------------- #
 
+def _tri_z_extent(mesh: dict):
+    """每个三角形的 (zmin, zmax)；按 verts 数组身份缓存于 mesh（切片逐层复用）。
+
+    同一模型的多次水线切片共享网格，逐层重复扫描 13 万三角形只为筛出跨层
+    的一小部分（约 7 千）代价很高；缓存跨度后每层只做两次数组比较。
+    """
+    verts = mesh["verts"]
+    cached = mesh.get("_triZ")
+    if cached is not None and cached[0] is verts:
+        return cached[1], cached[2]
+    vz = verts[mesh["tris"]][:, :, 2]
+    lo = vz.min(axis=1)
+    hi = vz.max(axis=1)
+    mesh["_triZ"] = (verts, lo, hi)
+    return lo, hi
+
+
 def mesh_waterline(mesh: dict, z: float,
                    min_area: float = 1e-6) -> list[list[tuple[float, float]]]:
     """取模型在高度 z 的水平截面轮廓（外边界+岛），返回多边形点列。
 
-    每个三角形与平面相交得 0 或 2 个交点 → 线段；所有线段经 shapely
-    unary_union + polygonize 组装成闭合多边形，滤除噪声小环。
+    每个三角形与平面相交得 0 或 2 个交点 → 线段（向量化批量求交）；
+    所有线段经 _assemble_rings 组装成闭合多边形，滤除噪声小环。
     """
     verts, tris = mesh["verts"], mesh["tris"]
     z = float(z)
-    lines = []
-    v0 = verts[tris[:, 0]]
-    v1 = verts[tris[:, 1]]
-    v2 = verts[tris[:, 2]]
-    z0 = v0[:, 2]
-    z1 = v1[:, 2]
-    z2 = v2[:, 2]
-    # 三角形完全在平面一侧 → 跳过
-    above = np.maximum(np.maximum(z0, z1), z2) < z
-    below = np.minimum(np.minimum(z0, z1), z2) > z
-    keep = ~(above | below)
-    idx = np.nonzero(keep)[0]
+    # 用预缓存的三角形 z 跨度筛选跨层三角形（避免每层重扫全部三角形顶点）
+    tzlo, tzhi = _tri_z_extent(mesh)
+    idx = np.nonzero((tzlo <= z) & (tzhi >= z))[0]
     if len(idx) == 0:
         return []
-    for ti in idx:
-        pts3 = np.array([v0[ti], v1[ti], v2[ti]])
-        hits = []
-        for k in range(3):
-            a, b = pts3[k], pts3[(k + 1) % 3]
-            za, zb = a[2], b[2]
-            if abs(zb - za) < 1e-12:
-                continue
-            if (za - z) * (zb - z) <= 0.0:
-                t = (z - za) / (zb - za)
-                hits.append((a[0] + (b[0] - a[0]) * t,
-                             a[1] + (b[1] - a[1]) * t))
-        if len(hits) >= 2:
-            lines.append((hits[0], hits[1]))
-    if not lines:
+    # 跨平面的三角形：对 3 条边批量求与 z 平面的交点（端点在 3 个顶点上环绕）
+    vv = verts[tris[idx]]                                # (K,3,3)
+    vn = np.roll(vv, -1, axis=1)                          # 每条边的终点
+    za = vv[:, :, 2]
+    zb = vn[:, :, 2]
+    dz = zb - za
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # dz=0 的水平边会得到 inf/nan，但这些位置随后被 hit 掩掉，不参与结果
+        t = (z - za) / dz
+        hx = vv[:, :, 0] + (vn[:, :, 0] - vv[:, :, 0]) * t
+        hy = vv[:, :, 1] + (vn[:, :, 1] - vv[:, :, 1]) * t
+    # 与 z 严格相交（不含水平边），且交点落在边内 → 命中
+    hit = (np.abs(dz) >= 1e-12) & ((za - z) * (zb - z) <= 0.0)
+    cnt = hit.sum(axis=1)
+    ok = cnt >= 2
+    if not ok.any():
         return []
-    rings = _assemble_rings(lines)
+    hx, hy, hit = hx[ok], hy[ok], hit[ok]
+    # 取每条边序（0/1/2）中最早命中的两条 → 与原逐边 append 顺序一致
+    rows = np.arange(len(hx))
+    e1 = np.argmax(hit, axis=1)
+    hit2 = hit.copy()
+    hit2[rows, e1] = False
+    e2 = np.argmax(hit2, axis=1)
+    segs = np.empty((len(hx), 2, 2), dtype=np.float64)
+    segs[:, 0, 0] = hx[rows, e1]
+    segs[:, 0, 1] = hy[rows, e1]
+    segs[:, 1, 0] = hx[rows, e2]
+    segs[:, 1, 1] = hy[rows, e2]
+    rings = _assemble_rings(segs)
     out: list[list[tuple[float, float]]] = []
     for r in rings:
         if len(r) < 3:
@@ -283,48 +304,89 @@ def mesh_waterline(mesh: dict, z: float,
     return out
 
 
-def _assemble_rings(segments: list) -> list:
-    """线段自组装成闭合环（替代 shapely polygonize：端点浮点差 1e-6
-    会导致 polygonize 失败，这里按坐标聚类后沿度 2 顶点走环）。"""
-    from collections import defaultdict
-    adj: dict = defaultdict(list)
-    for a, b in segments:
-        ka = (round(a[0], 6), round(a[1], 6))
-        kb = (round(b[0], 6), round(b[1], 6))
-        adj[ka].append(kb)
-        adj[kb].append(ka)
-    used: set = set()
+def _cluster_endpoints(flat: np.ndarray):
+    """端点按 1e-6 网格聚类为整数节点，返回 (nodes (N,2) f8, inv (2M,) i8)。
+
+    把 (x,y)*1e6 折叠成一维 int64 键后 np.unique，比 np.unique(axis=0) 快约
+    6×；键序与 (x,y) 字典序一致，故节点编号与 axis=0 版本完全相同。坐标范围
+    过大可能溢出 int64 时（跨度乘积 ≥ 2^62）回退 axis=0。
+    """
+    kn = np.round(flat, 6)
+    qi = np.rint(kn * 1e6).astype(np.int64)
+    qmin = qi.min(axis=0)
+    rng = qi.max(axis=0) - qmin + 1
+    if int(rng[0]) * int(rng[1]) >= (1 << 62):
+        nodes, inv = np.unique(kn, axis=0, return_inverse=True)
+        return nodes, inv.reshape(-1).astype(np.int64)
+    key = (qi[:, 0] - qmin[0]) * rng[1] + (qi[:, 1] - qmin[1])
+    _uk, idx, inv = np.unique(key, return_index=True, return_inverse=True)
+    return kn[idx], inv.reshape(-1).astype(np.int64)
+
+
+def _assemble_rings(segments) -> list:
+    """线段自组装成闭合环。
+
+    端点按 1e-6 网格聚类为整数节点（一维键 np.unique 排序 → 确定性），邻接表
+    存 (邻节点, 边 id)，走环时用 bytearray 标记已用边。无向边去重与自环“压
+    两条”语义、邻接插入顺序均与原逐段 round+dict+线性扫描实现逐环等价。
+    每条边走一步即被消费，故走环必然终止（无需计数保护）。
+    """
+    if len(segments) == 0:
+        return []
+    seg = np.asarray(segments, dtype=np.float64)
+    if seg.ndim != 3 or seg.shape[1:] != (2, 2):
+        return []
+    nodes, inv = _cluster_endpoints(seg.reshape(-1, 2))
+    u = inv[0::2]
+    v = inv[1::2]
+    n_node = len(nodes)
+    # 无向边去重：键 = min*n_node + max（与 (min,max) 排序一致）；保留“首次出现
+    # 顺序”，使邻接插入顺序与原逐段实现一致（原实现同端点对的线段会被折叠成
+    # 一条，含零长自环；否则平面过顶点时重复边会各插一次形成重复顶点）。
+    key = np.minimum(u, v) * n_node + np.maximum(u, v)
+    _, first = np.unique(key, return_index=True)
+    fi = first[np.argsort(first, kind="stable")]
+    ea = u[fi].tolist()          # 保留原始段方向（决定 adj 键插入顺序）
+    eb = v[fi].tolist()
+    n_edge = len(ea)
+    adj: dict = {}
+    setdef = adj.setdefault
+    for e in range(n_edge):
+        a = ea[e]
+        b = eb[e]
+        setdef(a, []).append((b, e))
+        setdef(b, []).append((a, e))
+        if a == b:
+            setdef(a, []).append((a, e))      # 自环：原实现压入两条
+    used = bytearray(n_edge)
     rings: list = []
-    for start in list(adj.keys()):
-        if not adj.get(start):
-            continue
+    for start in adj.keys():
         ring = [start]
         cur = start
-        prev = None
-        guard = 0
-        while guard < 100000:
-            guard += 1
-            nxts = [n for n in adj[cur] if n != prev]
-            if not nxts:
-                break
+        prev = -1
+        while True:
             cand = None
-            for n in nxts:
-                key = frozenset((cur, n))
-                if key not in used:
-                    cand = n
+            cand_any = None
+            for e in adj[cur]:
+                if e[0] == prev:
+                    continue
+                if cand_any is None:
+                    cand_any = e
+                if not used[e[1]]:
+                    cand = e
                     break
             if cand is None:
-                cand = nxts[0]
-            key = frozenset((cur, cand))
-            if key in used:
+                cand = cand_any
+            if cand is None or used[cand[1]]:
                 break
-            used.add(key)
-            ring.append(cand)
-            prev, cur = cur, cand
-            if cand == start:
+            used[cand[1]] = 1
+            ring.append(cand[0])
+            prev, cur = cur, cand[0]
+            if cand[0] == start:
                 break
         if len(ring) >= 4:
             rings.append(ring)
+    nodepy = nodes.tolist()
     out: list = []
     seen: set = set()
     for r in rings:
@@ -335,7 +397,7 @@ def _assemble_rings(segments: list) -> list:
             continue
         seen.add(sig)
         if len(r) >= 3:
-            out.append(r)
+            out.append([(nodepy[i][0], nodepy[i][1]) for i in r])
     return out
 
 
@@ -370,6 +432,14 @@ def _rings_to_regions(rings: list) -> list:
             continue
     if not polys:
         return []
+    # 包围盒预筛：a.contains(b) 的必要条件是 a 的 bbox 含 b 的 bbox，
+    # 先比 bbox（纯元组比较）再调 shapely contains，跳过绝大多数无谓调用
+    bounds = [p.bounds for p in polys]
+
+    def _bbox_holds(inner_b, outer_b):
+        return (inner_b[0] >= outer_b[0] and inner_b[1] >= outer_b[1]
+                and inner_b[2] <= outer_b[2] and inner_b[3] <= outer_b[3])
+
     # 包含深度：被几个更大的环包含（面积排序后 O(n²)，n=环数，很小）
     order = sorted(range(len(polys)), key=lambda i: polys[i].area, reverse=True)
     depth = [0] * len(polys)
@@ -377,6 +447,8 @@ def _rings_to_regions(rings: list) -> list:
         ia = order[a]
         for b in range(a + 1, len(order)):
             ib = order[b]
+            if not _bbox_holds(bounds[ib], bounds[ia]):
+                continue
             try:
                 if polys[ia].contains(polys[ib]):
                     depth[ib] += 1
@@ -389,6 +461,8 @@ def _rings_to_regions(rings: list) -> list:
     for hi in holes:
         host = None
         for oi in outers:
+            if not _bbox_holds(bounds[hi], bounds[oi]):
+                continue
             try:
                 if polys[oi].contains(polys[hi]) and \
                         (host is None or polys[oi].area < polys[host].area):
@@ -396,7 +470,14 @@ def _rings_to_regions(rings: list) -> list:
             except Exception:
                 continue
         if host is not None:
-            holes_of[host].append(polys[hi].exterior.coords)
+            g = polys[hi]
+            if g.geom_type == "Polygon":
+                holes_of[host].append(g.exterior.coords)
+            else:
+                # 无效/自交环经 buffer(0) 可能变成 MultiPolygon（无 .exterior）：
+                # 退回逐部件的边界作为孔，避免此处 AttributeError 崩溃
+                for part in getattr(g, "geoms", ()):
+                    holes_of[host].append(part.exterior.coords)
     regions = []
     for oi in outers:
         try:

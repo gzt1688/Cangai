@@ -1,4 +1,4 @@
-﻿"""编辑命令：Chamfer 倒角 / Trim 修剪（移植自原 C++ 项目）。
+"""编辑命令：Chamfer 倒角 / Trim 修剪（移植自原 C++ 项目）。
 
 交互流程：
 - Chamfer 倒角：
@@ -1905,6 +1905,14 @@ class _PanelXformBase(CommandInstance):
                 c = Point3D(cx, cy, cz)
                 for o in objs:
                     o.scaleAround(inv, inv, inv, c)
+        elif self._editKind == "scale3":
+            sx, sy, sz, cx, cy, cz = delta
+            c = Point3D(cx, cy, cz)
+            ix = 1.0 / sx if abs(sx) > 1e-12 else 1.0
+            iy = 1.0 / sy if abs(sy) > 1e-12 else 1.0
+            iz = 1.0 / sz if abs(sz) > 1e-12 else 1.0
+            for o in objs:
+                o.scaleAround(ix, iy, iz, c)
 
     def _applyDelta(self, delta) -> None:
         """按新 delta 对真实对象施加变换（调用方先 _invertPrev）。
@@ -1929,6 +1937,11 @@ class _PanelXformBase(CommandInstance):
             c = Point3D(cx, cy, cz)
             for o in objs:
                 o.scaleAround(k, k, k, c)
+        elif self._editKind == "scale3":
+            sx, sy, sz, cx, cy, cz = delta
+            c = Point3D(cx, cy, cz)
+            for o in objs:
+                o.scaleAround(sx, sy, sz, c)
         # 通知 2D/3D 场景：这些对象几何变了，该重画/重算 path
         if self._doc is not None:
             for o in objs:
@@ -2342,6 +2355,162 @@ class PanelScaleCommand(_PanelXformBase):
         self._p3: Optional[Point3D] = None  # 目标点
         self._cursor: Optional[Point3D] = None
         self._kbInput: str = ""             # 键盘输入目标长度缓冲
+        self._panel = None
+        self._mode: str = "point"           # "point" 三点缩放 / "object" 对象模式
+        # 对象模式需要跟随选择变化刷新基准对象下拉
+        if self._doc is not None:
+            self._doc.selectionChanged.connect(self._onDocSelChanged)
+
+    def _onDocSelChanged(self) -> None:
+        """选择变化：基准对象若已不在选中集里，则同步清掉，避免误缩放旧对象。"""
+        if self._panel is None or self._mode != "object":
+            return
+        ref = self._panel.refObject()
+        if ref is None:
+            return
+        ids = {o.id() for o in self._unlockedSelected()}
+        if ref.id() not in ids:
+            self._panel.setRefObject(None)
+
+    def _pickRefObject(self, wp: Point3D) -> None:
+        """对象模式下在画布上点选基准对象。"""
+        pick = self._pickObject(wp)
+        if pick is None:
+            self._msg = "未拾取到对象，请点击对象轮廓"
+            self._emitPrompt()
+            return
+        # 点选的对象若未在选中集中，一并选中，保证它也会被缩放
+        if self._doc is not None and \
+                pick.id() not in {o.id() for o in self._unlockedSelected()}:
+            try:
+                self._doc.selectObject(pick.id(), append=True)
+            except Exception:
+                pass
+        self._panel.setRefObject(pick)
+        self._msg = ""
+        self._emitPrompt()
+
+    def _disconnectSelection(self) -> None:
+        if self._doc is not None:
+            try:
+                self._doc.selectionChanged.disconnect(self._onDocSelChanged)
+            except Exception:
+                pass
+
+    def finish(self) -> None:
+        self._disconnectSelection()
+        super().finish()
+
+    def cancel(self) -> None:
+        self._disconnectSelection()
+        super().cancel()
+
+    def paramPanel(self):
+        from ui.commands.param_panels import PanelScaleParamPanel
+        if self._panel is None:
+            self._panel = PanelScaleParamPanel()
+            self._panel.paramsChanged.connect(self._updatePreview)
+            self._panel.confirmed.connect(self._onPanelApply)
+            self._panel.cancelRequested.connect(self.cancel)
+            self._panel.modeChanged.connect(self._onModeChanged)
+            self._panel.objectConfirmed.connect(self._applyObjectScale)
+        return self._panel
+
+    # ---------- 参数面板：模式切换 / 对象模式 ----------
+
+    def _onModeChanged(self, mode: str) -> None:
+        """点模式 ↔ 对象模式：重置点拾取状态与实时事务，避免残留预览。"""
+        self._mode = mode
+        self._p1 = self._p2 = self._p3 = None
+        self._cursor = None
+        self._kbInput = ""
+        self._cancelLiveEdit()
+        self._setPreviewPath(QPainterPath())
+        self._hideCursorMarker()
+        self._msg = ""
+        self._emitPrompt()
+
+    def _onPanelApply(self) -> None:
+        """点模式面板「应用目标长度」：等价于按当前目标长度确认。"""
+        if self._mode != "point":
+            return
+        p3 = self._kbTargetPoint()
+        if p3 is None and self._panel is not None and self._p2 is not None:
+            # 没有键盘缓冲时，用面板输入的目标长度沿 P1→P2 方向生成 P3
+            u = self._directionUnit()
+            if u is not None and self._p1 is not None:
+                v = self._panel.targetLength()
+                p3 = Point3D(self._p1.x + u[0] * v,
+                             self._p1.y + u[1] * v,
+                             self._p1.z + u[2] * v)
+        if p3 is None:
+            self._msg = "请先点基准点和参考起点"
+            self._emitPrompt()
+            return
+        self._p3 = p3
+        self._applyScale()
+
+    def _applyObjectScale(self) -> None:
+        """对象模式确认：按基准对象的包围盒尺寸做分轴缩放。
+
+        基准对象精确达到输入的 X/Y/Z 目标尺寸；同一比例施加到全部选中对象，
+        绕基准对象包围盒中心缩放（浮雕模型 Z 由高度场决定，sz 强制为 1）。
+        """
+        objs = self._unlockedSelected()
+        if not objs:
+            self._msg = "没有可缩放的对象，请先选中对象"
+            self._emitPrompt()
+            return
+        ref = self._panel.refObject() if self._panel is not None else None
+        if ref is None:
+            ref = objs[0]
+        try:
+            bb = ref.getBoundingBox()
+        except Exception:
+            bb = None
+        if bb is None or not bb.isValid():
+            self._msg = "基准对象没有有效包围盒"
+            self._emitPrompt()
+            return
+        cur = [bb.width(), bb.height(), bb.depth()]
+        tgt = list(self._panel.objectDims()) if self._panel is not None else cur
+        axis = self._panel.ratioAxis() if self._panel is not None else -1
+        if axis >= 0 and cur[axis] > 1e-9:
+            # 勾选等比：以该轴为主动轴，其余轴按同一比例联动
+            r = tgt[axis] / cur[axis]
+            factors = [r, r, r]
+        else:
+            factors = [(tgt[i] / cur[i]) if cur[i] > 1e-9 else 1.0
+                       for i in range(3)]
+        try:
+            from core.vector.object_type import ObjectType
+            if ref.type() == ObjectType.SURFACE:
+                factors[2] = 1.0   # 浮雕 Z 尺寸走“模型Z”，放置缩放不改
+        except Exception:
+            pass
+        if all(abs(f - 1.0) < 1e-9 for f in factors):
+            self._msg = "尺寸未改变"
+            self._emitPrompt()
+            return
+        sx, sy, sz = factors
+        center = Point3D((bb.min.x + bb.max.x) * 0.5,
+                         (bb.min.y + bb.max.y) * 0.5, 0.0)
+        self._startLiveEdit("scale3")
+        if not self._editActive:
+            self._msg = "缩放事务启动失败"
+            self._emitPrompt()
+            return
+        self._applyDelta((sx, sy, sz, center.x, center.y, center.z))
+        self._commitLiveEdit()
+        if self._doc is not None:
+            for o in objs:
+                self._doc.notifyObjectChanged(o.id())
+        self._notifyGizmoRefresh()
+        if self._manager is not None:
+            self._manager.notifyResult(
+                f"已按基准对象缩放 {len(objs)} 个对象"
+                f"（X×{sx:.4f}  Y×{sy:.4f}  Z×{sz:.4f}）")
+        self.finish()
 
     # ---------- 状态辅助 ----------
 
@@ -2396,6 +2565,12 @@ class PanelScaleCommand(_PanelXformBase):
     def prompt(self) -> str:
         if self._msg:
             return self._msg
+        if self._mode == "object":
+            if not self._unlockedSelected():
+                return "对象模式：先选中要缩放的对象"
+            if self._panel is None or self._panel.refObject() is None:
+                return "对象模式：在画布上点选基准对象"
+            return "对象模式：改尺寸（可勾等比）→ 点确认"
         if not self._selectedObjects:
             return "点击选中要缩放的对象，或先选中再点缩放基准点"
         if self._p1 is None:
@@ -2474,6 +2649,8 @@ class PanelScaleCommand(_PanelXformBase):
         self._emitPrompt()
 
     def onKeyPress(self, key, mods) -> bool:
+        if self._mode == "object":
+            return False    # 对象模式不占用键盘，交给面板/全局快捷键
         # P2 未点：键盘输入不拦截
         if self._p2 is None:
             return False
@@ -2510,6 +2687,9 @@ class PanelScaleCommand(_PanelXformBase):
 
     def onMousePress(self, wp: Point3D, mods) -> None:
         self._msg = ""
+        if self._mode == "object":
+            self._pickRefObject(wp)   # 对象模式：点选基准对象
+            return
         if not self._ensureSelectionFromPick(wp):
             return
         if self._p1 is None:
@@ -2537,7 +2717,7 @@ class PanelScaleCommand(_PanelXformBase):
 
     def onMouseMove(self, wp: Point3D, mods) -> None:
         self._cursor = wp
-        if self._p1 is None:
+        if self._mode == "object" or self._p1 is None:
             return
         self._setCursorMarker(wp)
         # 键盘输入阶段：仍允许光标移动，但 P3' 以键盘输入为准（预览已在 onKeyPress 更新过）
@@ -2735,7 +2915,99 @@ class PanelMeasureCommand(CommandInstance):
         self.finish()
 
 
+class TransferTo3DCommand(CommandInstance):
+    """转入3D：把 2D/浮雕空间选中的曲线复制到 3D 空间，并切到 3D 模式查看。
+
+    与「导入CNC」同为桥梁命令：不改动源曲线，复制一份独立对象（新 id）
+    进 3D 空间，因此在 3D 里编辑不会影响 2D 原稿，可反复转换。
+    """
+
+    # 可转换的对象类型（点位/文字/图片/尺寸/曲面/实体不参与）
+    _CURVE_TYPES = (ObjectType.LINE, ObjectType.CURVE,
+                    ObjectType.POLYCURVE, ObjectType.NURBS_CURVE,
+                    ObjectType.CIRCLE, ObjectType.ARC,
+                    ObjectType.ELLIPSE, ObjectType.RECTANGLE,
+                    ObjectType.REVCLOUD)
+
+    def name(self) -> str:
+        return "TransferTo3D"
+
+    def commandTitle(self) -> str:
+        return "转入3D"
+
+    def prompt(self) -> str:
+        return "转入3D：先选中 2D 曲线，再点此按钮（复制到 3D 空间并切换模式）"
+
+    def start(self) -> None:
+        super().start()
+        import uuid
+        from core.document import SPACE_2D, SPACE_3D, objectFromDict
+        doc = self._doc
+        if doc is None:
+            self.finish()
+            return
+        if doc.space() != SPACE_2D:
+            self._notify("「转入3D」请在 2D 或浮雕模式下使用（3D/CNC 空间无需转换）")
+            self.finish()
+            return
+        sel = [o for o in doc.objects()
+               if o.isSelected() and o.type() in self._CURVE_TYPES
+               and not o.isLocked()]
+        if not sel:
+            self._notify("请先选中要转入 3D 的曲线")
+            self.finish()
+            return
+        doc.beginEdit()
+        count = 0
+        clones = []
+        try:
+            for o in sel:
+                data = o.serialize()
+                data["id"] = uuid.uuid4().hex    # 新 id：与 2D 原稿完全独立
+                clone = objectFromDict(data)
+                if clone is None:
+                    continue
+                doc.addObject(clone, space=SPACE_3D)
+                count += 1
+                clones.append(clone)
+        finally:
+            doc.endEdit()
+        if not count:
+            self._notify("所选对象无法转入 3D")
+            self.finish()
+            return
+        # 先切到 3D 模式（切空间会清空选中集），再选中新对象，
+        # 切过去即可直接编辑/挤出
+        self._notify(f"已把 {count} 条曲线转入 3D 空间并切换到 3D 模式"
+                     "（2D 原曲线保留）")
+        self._switchTo3D()
+        if doc.space() == SPACE_3D:
+            for c in clones:
+                doc.selectObject(c.id(), True)
+        self.finish()
+
+    @staticmethod
+    def _switchTo3D() -> None:
+        try:
+            from PySide6.QtWidgets import QApplication
+            for w in QApplication.topLevelWidgets():
+                bar = getattr(w, "_canvasModeBar", None)
+                if bar is not None:
+                    bar.setCurrent("3d", notify=True)
+                    break
+        except Exception:
+            pass
+
+    def _notify(self, text: str) -> None:
+        if self._manager is not None:
+            self._manager.notifyResult(text)
+
+    def onMousePress(self, wp: Point3D, mods) -> None: ...
+    def onMouseMove(self, wp: Point3D, mods) -> None: ...
+
+
 def registerAll(manager) -> None:
+    manager.register("TransferTo3D", TransferTo3DCommand)
     manager.register("Chamfer", ChamferCommand)
     manager.register("Trim", TrimCommand)
     manager.register("Array", ArrayCommand)

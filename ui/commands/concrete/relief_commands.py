@@ -26,16 +26,17 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPainterPath
+from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtGui import QPainterPath, QPolygonF, QBrush, QColor
 
 from core.vector.geometry_types import BoundingBox3D, ObjectType, Point3D
 from core.relief import HeightField
 from core.relief.region_relief import (apply_region_relief, sample_curve_points,
-                                       build_inside_mask)
+                                       build_inside_mask, resample_polyline)
 from core.relief.wall_curtain import (snap_band_to_platforms, DeJitterParams)
 from core.relief.sweep import (apply_sweep, sample_sweep_path,
                                 apply_brush_stamp, move_brush_region,
@@ -217,6 +218,12 @@ class ReconstructRelief(CommandInstance):
         return "重构网格"
 
 
+def _shp_point(x: float, y: float):
+    """shapely 点（延迟导入：不用区域识别时不加载）。"""
+    from shapely.geometry import Point
+    return Point(float(x), float(y))
+
+
 def _pointPolylineDistance(x: float, y: float, pts: np.ndarray) -> float:
     """世界点到折线的最小欧氏距离（拾取用）。"""
     ax, ay = pts[:-1, 0], pts[:-1, 1]
@@ -244,10 +251,25 @@ class RegionReliefCommand(CommandInstance):
     """
 
     _PICK_PX = 8.0      # 点选容差（屏幕像素）
+    _CURVE_STRICT_PX = 4.0   # 曲线优先的严格容差：真正压在线上才算"点曲线"
 
     def __init__(self) -> None:
         super().__init__()
         self._panel: RegionReliefParamPanel | None = None
+        # 区域识别缓存：(面列表[(shapely 面, 外环, [孔环])], STRtree)
+        self._regionFaces: tuple | None = None
+        self._regionTol: float | None = None
+        self._regionGen = 0                     # 线框版本号（栅格兜底缓存键）
+        self._regionDirty = True
+        self._regionSignalsOn = False
+        self._pickCache = None                  # [(闭合曲线, 采样点)] 拾取缓存
+        self._pickDirty = True
+        self._allPtsCache: list | None = None   # [(曲线, 采样点)] 全部曲线缓存
+        self._allPtsGen = -1
+        self._previewFace = None                # 当前悬停的面（含孔洞的原始面）
+        self._previewKey = None                 # 高亮对象去重键
+        self._lastFail: str | None = None       # 上次失败原因（跟在提示行末尾）
+        self._dbgInfo: dict = {}                # 最近一次区域识别的中间数据
 
     # ---------------- 面板 ----------------
 
@@ -255,9 +277,75 @@ class RegionReliefCommand(CommandInstance):
         super().start()
         self._lastWp = None
         self._baseSnap = None   # 命令内基准快照（首次塑形时取，命令内多次点选共用）
+        self._regionFaces = None
+        self._regionTol = None  # 建缓存时用的搭接容差（缩放变化过大时重建）
+        self._regionGen = 0
+        self._rasterCache = {}  # 栅格兜底：边界曲线集合 → 矢量面
+        self._rasterGrid = None # 栅格兜底：共享的连通域标记网格
+        self._lastFail = None   # 上次失败原因（跟在提示行末尾）
+        self._dbgInfo = {}
+        self._regionDirty = True
+        self._pickCache = None
+        self._pickDirty = True
+        self._allPtsCache = None
+        self._allPtsGen = -1
+        self._previewFace = None
+        self._previewKey = None
+        self._connectRegionSignals()
         clr = getattr(self._view, "clearSnapMarker", None)
         if callable(clr):
             clr()
+
+    def finish(self) -> None:
+        self._disconnectRegionSignals()
+        self._hideRegionPreview()
+        super().finish()
+
+    def cancel(self) -> None:
+        self._disconnectRegionSignals()
+        self._hideRegionPreview()
+        super().cancel()
+
+    def _connectRegionSignals(self) -> None:
+        doc = self._doc
+        if doc is None or self._regionSignalsOn:
+            return
+        for sig in (doc.objectAdded, doc.objectRemoved,
+                    doc.objectChanged, doc.layerChanged):
+            try:
+                sig.connect(self._onDocChangedForRegion)
+            except Exception:
+                pass
+        self._regionSignalsOn = True
+
+    def _disconnectRegionSignals(self) -> None:
+        doc = self._doc
+        if doc is None or not self._regionSignalsOn:
+            return
+        for sig in (doc.objectAdded, doc.objectRemoved,
+                    doc.objectChanged, doc.layerChanged):
+            try:
+                sig.disconnect(self._onDocChangedForRegion)
+            except Exception:
+                pass
+        self._regionSignalsOn = False
+
+    def _onDocChangedForRegion(self, *args) -> None:
+        """文档线框变化时让区域缓存失效（高度场变化不影响平面线框）。"""
+        oid = args[0] if args else ""
+        if oid and self._doc is not None:
+            try:
+                obj = self._doc.object(oid)
+            except Exception:
+                obj = None
+            if obj is not None and obj.type() == ObjectType.SURFACE:
+                return
+        self._regionDirty = True
+        self._regionGen = getattr(self, "_regionGen", 0) + 1
+        self._pickDirty = True
+        self._rasterCache = {}
+        self._rasterGrid = None
+        self._hideRegionPreview()
 
     def paramPanel(self):
         if self._panel is None:
@@ -278,6 +366,11 @@ class RegionReliefCommand(CommandInstance):
             except Exception:
                 pass
 
+    def _fail(self, text: str) -> None:
+        """报错同时留档：提示行（prompt）不会淡出，便于用户回看失败原因。"""
+        self._lastFail = str(text)
+        self._notify(text)
+
     def _curveObjects(self) -> list:
         """当前选中的曲线对象（排除浮雕模型与锁定对象）。"""
         if self._doc is None:
@@ -292,19 +385,97 @@ class RegionReliefCommand(CommandInstance):
 
     # ---------------- 执行 ----------------
 
+    def _modelForPolygon(self, poly):
+        """点击区域对应的浮雕模型：活动模型优先，否则自动找覆盖该区域的模型。
+
+        之前只认"活动模型"：若当前活动的不是光标下那块模型（或没有活动模型），
+        区域明明识别到了却提示"未命中"。这里按区域 bbox 与各模型世界 bbox 的
+        覆盖度自动匹配，活动模型只在它确实覆盖该区域时优先。
+        """
+        doc = self._doc
+        if doc is None or poly is None or poly.shape[0] < 3:
+            return self.activeModel()
+        try:
+            x0 = float(np.min(poly[:, 0]))
+            y0 = float(np.min(poly[:, 1]))
+            x1 = float(np.max(poly[:, 0]))
+            y1 = float(np.max(poly[:, 1]))
+        except Exception:
+            return self.activeModel()
+        area = max(1e-12, (x1 - x0) * (y1 - y0))
+        active = self.activeModel()
+        cov = []
+        for m in doc.reliefModels():
+            try:
+                bb = m.getBoundingBox()
+            except Exception:
+                continue
+            if bb is None or not bb.isValid():
+                continue
+            iw = min(x1, bb.max.x) - max(x0, bb.min.x)
+            ih = min(y1, bb.max.y) - max(y0, bb.min.y)
+            if iw <= 1e-9 or ih <= 1e-9:
+                continue
+            ratio = (iw * ih) / area
+            box_area = max(1e-12, bb.width() * bb.height())
+            # 活动模型只在它确实覆盖该区域（≥50%）时优先，否则按覆盖度择优；
+            # 任何有交集的模型都算候选（区域跨出模型时按模型范围裁剪即可）。
+            rank = 0 if (m is active and ratio >= 0.5) else 1
+            cov.append((rank, -ratio, box_area, m))
+        if not cov:
+            return None
+        cov.sort(key=lambda c: c[:3])
+        return cov[0][3]
+
+    def _notifyNoMove(self, poly, params, hf) -> None:
+        """区域已识别但没改到顶点：说清到底是哪一步没命中。"""
+        scope = getattr(params, "color_scope", "ignore")
+        if scope != "ignore":
+            self._fail("区域已识别，但被「颜色」作用范围过滤：请把作用区域改为『颜色无效』")
+            return
+        try:
+            hx0, hy0, hx1, hy1 = hf.bbox()
+            x0 = float(np.min(poly[:, 0]))
+            y0 = float(np.min(poly[:, 1]))
+            x1 = float(np.max(poly[:, 0]))
+            y1 = float(np.max(poly[:, 1]))
+            outside = x1 < hx0 or x0 > hx1 or y1 < hy0 or y0 > hy1
+        except Exception:
+            outside = False
+        if outside:
+            self._fail("区域已识别，但不在模型范围内：请把模型与曲线对齐")
+        elif float(params.base_height) <= 0.0 and \
+                float(getattr(params, "free_height", 0.0)) <= 0.0:
+            self._fail("区域已识别，但基高与高度都为 0：请先设置浮雕高度")
+        else:
+            self._fail("区域已识别，但模型栅格在该区域内没有顶点（区域太小或网格太粗）")
+
     def _applyToCurve(self, obj) -> None:
-        """对单条闭合曲线用当前面板参数起浮雕（点击即执行，可无限累加）。
+        """对单条闭合曲线用当前面板参数起浮雕（点击即执行，可无限累加）。"""
+        if self._panel is None:
+            return
+        poly = sample_curve_points(obj, self._panel.params().sample_count)
+        if poly.shape[0] < 3:
+            self._notify("曲线点数不足，无法起浮雕")
+            return
+        self._applyToPolygon(poly, None)
+
+    def _applyToPolygon(self, poly, holes=None) -> None:
+        """对一条闭合轮廓（可带内部孔洞环）起浮雕，可无限累加。
 
         设计原则：
-          * 永远不做"同曲线先回滚再重做"——这样同一条曲线反复点击就是纯累加
+          * 永远不做"同区域先回滚再重做"——同一区域反复点击就是纯累加
             (当 blend=add / subtract)，满足用户"无限累加 / 再点也有效"需求。
           * 每一次应用 = 一次独立的 beginEdit / endEdit（因为本命令常驻，
             CommandManager 只在命令生命周期包一次 begin/end），保证每一层
             浮雕都能 Ctrl+Z 单独撤销。
         """
-        model = self.activeModel()
+        model = self._modelForPolygon(poly)
         if model is None:
-            self._notify("请先选中浮雕模型（区域塑形作用于模型）")
+            if not self._doc or not self._doc.reliefModels():
+                self._fail("文档中没有浮雕模型：请先创建/导入浮雕模型")
+            else:
+                self._fail("该区域不在任何浮雕模型范围内：请把模型与曲线对齐")
             return
         if self._panel is None:
             return
@@ -321,16 +492,13 @@ class RegionReliefCommand(CommandInstance):
 
             hf = model.heightField()
 
-            poly = sample_curve_points(obj, params.sample_count)
-            if poly.shape[0] < 3:
-                self._notify("曲线点数不足，无法起浮雕")
-                return
-
             before = hf.data.copy()
             moved = apply_region_relief(hf, poly, params,
                                         color_mask=model.colorMask(),
-                                        color_value=PaintState.instance().currentValue())
+                                        color_value=PaintState.instance().currentValue(),
+                                        holes=holes)
             if moved > 0:
+                self._lastFail = None
                 # 精确比较：是否真的变了（blend=replace 且新值等于旧值 也能正确识别）
                 changed = not np.array_equal(before, hf.data)
                 if changed:
@@ -341,7 +509,7 @@ class RegionReliefCommand(CommandInstance):
                         pass
                 self._notify(f"已起浮雕（累加模式）：{moved} 个顶点")
             else:
-                self._notify("未命中区域：请确认曲线落在模型范围内")
+                self._notifyNoMove(poly, params, hf)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -352,21 +520,550 @@ class RegionReliefCommand(CommandInstance):
             except Exception:
                 pass
 
-    # ---------------- 交互：画布识别闭合曲线并即时浮雕 ----------------
+    # ---------------- 交互：画布识别区域并即时浮雕 ----------------
 
     def onMouseMove(self, wp, mods) -> None:
-        pass
+        """悬停高亮：曲线优先（压线即高亮该曲线），否则高亮所在区域。
+
+        普通悬停 = 整块区域都起浮雕（忽略内部小轮廓）；按住 Ctrl 时高亮挖空
+        内岛的范围，点前即可看出差别。
+        """
+        if self._panel is None:
+            return
+        self._lastWp = wp
+        obj = self._pickClosedCurve(wp, self._CURVE_STRICT_PX)
+        face = None
+        if obj is None:
+            # 严格容差没压到线：先看是否在某个闭合区域里；区域也不成立时，
+            # 才把拾取放宽到点选容差（保证"近线点击"仍能点到曲线）。
+            face = self._regionAt(wp.x, wp.y, wp)
+            if face is None:
+                obj = self._pickClosedCurve(wp)
+        if obj is not None:
+            key = ("curve", obj.id())
+            if key != self._previewKey:
+                self._previewFace = None
+                self._previewKey = key
+                self._showCurvePreview(obj)
+            return
+        if face is None:
+            self._hideRegionPreview()
+            return
+        hollow = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        key = (id(face[0]), hollow)
+        if key == self._previewKey:
+            return
+        self._previewFace = face
+        self._previewKey = key
+        self._showRegionPreview(face, hollow=hollow)
 
     def onMousePress(self, wp, mods) -> None:
-        """点击最近的闭合曲线即按当前参数起浮雕（无需应用按钮）。
+        """曲线优先；点空白处才识别所在闭合区域。
 
-        未命中任何闭合曲线时给出明确提示，避免"点了像失效"。
+        优先级：
+          1. 命中闭合曲线（像素容差）→ 直接按该曲线起浮雕（整条曲线 = 区域）；
+          2. 否则识别光标所在的闭合区域 → 普通点击忽略区域内的小轮廓，整块
+             一起起浮雕；按住 Ctrl 则把这些小轮廓当孔洞（内岛保持 0，不参与）。
         """
-        obj = self._pickClosedCurve(wp)
-        if obj is None:
-            self._notify("未命中闭合曲线：请把鼠标移动到曲线上再点击（8 像素容差）")
+        obj = self._pickClosedCurve(wp, self._CURVE_STRICT_PX)
+        if obj is not None:
+            self._hideRegionPreview()
+            self._applyToCurve(obj)
             return
-        self._applyToCurve(obj)
+        face = self._regionAt(wp.x, wp.y, wp)
+        if face is None:
+            # 空白处也没识别到区域：放宽曲线拾取（近线点击仍按曲线走），
+            # 再不行才提示——避免"看着封闭却什么都没发生"。
+            obj = self._pickClosedCurve(wp)
+            if obj is not None:
+                self._hideRegionPreview()
+                self._applyToCurve(obj)
+                return
+            # 悬停已命中的面直接沿用：按下点与悬停点一致，但按下瞬间若有
+            # 文档信号让缓存失效/重建，缓存里可能暂时找不到，不能因此判"没有"。
+            face = self._hoveredFaceAt(wp.x, wp.y)
+        if face is None:
+            self._dumpRegionDebug(wp)
+            self._fail("未找到闭合区域：" + self._diagText())
+            return
+        hollow = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        holes = face[2] if hollow else None
+        self._hideRegionPreview()
+        self._applyToPolygon(face[1], holes)
+
+    # ---------------- 区域识别（可见曲线平面剖分 + 命中测试） ----------------
+
+    def _regionAt(self, x: float, y: float, wp=None):
+        """返回包含世界点 (x,y) 的闭合面 (面, 外环, [孔环])；无则 None。
+
+        优先取**面积最小**的包含面（嵌套轮廓取最内层，符合直觉）。
+        点落在边界线上时用极小几何容差补选最近的面，保证"点边线也能命中"。
+        wp：该点的世界坐标（用于按视图像素换算搭接容差；缺省用最近一次悬停点）。
+        """
+        faces, tree = self._regionFacesCached(wp)
+        pt = _shp_point(x, y)
+        # STRtree 先按包围盒筛候选，避免面数多时逐个 contains
+        cand = faces
+        if tree is not None and faces:
+            try:
+                cand = [faces[int(i)] for i in tree.query(pt)]
+            except Exception:
+                cand = faces
+        if cand:
+            best = self._smallestContaining(cand, pt)
+            if best is not None:
+                return best
+        # 栅格兜底：线框在屏幕上看着已闭合、但矢量端点之间还差像素级缝隙时，
+        # 按栅格连通域判断"用户眼里是否封闭"，再只取相邻曲线重建精确矢量面。
+        # （矢量一个面都没剖出来时也要走这里——这正是"贴线却不识别"的主因）
+        rfaces = self._rasterRegionFaces(x, y)
+        if rfaces:
+            best = self._smallestContaining(rfaces, pt)
+            if best is not None:
+                return best
+        if not faces:
+            return None
+        # 边界容差：点恰好落在曲线上（含开放边线组成区域的情况）
+        xmin = min(float(f[0].bounds[0]) for f in faces)
+        xmax = max(float(f[0].bounds[2]) for f in faces)
+        tol = 1e-6 * max(1.0, xmax - xmin)
+        cands = [(float(f[0].distance(pt)), f[0].area, f) for f in faces]
+        cands = [c for c in cands if c[0] <= tol]
+        if not cands:
+            return None
+        cands.sort(key=lambda c: (c[0], c[1]))
+        return cands[0][2]
+
+    @staticmethod
+    def _smallestContaining(faces, pt):
+        """包含该点的面积最小的面（嵌套时取最内层）。"""
+        best = None
+        for face in faces:
+            try:
+                if not face[0].contains(pt):
+                    continue
+            except Exception:
+                continue
+            if best is None or face[0].area < best[0].area:
+                best = face
+        return best
+
+    def _rasterRegionFaces(self, x: float, y: float) -> list:
+        """栅格兜底识别（"屏幕上看着封闭"就算封闭）。
+
+        把可见曲线按像素栅格成 1px 线条并轻微膨胀，再对空白像素做连通域标记：
+        点击所在连通域若不贴图幅边界，就是用户眼里的一个封闭区域。随后只取与
+        该连通域相邻的曲线，用较大容差重建成**精确矢量面**（几何不失真）。
+        这样端点与线之间只差几个像素缝隙时也能识别，而不必画过头交叉。
+        """
+        try:
+            import scipy.ndimage as ndi
+        except Exception:
+            return []
+        curves = self._allCurvePts()
+        if len(curves) < 2:
+            return []
+        vis = self._touchTolWorld() or 0.0
+        gkey = (self._regionGen, round(float(vis), 6))
+        grid = getattr(self, "_rasterGrid", None)
+        if grid is None or grid[0] != gkey:
+            pts_list = [p for _o, p in curves]
+            allp = np.concatenate(pts_list)
+            x0, y0 = float(allp[:, 0].min()), float(allp[:, 1].min())
+            x1, y1 = float(allp[:, 0].max()), float(allp[:, 1].max())
+            w, h = max(x1 - x0, 1e-6), max(y1 - y0, 1e-6)
+            span = max(w, h) * 1.08
+            px = span / 1100.0                      # 每像素世界尺寸
+            x0 -= (span - w) * 0.5
+            y0 -= (span - h) * 0.5
+            side = max(8, int(round(span / px)) + 1)
+            W, H = side, side
+            wire = np.zeros((H, W), dtype=bool)
+            pix = []
+            for pts in pts_list:
+                seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+                n = int(float(seg.sum()) / (px * 0.5)) + 1
+                n = max(2, min(n, 40000))
+                dense = resample_polyline(pts, n)
+                ix = np.clip(((dense[:, 0] - x0) / px).astype(np.int64), 0, W - 1)
+                iy = np.clip(((dense[:, 1] - y0) / px).astype(np.int64), 0, H - 1)
+                wire[iy, ix] = True
+                pix.append(np.column_stack((iy, ix)))
+            # 膨胀量对应"屏幕上几个像素"：看着连上了，栅格上就视为连上
+            iters = int(np.clip(round(vis / px), 2, 60)) if px > 1e-12 else 2
+            grown = ndi.binary_dilation(wire, iterations=iters)
+            lab, _n = ndi.label(~grown)
+            grid = (gkey, lab, pix, iters, float(x0), float(y0), float(px), W, H)
+            self._rasterGrid = grid
+        _gkey, lab, pix, iters, x0, y0, px, W, H = grid
+        cx = int(np.clip(round((x - x0) / px), 0, W - 1))
+        cy = int(np.clip(round((y - y0) / px), 0, H - 1))
+        comp_id = int(lab[cy, cx])
+        if comp_id == 0:
+            # 点压在线上：取附近最大的空白连通域（等价于"点线也算命中"）
+            win = lab[max(0, cy - 4):cy + 5, max(0, cx - 4):cx + 5]
+            win = win[win > 0]
+            if win.size == 0:
+                return []
+            comp_id = int(np.bincount(win).argmax())
+        comp = lab == comp_id
+        if comp[0, :].any() or comp[-1, :].any() \
+                or comp[:, 0].any() or comp[:, -1].any():
+            return []                        # 连通到图幅边界 = 不封闭
+        near = ndi.binary_dilation(comp, iterations=3)
+        ids = {k for k, p in enumerate(pix) if near[p[:, 0], p[:, 1]].any()}
+        if len(ids) < 2:
+            return []
+        key = (self._regionGen, tuple(sorted(ids)))
+        hit = self._rasterCache.get(key)
+        if hit is not None:
+            return hit
+        sub = [curves[k][0] for k in sorted(ids)]
+        # 重建矢量面时容差要覆盖"视觉上认为已连上"的范围
+        rtol = max(px * 8.0, vis * 2.0)
+        faces = build_region_faces(self._doc, sub, 256, touch_tol=rtol)
+        if self._smallestContaining(faces, _shp_point(x, y)) is None:
+            # 矢量重建仍没兜住（端点偏离更大 / 曲线采样端点与视觉不符）：
+            # 直接按栅格连通域轮廓取面——"看到封闭就算封闭"，不会再判没有。
+            faces = self._rasterContourFaces(comp, iters, x0, y0, px)
+        if len(self._rasterCache) > 8:       # 只留最近几组，避免无限增长
+            self._rasterCache.clear()
+        self._rasterCache[key] = faces
+        self._dbgInfo = dict(getattr(self, "_dbgInfo", None) or {})
+        self._dbgInfo["raster"] = len(faces)
+        return faces
+
+    def _rasterContourFaces(self, comp, iters: int, x0: float, y0: float,
+                            px: float) -> list:
+        """把空白连通域轮廓转成世界坐标面（含内岛孔洞）。
+
+        连通域本身是"线条膨胀后剩下的空白"，比真实区域小 iters 像素；
+        先按同样像素数膨胀回去，轮廓正好落在曲线中心线上。
+        """
+        try:
+            import cv2
+            import scipy.ndimage as ndi
+        except Exception:
+            return []
+        full = ndi.binary_dilation(comp, iterations=iters)
+        img = (full.astype(np.uint8) * 255)
+        cont, hier = cv2.findContours(img, cv2.RETR_CCOMP,
+                                      cv2.CHAIN_APPROX_SIMPLE)
+        if hier is None:
+            return []
+        hier = hier[0]
+
+        def to_world(c):
+            p = c.reshape(-1, 2).astype(np.float64)
+            return np.column_stack((x0 + p[:, 0] * px, y0 + p[:, 1] * px))
+
+        out = []
+        for i, c in enumerate(cont):
+            if hier[i][3] != -1 or len(c) < 3:
+                continue                       # 只要最外层
+            outer = to_world(c)
+            holes = []
+            j = hier[i][2]
+            while j != -1:
+                if len(cont[j]) >= 3:
+                    holes.append(to_world(cont[j]))
+                j = hier[j][0]
+            try:
+                from shapely.geometry import Polygon
+                poly = Polygon(outer, holes)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                    if poly.is_empty:
+                        continue
+                    polys = [poly] if poly.geom_type == "Polygon" else list(poly.geoms)
+                else:
+                    polys = [poly]
+            except Exception:
+                continue
+            for p in polys:
+                if p.area <= 0:
+                    continue
+                rings = [np.asarray(p.exterior.coords)[:-1]]
+                hs = [np.asarray(r.coords)[:-1] for r in p.interiors]
+                out.append((p, rings[0], hs))
+        # 简化为像素分辨率级，减少顶点但不改变形状
+        return out
+
+    def _hoveredFaceAt(self, x: float, y: float):
+        """悬停缓存的面：仅当点仍在该面或极近边界时沿用，避免误用过期高亮。"""
+        face = self._previewFace
+        if face is None:
+            return None
+        try:
+            from shapely.geometry import Point
+            pt = Point(float(x), float(y))
+            if face[0].contains(pt):
+                return face
+            b = face[0].bounds
+            tol = 1e-3 * max(1.0, float(b[2] - b[0]), float(b[3] - b[1]))
+            if float(face[0].distance(pt)) <= tol:
+                return face
+        except Exception:
+            return None
+        return None
+
+    def _regionFacesCached(self, wp=None):
+        """返回 (面列表, STRtree)；线框变化后自动重建。
+
+        端点搭接容差先按"当前视图 8 像素"计算（用户看着贴上就算相连）；
+        若这样仍剖不出任何面，再用 3 倍容差重试一次——只在"一个区域都没找到"
+        时放宽，不会影响本来就闭合/半闭合的线框，也不会误连已有区域。
+        wp：可选的世界点，用于在没有悬停记录时也能按像素换算容差。
+        """
+        if wp is not None:
+            self._lastWp = wp
+        tol = self._touchTolWorld()
+        # 首次悬停前若已建过缓存，用的是相对容差；一旦拿到"像素容差"（或缩放
+        # 变化较大），必须重建，否则贴线容差永远不生效——这正是"必须画过头
+        # 才能闭合"的根因之一。
+        stale = (tol is not None and
+                 (self._regionTol is None or
+                  tol > self._regionTol * 2.0 or
+                  tol * 2.0 < self._regionTol))
+        if self._regionFaces is None or self._regionDirty or stale:
+            objs = self._curveObjectsForRegion()
+            sample = 256 if len(objs) <= 300 else (96 if len(objs) <= 2000 else 48)
+            faces = build_region_faces(self._doc, objs, sample, touch_tol=tol)
+            if not faces:
+                # 逐级放宽搭接容差：视觉像素不够就 3×、10×、30×，最后按图幅 3%
+                # 兜底。只在"一个区域都没剖出来"时才升级，已有区域不受影响，
+                # 从根上消除"必须画过头、真交叉了才认"的问题。
+                diag = self._wireDiag()
+                for k in (3.0, 10.0, 30.0):
+                    cand = max(tol * k, diag * 0.01 * (k / 10.0)) if tol else \
+                        diag * 0.01 * (k / 10.0)
+                    if diag:
+                        cand = min(cand, diag * 0.05)
+                    faces = build_region_faces(self._doc, objs, sample,
+                                               touch_tol=cand)
+                    if faces:
+                        break
+            tree = None
+            if faces:
+                try:
+                    from shapely.strtree import STRtree
+                    tree = STRtree([f[0] for f in faces])
+                except Exception:
+                    tree = None
+            self._regionFaces = (faces, tree)
+            self._regionTol = tol
+            self._dbgInfo = {"curves": len(objs), "faces": len(faces)}
+            self._regionDirty = False
+        return self._regionFaces
+
+    def _wireDiag(self) -> float:
+        """可见曲线的整体图幅对角线（用于相对兜底容差）。"""
+        if self._doc is None:
+            return 0.0
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        for o in self._doc.visibleObjects():
+            try:
+                bb = o.getBoundingBox()
+            except Exception:
+                continue
+            if bb is None:
+                continue
+            x0 = min(x0, float(bb.min.x)); x1 = max(x1, float(bb.max.x))
+            y0 = min(y0, float(bb.min.y)); y1 = max(y1, float(bb.max.y))
+        if x0 > x1 or y0 > y1:
+            return 0.0
+        return math.hypot(x1 - x0, y1 - y0)
+
+    def _dumpRegionDebug(self, wp) -> None:
+        """区域识别失败时，把真实几何写进 _region_debug.log（每次覆盖）。
+
+        合成测试过得去、真机仍失败，就必须看真实数据：对象类型、采样端点、
+        缝隙、剖分面数。日志很小，便于直接把问题定位到具体曲线。
+        """
+        try:
+            lines = [f"# {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                     f"click=({wp.x:.4f},{wp.y:.4f})",
+                     f"tol={self._touchTolWorld():.5f} "
+                     f"diag={self._wireDiag():.4f} dbg={self._dbgInfo}"]
+            for o, pts in self._allCurvePts():
+                try:
+                    bb = o.getBoundingBox()
+                    bbt = f"({bb.min.x:.3f},{bb.min.y:.3f})-({bb.max.x:.3f},{bb.max.y:.3f})"
+                except Exception:
+                    bbt = "n/a"
+                closed = getattr(o, "isClosed", None)
+                closed = closed() if callable(closed) else None
+                lines.append(
+                    f"{type(o).__name__} type={o.type()} closed={closed} "
+                    f"n={pts.shape[0]} bbox={bbt} "
+                    f"first={np.round(pts[0], 4).tolist()} "
+                    f"last={np.round(pts[-1], 4).tolist()}")
+            info = self._openGapInfo()
+            if info:
+                lines.append(f"nearest_gap={info[0]:.5f} tried={info[1]:.5f}")
+            with open(os.path.join(os.getcwd(), "_region_debug.log"),
+                      "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+    def _diagText(self) -> str:
+        """失败时的可读诊断：参与曲线数、剖出的面数、栅格兜底结果、最近缝隙。
+
+        出问题时用户能直接把这句话发回来，定位是哪一环没过，而不是继续猜。
+        """
+        d = self._dbgInfo or {}
+        ncur = d.get("curves", 0)
+        nvec = d.get("faces", 0)
+        nras = d.get("raster", 0)
+        parts = [f"曲线 {ncur} 条", f"矢量剖出 {nvec} 个面"]
+        if nras:
+            parts.append(f"栅格兜底 {nras} 个面")
+        info = self._openGapInfo()
+        if info is not None:
+            gap, tol = info
+            parts.append(f"最近端点距其它线 {gap:.3f}mm")
+            parts.append(f"已尝试贴接 {tol:.3f}mm")
+        if ncur < 2:
+            parts.append("开放线不足两条，无法围合；请点击闭合曲线")
+        return "，".join(parts)
+
+    def _openGapInfo(self):
+        """失败诊断：开放端点到其它折线的最近距离 + 已尝试过的最大搭接容差。"""
+        if self._doc is None:
+            return None
+        polys = []
+        for o in self._curveObjectsForRegion():
+            try:
+                pts = sample_curve_points(o, 128)
+            except Exception:
+                continue
+            if pts.shape[0] >= 2:
+                polys.append(pts)
+        if len(polys) < 2:
+            return None
+        best = float("inf")
+        for i, pts in enumerate(polys):
+            if float(np.linalg.norm(pts[0] - pts[-1])) <= 1e-9:
+                continue
+            for s in (0, -1):
+                P = pts[s]
+                for j, other in enumerate(polys):
+                    if j == i:
+                        continue
+                    d = _pointPolylineDistance(float(P[0]), float(P[1]), other)
+                    if d < best:
+                        best = d
+        if not np.isfinite(best):
+            return None
+        tol = self._touchTolWorld() or 0.0
+        diag = self._wireDiag()
+        tried = max(tol * 6.0, diag * 0.02, tol)
+        if diag:
+            tried = min(tried, max(2.0, diag * 1e-2))
+        return float(best), float(tried)
+
+    def _touchTolWorld(self) -> float | None:
+        """端点搭接容差：约 8 个屏幕像素对应的世界尺寸（与点选容差同量级）。
+
+        用户"看着端点已经贴在线上"时，实际往往还差几个像素；按视觉像素
+        换算容差，才能做到"贴上了就闭合"，而不是必须画过头产生真实交叉。
+        """
+        if self._lastWp is None:
+            # 还没悬停过（命令刚激活就点）：仍要给一个"视觉容差"，否则退回
+            # 图幅相对容差（很小），贴线也识别不出——这正是反复"还是不行"的点。
+            try:
+                return self._pixelTolWorld(None)
+            except Exception:
+                return 1.0
+        try:
+            return self._pixelTolWorld(self._lastWp)
+        except Exception:
+            return 1.0
+
+    def _allCurvePts(self) -> list:
+        """[(曲线对象, 采样点)]：参与区域剖分的**全部**曲线（含开放线）。
+
+        栅格兜底必须看开放线（直线+曲线端点搭接就是这种情况），不能用
+        只含闭合曲线的拾取缓存。
+        """
+        if self._allPtsCache is not None and self._allPtsGen == self._regionGen:
+            return self._allPtsCache
+        out = []
+        for o in self._curveObjectsForRegion():
+            try:
+                pts = sample_curve_points(o, 256)
+            except Exception:
+                continue
+            if pts.shape[0] >= 2:
+                out.append((o, pts))
+        self._allPtsCache = out
+        self._allPtsGen = self._regionGen
+        return out
+
+    def _curveObjectsForRegion(self) -> list:
+        """参与区域识别的曲线对象（排除浮雕模型/锁定对象/非曲线对象）。"""
+        if self._doc is None:
+            return []
+        out = []
+        for o in self._doc.visibleObjects():
+            if o.type() == ObjectType.SURFACE or o.isLocked():
+                continue
+            if hasattr(o, "getSampledPoints") or hasattr(o, "toPolycurve") \
+                    or hasattr(o, "points"):
+                out.append(o)
+        return out
+
+    def _showRegionPreview(self, face, hollow: bool = False) -> None:
+        """在 2D 画布叠加半透明填充高亮。
+
+        普通点击 hollow=False：整块区域一起起浮雕（忽略内部小轮廓）；
+        Ctrl 点击 hollow=True：内岛按奇偶规则挖空（保持 0，不参与）。
+        """
+        item = self._previewItem
+        if item is None:
+            return
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        rings = [face[1], *face[2]] if hollow else [face[1]]
+        for ring in rings:
+            pts = [QPointF(float(p[0]), float(p[1])) for p in ring]
+            if len(pts) >= 3:
+                path.addPolygon(QPolygonF(pts))
+        item.setPath(path)
+        item.setBrush(QBrush(QColor(21, 182, 201, 46)))
+
+    def _showCurvePreview(self, obj) -> None:
+        """高亮即将作用的整条闭合曲线（曲线优先时的范围提示）。"""
+        item = self._previewItem
+        if item is None:
+            return
+        try:
+            pts = sample_curve_points(obj, 256)
+        except Exception:
+            return
+        if pts.shape[0] < 3:
+            return
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        path.addPolygon(QPolygonF([QPointF(float(p[0]), float(p[1])) for p in pts]))
+        item.setPath(path)
+        item.setBrush(QBrush(QColor(21, 182, 201, 46)))
+
+    def _hideRegionPreview(self) -> None:
+        item = self._previewItem
+        self._previewFace = None
+        self._previewKey = None
+        if item is None:
+            return
+        if not item.path().isEmpty():
+            item.setPath(QPainterPath())
+        item.setBrush(Qt.BrushStyle.NoBrush)
+
+    def usesCtrlClick(self) -> bool:
+        """本命令使用 Ctrl+点击（内岛参与），视口不要把它当涂抹快捷键。"""
+        return True
 
     def onRightClick(self, wp) -> bool:
         """右键结束命令（2D 画布与 3D 视口一致：右键完成/结束当前命令）。"""
@@ -382,52 +1079,82 @@ class RegionReliefCommand(CommandInstance):
         """区域浮雕点击即起浮雕，无需精确吸附，关闭视口吸附气泡。"""
         return False
 
-    def _pickClosedCurve(self, wp):
+    def _pickClosedCurve(self, wp, px: float | None = None):
         """拾取最近的**闭合**曲线（世界点到折线最近距离在容差内）。
 
         闭合判定优先用对象的 isClosed()；圆/椭圆/弧等参数曲线若未直接暴露
         isClosed，则以采样点首尾是否重合（距离远小于曲线总长）识别闭合轮廓。
+        采样结果按文档状态缓存，悬停时逐帧拾取不再重复采样。
+        px：拾取容差（屏幕像素）；缺省用 _PICK_PX。
         """
         if self._doc is None:
             return None
-        tol = self._pixelTolWorld()
+        tol = self._pixelTolWorld(wp, px)
         best, best_d = None, tol
-        for o in self._doc.visibleObjects():
-            if o.type() == ObjectType.SURFACE or o.isLocked():
-                continue
-            pts = sample_curve_points(o, 128)
-            if pts.shape[0] < 3:
-                continue
-            # 闭合识别：对象显式 isClosed() 或采样首尾重合
-            closed = getattr(o, "isClosed", None)
-            if callable(closed):
-                if not closed():
-                    continue
-            else:
-                d_end = float(np.linalg.norm(pts[0] - pts[-1]))
-                perim = float(np.linalg.norm(
-                    np.diff(pts, axis=0), axis=1).sum())
-                if perim > 1e-9 and d_end > 1e-3 * perim:
-                    continue
+        for o, pts in self._pickCurvesCached():
             d = _pointPolylineDistance(wp.x, wp.y, pts)
             if d < best_d:
                 best, best_d = o, d
         return best
 
-    def _pixelTolWorld(self) -> float:
-        """拾取容差：屏幕像素 → 世界 mm。"""
+    def _pickCurvesCached(self) -> list:
+        """[(闭合曲线对象, 采样点)] 缓存；线框变化时失效。"""
+        if self._pickCache is None or self._pickDirty:
+            out = []
+            if self._doc is not None:
+                for o in self._doc.visibleObjects():
+                    if o.type() == ObjectType.SURFACE or o.isLocked():
+                        continue
+                    try:
+                        pts = sample_curve_points(o, 128)
+                    except Exception:
+                        continue
+                    if pts.shape[0] < 3:
+                        continue
+                    closed = getattr(o, "isClosed", None)
+                    if callable(closed):
+                        if not closed():
+                            continue
+                    else:
+                        d_end = float(np.linalg.norm(pts[0] - pts[-1]))
+                        perim = float(np.linalg.norm(
+                            np.diff(pts, axis=0), axis=1).sum())
+                        if perim > 1e-9 and d_end > 1e-3 * perim:
+                            continue
+                    out.append((o, pts))
+            self._pickCache = out
+            self._pickDirty = False
+        return self._pickCache
+
+    def _pixelTolWorld(self, wp=None, px: float | None = None) -> float:
+        """拾取容差：屏幕像素 → 世界 mm。px 缺省用点选容差 _PICK_PX。"""
+        p = self._PICK_PX if px is None else float(px)
         try:
             s = abs(self._view.transform().m11())
             if s > 1e-9:
-                return self._PICK_PX / s
+                return p / s
         except Exception:
             pass
+        # 3D/浮雕视口没有 QGraphicsView.transform()：用其 world-per-pixel 换算
+        wpp = getattr(self._view, "_worldPerPixel", None)
+        if callable(wpp) and wp is not None:
+            try:
+                v = float(wpp(wp))
+                if v > 1e-9:
+                    return p * v
+            except Exception:
+                pass
         return 1.0
 
     def prompt(self) -> str:
-        if self.activeModel() is None:
-            return "请先在 2D 选中浮雕模型（区域塑形作用于活动模型）"
-        return "点击闭合曲线即起浮雕（同一条曲线反复点击会无限累加；右键/回车结束命令，Ctrl+Z 单独撤销每一层）"
+        if self.activeModel() is None and not (self._doc and self._doc.reliefModels()):
+            return "文档中没有浮雕模型：请先创建/导入浮雕模型"
+        base = ("点击闭合曲线=按该曲线起浮雕（优先级最高）；点击空白处=识别所在闭合区域，"
+                "区域内小轮廓默认忽略（整块鼓起），Ctrl+点击=小轮廓挖空不参与；"
+                "右键/回车结束，Ctrl+Z 逐层撤销")
+        if getattr(self, "_lastFail", None):
+            return f"{base}｜上次：{self._lastFail}"
+        return base
 
     def name(self) -> str:
         return "RegionRelief"
@@ -1411,9 +2138,10 @@ class AddMaterialCommand(CommandInstance):
     AIR_FLOW = 0.04     # 气刷每拍（33ms）：按住不动持续堆料（≈1.2×高度/秒）
     AIR_MS = 33
 
-    def __init__(self) -> None:
+    def __init__(self, initial_effect: str = "add") -> None:
         super().__init__()
         self._panel: AddMaterialParamPanel | None = None
+        self._initialEffect = "remove" if initial_effect == "remove" else "add"
         self._lastWp = None        # 最近鼠标世界位置（笔刷圈跟随用）
         self._stroking = False     # 笔画进行中（按下→拖动→松开）
         self._lastStamp = None     # 最近一次盖章的世界坐标（弧长插值起点）
@@ -1434,6 +2162,7 @@ class AddMaterialCommand(CommandInstance):
     def paramPanel(self):
         if self._panel is None:
             self._panel = AddMaterialParamPanel()
+            self._panel.setApplyMode(self._initialEffect)
             self._panel.finished.connect(self.finish)
         return self._panel
 
@@ -5160,6 +5889,31 @@ class ImageToModelCommand(CommandInstance):
         self._panel.setProgress(0, "生成模型启动中...")
         thread.start()
 
+    def _pinAsReliefTarget(self, obj) -> None:
+        """浮雕模式下把新生成的模型设为当前编辑目标（锁定、不可移动）。
+
+        2D 模式不做任何处理：模型保持普通对象语义，可选中、可移动。
+        主窗口若未提供该接口（例如嵌入测试环境）则静默跳过。"""
+        win = self._view.window() if self._view is not None else None
+        pin = getattr(win, "_pinReliefModelAsTarget", None) if win is not None else None
+        if not callable(pin):
+            return
+        try:
+            bar = getattr(win, "_canvasModeBar", None)
+            if bar is None or bar.current() != "relief":
+                return
+            pin(obj)
+        except Exception:
+            # 不静默：pin 失败会让新模型既不在浮雕显示、又可能带着旧锁，
+            # 只有落日志才能在用户反馈“偶尔异常”时定位到这一环
+            import traceback
+            traceback.print_exc()
+            try:
+                from ui.view_3d._renderdbg import dbg
+                dbg("pinAsReliefTarget failed\n" + traceback.format_exc())
+            except Exception:
+                pass
+
     def _onStageBDone(self, hf, geo) -> None:
         if self._aborted or self._panel is None:
             return   # 命令已取消/结束：丢弃过期结果
@@ -5203,6 +5957,10 @@ class ImageToModelCommand(CommandInstance):
             obj = ReliefModelObject.fromHeightField(hf)
             self._doc.addObject(obj)
             self._doc.selectObject(obj.id())
+            # 浮雕模式下，新生成的模型即当前编辑模型：锁定编辑（不可移动），
+            # 与其他浮雕模型一样只保留一个编辑目标。2D 模式下不处理——模型
+            # 保持可选中、可移动。
+            self._pinAsReliefTarget(obj)
             hmax = float(hf.data.max())
             note = "（尺寸已与原图对齐）" if fit_size else "（未强制对齐尺寸）"
             self._notify(
@@ -5440,7 +6198,7 @@ class TextureFillCommand(CommandInstance):
         self._preview_active = True
         self._refreshModel(model)
         if n > 0:
-            self._notify("预览中…调参实时更新，点“确认生成”完成，"
+            self._notify("预览中…调参实时更新，点“确认”完成，"
                          "“取消”还原")
 
     def _confirmPreview(self) -> None:
@@ -5657,7 +6415,7 @@ class TextureFillCommand(CommandInstance):
             if k == "weave":
                 # 编织（整面）：不选曲线，预览由面板参数驱动
                 self._notify("编织按面板参数整面生成（实时预览，"
-                             "“确认生成”完成）")
+                             "“确认”完成）")
                 return
         tol = self._pixelTolWorld()
         obj = pick_closed_curve(self._doc, wp.x, wp.y, tol)
@@ -5694,10 +6452,10 @@ class TextureFillCommand(CommandInstance):
             k = self._panel.kind()
             if k == "wrap":
                 return ("缠绕：把相互交叉的多条曲线编组后，单击组内任一曲线"
-                        "即实时预览，调参更新，点“确认生成”完成")
+                        "即实时预览，调参更新，点“确认”完成")
             if k == "weave":
                 return ("编织：按面板参数（横/竖条数、截面）整面实时预览，"
-                        "点“确认生成”完成，取消/右键还原")
+                        "点“确认”完成，取消/右键还原")
         return "点击闭合曲线即在该区域内填充纹理；面板可应用到整个模型（右键/回车结束）"
 
 
@@ -5870,3 +6628,299 @@ def pick_closed_curve(doc, x: float, y: float, tol_world: float):
         if d < best_d:
             best, best_d = o, d
     return best
+
+
+# ---- 模块级工具：点击处闭合区域识别（区域塑形用） ----
+
+def build_region_faces(doc, objs=None, sample_count: int = 256,
+                       touch_tol: float | None = None) -> list:
+    """把可见曲线当成平面线框，剖分出所有闭合面（点击空白处自动识别区域）。
+
+    返回 ``[(shapely 面, 外环(N,2), [孔环(N,2), ...]), ...]``。
+    端点在容差内自动"搭接"（端点对端点、端点搭在另一条线内部都算），
+    因此“用多段独立曲线围成的矩形/多边形”同样能被识别；嵌套轮廓由
+    polygonize 自动拆成环带与内岛面。
+
+    touch_tol：搭接容差（世界单位）。由调用方按当前视图"几像素"换算传入，
+    使"视觉上端点贴到线上了"就一定能闭合；缺省按图幅 1e-3 相对值。
+    shapely 不可用或线框无法闭合时返回空列表，调用方回退到单条闭合曲线。
+    """
+    if doc is None:
+        return []
+    try:
+        from shapely.geometry import LineString
+        from shapely.ops import polygonize, unary_union
+    except Exception:
+        return []
+    if objs is None:
+        objs = doc.visibleObjects()
+    line_pts = []
+    for o in objs:
+        if o.type() == ObjectType.SURFACE or o.isLocked():
+            continue
+        try:
+            pts = sample_curve_points(o, sample_count)
+        except Exception:
+            continue
+        if pts.shape[0] < 2:
+            continue
+        arr = np.asarray(pts, dtype=np.float64)
+        # 去掉连续重复点（LineString 不允许零长段）
+        keep = np.ones(arr.shape[0], dtype=bool)
+        keep[1:] = np.any(np.abs(np.diff(arr, axis=0)) > 1e-12, axis=1)
+        arr = arr[keep]
+        if arr.shape[0] < 2:
+            continue
+        # 闭合环强制首尾严格相等：重采样/参数化会留下 1e-15 级差值，
+        # shapely 会判定为非闭合环（is_ring=False）而无法 polygonize
+        if arr.shape[0] >= 3:
+            scale = max(1.0, float(np.abs(arr).max()))
+            if float(np.linalg.norm(arr[0] - arr[-1])) <= 1e-9 * scale:
+                arr[-1] = arr[0]
+        # 顶点远多于采样数时按弧长降采样（导入的密集折线不拖慢剖分）
+        if arr.shape[0] > 2 * sample_count:
+            arr = resample_polyline(arr, sample_count)
+            scale = max(1.0, float(np.abs(arr).max()))
+            if float(np.linalg.norm(arr[0] - arr[-1])) <= 1e-9 * scale:
+                arr[-1] = arr[0]
+        line_pts.append(arr.copy())
+    if not line_pts:
+        return []
+    # 搭接容差：优先用调用方按视图像素换算的值（"看起来贴上了"即闭合），
+    # 只在缩放过远时加一个上限，防止把明显分开的图元误连。
+    all_pts = np.concatenate(line_pts)
+    diag = math.hypot(float(np.ptp(all_pts[:, 0])), float(np.ptp(all_pts[:, 1])))
+    tol = max(1e-9, diag * 1e-3)
+    if touch_tol is not None and touch_tol > 0.0:
+        tol = min(float(touch_tol), max(2.0, diag * 3e-2))
+    _snap_open_endpoints(line_pts, tol)
+    _insert_t_junctions(line_pts, tol)
+    faces = _polygonize_lines(line_pts)
+    if not faces:
+        # 端点离对方的线还差一截（肉眼觉得"就搭在上面"）：沿各自切线延长端点，
+        # 与最近的线求交并接入。只在确实剖不出任何面时才做，不会改变已闭合图形。
+        _extend_endpoints_to_lines(line_pts, max(diag * 0.12, tol * 4.0))
+        faces = _polygonize_lines(line_pts)
+    return faces
+
+
+def _polygonize_lines(line_pts) -> list:
+    """折线集合 → 闭合面列表（(面, 外环, 孔环数组)）；失败返回 []。"""
+    try:
+        from shapely.geometry import LineString
+        from shapely.ops import polygonize, unary_union
+    except Exception:
+        return []
+    try:
+        merged = unary_union([LineString(a) for a in line_pts])
+        faces = []
+        for poly in polygonize(merged):
+            if poly.is_empty or poly.geom_type != "Polygon" or poly.area <= 0.0:
+                continue
+            outer = np.asarray(poly.exterior.coords, dtype=np.float64)
+            holes = [np.asarray(r.coords, dtype=np.float64)
+                     for r in poly.interiors]
+            faces.append((poly, outer, holes))
+        return faces
+    except Exception:
+        return []
+
+
+def _extend_endpoints_to_lines(line_pts, max_len: float) -> None:
+    """把开放端点沿切线延长到最近的其它线上（"差一小截才搭上"也能闭合）。
+
+    只在矢量剖分完全失败时调用：逐段求射线交点，取最近的，把交点同时加到
+    自己的端点与对方的折线上，从而真正连通（不是靠放大容差硬贴）。
+    """
+    if max_len <= 0.0:
+        return
+    ends = []
+    for i, pts in enumerate(line_pts):
+        if pts.shape[0] < 2:
+            continue
+        if float(np.linalg.norm(pts[0] - pts[-1])) <= 1e-9:
+            continue                       # 闭合环没有开放端点
+        ends.append((i, 0))
+        ends.append((i, -1))
+    if not ends:
+        return
+    for i, s in ends:
+        pts = line_pts[i]
+        E = pts[0] if s == 0 else pts[-1]
+        nb = pts[1] if s == 0 else pts[-2]
+        d = E - nb
+        n = float(np.linalg.norm(d))
+        if n <= 1e-12:
+            continue
+        d = d / n
+        best = None                        # (t, pj, seg, Q)
+        for j, other in enumerate(line_pts):
+            if j == i or other.shape[0] < 2:
+                continue
+            A, B = other[:-1], other[1:]
+            w = B - A
+            denom = d[0] * w[:, 1] - d[1] * w[:, 0]
+            ok = np.abs(denom) > 1e-12
+            if not ok.any():
+                continue
+            ae = A - E
+            t = np.where(ok, (ae[:, 0] * w[:, 1] - ae[:, 1] * w[:, 0])
+                         / np.where(ok, denom, 1.0), -1.0)
+            u = np.where(ok, (ae[:, 0] * d[1] - ae[:, 1] * d[0])
+                         / np.where(ok, denom, 1.0), -1.0)
+            m = ok & (t > 1e-9) & (t <= max_len) & (u >= 0.0) & (u <= 1.0)
+            if not m.any():
+                continue
+            k = int(np.argmin(np.where(m, t, np.inf)))
+            tt = float(t[k])
+            if best is None or tt < best[0]:
+                best = (tt, j, k, E + d * tt)
+        if best is None:
+            continue
+        _tt, j, k, q = best
+        # 交点同时进入双方折线：自己延长到 q，对方在 k 段后插入 q
+        if s == 0:
+            line_pts[i] = np.vstack((q[None, :], pts))
+        else:
+            line_pts[i] = np.vstack((pts, q[None, :]))
+        other = line_pts[j]
+        if float(np.linalg.norm(other[k] - q)) > 1e-12:
+            line_pts[j] = np.insert(other, k + 1, q, axis=0)
+
+
+def _insert_t_junctions(line_pts, tol: float) -> None:
+    """把落在**其他折线内部**的开放端点接入该折线（T 型接点，就地修改）。
+
+    "一条直线 + 一条两端都搭在直线上的曲线"这类情形：端点只与直线内部相接、
+    并不与之交叉，union 时不会产生节点，polygonize 也就剖不出闭合面。
+    这里对每个开放端点：
+      * 垂足落在某段内部 → 把该点插入那一折线（精确取其投影点，保证共线）；
+      * 垂足落在某段端点附近 → 把端点坐标对齐到该顶点（顶点已存在，即连通）。
+    容差由调用方按视图像素换算传入（视觉贴合即算连通）。
+    """
+    ends = []
+    for i, pts in enumerate(line_pts):
+        if pts.shape[0] < 2:
+            continue
+        if float(np.linalg.norm(pts[0] - pts[-1])) <= 1e-9:
+            continue
+        ends.append((i, 0))
+        ends.append((i, -1))
+    if not ends:
+        return
+
+    seg_a, seg_b, seg_poly = [], [], []
+    starts = {}
+    nseg = 0
+    for i, pts in enumerate(line_pts):
+        starts[i] = nseg              # 该折线第一段在拼接数组里的下标
+        seg_a.append(pts[:-1])
+        seg_b.append(pts[1:])
+        seg_poly.extend([i] * (pts.shape[0] - 1))
+        nseg += pts.shape[0] - 1
+    A = np.concatenate(seg_a)
+    B = np.concatenate(seg_b)
+    AB = B - A
+    L2 = np.einsum("ij,ij->i", AB, AB)
+    ok = L2 > 1e-18
+    inv = np.where(ok, 1.0 / np.maximum(L2, 1e-18), 0.0)
+    pid = np.asarray(seg_poly, dtype=np.int64)
+
+    inserts = {}          # 折线序号 -> [(段序号, t, 点)]
+    seg_minx = np.minimum(A[:, 0], B[:, 0]) - tol
+    seg_maxx = np.maximum(A[:, 0], B[:, 0]) + tol
+    seg_miny = np.minimum(A[:, 1], B[:, 1]) - tol
+    seg_maxy = np.maximum(A[:, 1], B[:, 1]) + tol
+    for i, s in ends:
+        P = line_pts[i][s]
+        # 先用段包围盒粗筛（端点只可能与附近的段相接），再算精确垂距
+        sel = ((seg_minx <= P[0]) & (seg_maxx >= P[0])
+               & (seg_miny <= P[1]) & (seg_maxy >= P[1]) & (pid != i))
+        idx = np.nonzero(sel)[0]
+        if idx.size == 0:
+            continue
+        AP = P[None, :] - A[idx]
+        t = np.clip(np.einsum("ij,ij->i", AP, AB[idx]) * inv[idx], 0.0, 1.0)
+        proj = A[idx] + AB[idx] * t[:, None]
+        d = np.linalg.norm(P[None, :] - proj, axis=1)
+        k = int(np.argmin(d))
+        if d[k] > tol:
+            continue
+        j = int(idx[k])
+        pj = int(pid[j])
+        tj = float(t[k])
+        if tj <= 1e-6:
+            line_pts[i][s] = A[j].copy()
+        elif tj >= 1.0 - 1e-6:
+            line_pts[i][s] = B[j].copy()
+        else:
+            q = proj[k].copy()
+            inserts.setdefault(pj, []).append((j - starts[pj], tj, q))
+            line_pts[i][s] = q      # 端点同时吸附到垂足，缝隙才会真正闭合
+
+    for i, items in inserts.items():
+        pts = line_pts[i]
+        keep = sorted(items, key=lambda x: (x[0], x[1]))
+        new = [pts[0]]
+        for seg in range(pts.shape[0] - 1):
+            for _s, _t, q in keep:
+                if _s == seg:
+                    new.append(q)
+            new.append(pts[seg + 1])
+        arr = np.asarray(new, dtype=np.float64)
+        if arr.shape[0] > 2:
+            m = np.ones(arr.shape[0], dtype=bool)
+            m[1:] = np.any(np.abs(np.diff(arr, axis=0)) > 1e-12, axis=1)
+            arr = arr[m]
+        line_pts[i] = arr
+
+
+def _snap_open_endpoints(line_pts, tol: float) -> None:
+    """把开放折线端点按相对线框尺寸的极小容差合并（就地修改首尾点）。
+
+    分别绘制的多段曲线端点常有微小间隙，直接 union 无法闭合；这里用网格
+    哈希 + 并查集聚类后统一到同一坐标，使区域能被 polygonize 正确识别。
+    """
+    ends = []
+    for i, pts in enumerate(line_pts):
+        if float(np.linalg.norm(pts[0] - pts[-1])) <= 1e-9:
+            continue
+        ends.append((i, 0))
+        ends.append((i, -1))
+    if len(ends) < 4:
+        return
+    coords = np.asarray([line_pts[i][s] for i, s in ends], dtype=np.float64)
+    keys = np.floor(coords / tol).astype(np.int64)
+    cells = {}
+    for k in range(len(coords)):
+        cells.setdefault((int(keys[k, 0]), int(keys[k, 1])), []).append(k)
+    parent = list(range(len(coords)))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for (cx, cy), idxs in cells.items():
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                other = cells.get((cx + dx, cy + dy))
+                if not other:
+                    continue
+                for a in idxs:
+                    for b in other:
+                        if b <= a:
+                            continue
+                        if abs(coords[a, 0] - coords[b, 0]) <= tol \
+                                and abs(coords[a, 1] - coords[b, 1]) <= tol:
+                            ra, rb = find(a), find(b)
+                            if ra != rb:
+                                parent[rb] = ra
+    # 每个端点簇统一到簇内第一个端点的坐标
+    reps = {}
+    for k in range(len(coords)):
+        r = find(k)
+        reps.setdefault(r, coords[k].copy())
+    for k, (i, s) in enumerate(ends):
+        line_pts[i][s] = reps[find(k)]

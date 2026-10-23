@@ -35,7 +35,12 @@ DEFAULT_BASE_ANGLE = 80.0
 DEFAULT_FREE_HEIGHT = 3.0
 DEFAULT_BORDER_ANGLE = 45.0
 DEFAULT_BULGE_STRENGTH = 1.0
-DEFAULT_HEIGHT_CALIB = 0.4
+DEFAULT_HEIGHT_CALIB = 0.5
+# 自由鼓起峰值 = 内切半径 × tan(边界角) × 强度 × 本系数。
+# 取 0.5 有几何依据：椭圆剖面 u = 2t - t²（t = d/dmax）在边界处斜率
+# dh/dd = 2·H/dmax，令其等于 tan(边界角)·强度 即得 H = dmax·tan(边界角)·强度/2，
+# 于是"边界角"就是穹顶边缘的真实坡度，与精雕的区域浮雕一致。
+# （旧值 0.4 是拍脑袋校准，10mm 圆/边界20° 时比精雕低约 8%。）
 
 # 截面类型 / 表面特点 / 拼合方式 / 高度模式 / 倒角模式
 SHAPES = ("ellipse", "rectangle", "triangle", "circle", "spline", "chamfer")
@@ -255,12 +260,17 @@ def compute_signed_distance(inside: np.ndarray, cell: float,
     # 精确欧氏距离变换（与插件的 Felzenszwalb 1D EDT 同为精确解，单位为格）
     dist = distance_transform_edt(~seed).astype(np.float64)
     if outside_zero:
-        return dist * float(cell)
+        # 必须把外部真正清零：EDT 对外部像素同样给出正距离，若直接返回
+        # dist*cell，调用方取 max() 得到的是"离区域边界最远的**外部**像素"
+        # 距离（随模型图幅变大而增大），穹顶峰值会按模型尺寸放大——这正是
+        # 小圆浮雕在 160mm 模型上算出 12.87mm（应为 1.7mm 量级）的根因。
+        return np.where(inside, dist, 0.0) * float(cell)
     return np.where(inside, dist, -dist) * float(cell)
 
 
 def compute_polygon_sd(poly: np.ndarray, grid: Grid,
-                       inside: np.ndarray | None = None) -> np.ndarray:
+                       inside: np.ndarray | None = None,
+                       holes: Sequence[np.ndarray] | None = None) -> np.ndarray:
     """解析多边形有符号距离场（全域）：到折线边界的精确欧氏距离。
 
     与 :func:`compute_signed_distance`（像素掩码 + EDT）相比，本函数不做
@@ -273,6 +283,10 @@ def compute_polygon_sd(poly: np.ndarray, grid: Grid,
     贴根的小高度等值线不再贴着像素掩码走。inside 参数保留兼容但不再
     用于跳过外部像素（符号必须全域正确）。
 
+    holes：区域内部的孔洞环（如字母 O 的内圈、回字形内圈）。距离取到
+    **所有**环边界的最近值；符号用全部环合并后的奇偶规则（外环内、孔洞外
+    为正），孔洞边界因此也是一条真实的起坡边界，不会形成垂直断崖。
+
     性能：边数 > 256 的密集采样轮廓先按弧长均匀重采样到 256——弦高
     误差随曲率自消（对剖面 s = sd/dmax 是系统性偏置），对圆/椭圆类
     光滑轮廓不引入可见误差；射线法用交点排序 + searchsorted。
@@ -283,13 +297,18 @@ def compute_polygon_sd(poly: np.ndarray, grid: Grid,
     min_x, min_y, spacing, nx, ny = grid
     if poly.shape[0] < 2:
         return np.zeros((ny, nx), dtype=np.float64)
-    if poly.shape[0] > 256:
-        poly = resample_polyline(poly, 256)
+    rings = [poly]
+    for h in holes or ():
+        if h is not None and h.shape[0] >= 2:
+            rings.append(h)
+    # 密集环先按弧长均匀降采样（弦高误差随曲率自消）
+    rings = [resample_polyline(r, 256) if r.shape[0] > 256 else r for r in rings]
 
-    ax = poly[:, 0]
-    ay = poly[:, 1]
-    bx = np.roll(ax, -1)
-    by = np.roll(ay, -1)
+    # 逐环展开边（不能跨环 roll，否则会把一个环的末点连到下一个环的首点）
+    ax = np.concatenate([r[:, 0] for r in rings])
+    ay = np.concatenate([r[:, 1] for r in rings])
+    bx = np.concatenate([np.roll(r[:, 0], -1) for r in rings])
+    by = np.concatenate([np.roll(r[:, 1], -1) for r in rings])
     abx = bx - ax
     aby = by - ay
     len_sq = abx * abx + aby * aby
@@ -345,10 +364,10 @@ def compute_polygon_sd(poly: np.ndarray, grid: Grid,
 
     # ---- 边界 2 像素带：全分辨率精确覆盖 ----
     if step > 1:
-        inside = build_inside_mask(poly, grid)
-        if inside.any():
+        band_mask = inside if inside is not None else build_inside_mask(poly, grid)
+        if band_mask.any():
             from scipy.ndimage import binary_dilation
-            band = binary_dilation(inside, structure=np.ones((5, 5), dtype=bool))
+            band = binary_dilation(band_mask, structure=np.ones((5, 5), dtype=bool))
             rr_, cc_ = np.nonzero(band)
             d_band = _exact_dist(min_x + cc_ * spacing, min_y + rr_ * spacing)
             # band 内像素的符号：逐行射线（只对出现的行）
@@ -391,11 +410,20 @@ def _seg_dist_sq(px: np.ndarray, py: float, ax: np.ndarray, ay: np.ndarray,
 
 
 def compute_base_height_field(poly: np.ndarray, grid: Grid,
-                              base_height: float, base_angle_deg: float) -> np.ndarray:
+                              base_height: float, base_angle_deg: float,
+                              holes: Sequence[np.ndarray] | None = None) -> np.ndarray:
     """基高高度场：高度 = min(d × tan(基角), 基高)，d 为到折线边界的最近欧氏距离。
 
-    只计算多边形内部的顶点（扫描线确定每行内部列区间），外部保持 0。
+    只计算多边形内部的顶点（扫描线确定内部掩膜），外部保持 0。
     斜面平整、屋脊锐利，等价于 Rhino 的 ExtrudeCrvTapered。
+    holes 为区域内部孔洞环：孔洞内部同样保持 0，且孔洞边界与外墙一样
+    向外起坡（逐边作用带对全部环生效），不会在岛屿边缘出现垂直断崖。
+
+    实现：内部顶点先置为基高，再逐边在其作用带（边 bbox ±max_dist）内取
+    min(min(d×tan, 基高))；超出所有作用带（最近边 > max_dist）的格子保持基高，
+    外部格子为 0（高度非负，取 min 后仍为 0）。与原“逐行×区间×边（bbox 粗筛）”
+    实现逐位等价：被原粗筛排除的边都 ≥max_dist、贡献被截断为基高，故纳入与否
+    无影响；每条边用与原实现相同的表达式，最终高度逐位一致。
     """
     min_x, min_y, spacing, nx, ny = grid
     field = np.zeros((ny, nx), dtype=np.float64)
@@ -408,46 +436,58 @@ def compute_base_height_field(poly: np.ndarray, grid: Grid,
     max_dist = base_height / tan_base
     max_dist_sq = max_dist * max_dist
 
-    ax = poly[:, 0]
-    ay = poly[:, 1]
-    bx = np.roll(ax, -1)
-    by = np.roll(ay, -1)
+    rings = [poly]
+    for h in holes or ():
+        if h is not None and h.shape[0] >= 2:
+            rings.append(h)
+    # 逐环展开边（不能跨环 roll，否则会把一个环的末点连到下一个环的首点）
+    ax = np.concatenate([r[:, 0] for r in rings])
+    ay = np.concatenate([r[:, 1] for r in rings])
+    bx = np.concatenate([np.roll(r[:, 0], -1) for r in rings])
+    by = np.concatenate([np.roll(r[:, 1], -1) for r in rings])
     abx = bx - ax
     aby = by - ay
     len_sq = abx * abx + aby * aby
     inv_len_sq = np.where(len_sq > 1e-18, 1.0 / np.maximum(len_sq, 1e-18), 1e18)
-    e_min_x = np.minimum(ax, bx)
-    e_max_x = np.maximum(ax, bx)
-    e_min_y = np.minimum(ay, by)
-    e_max_y = np.maximum(ay, by)
 
-    fills = compute_row_scan_fills(poly, min_y, spacing, ny)
-    for r, xs in enumerate(fills):
-        cnt = xs.size - (xs.size % 2)
-        if cnt < 2:
+    inside = build_inside_mask(poly, grid)
+    for h in (holes or ()):
+        if h is not None and h.shape[0] >= 2:
+            inside &= ~build_inside_mask(h, grid)
+    if not inside.any():
+        return field
+    field[inside] = base_height
+
+    xs_axis = min_x + np.arange(nx, dtype=np.float64) * spacing
+    ys_axis = min_y + np.arange(ny, dtype=np.float64) * spacing
+    axl = ax.tolist(); ayl = ay.tolist()
+    bxl = bx.tolist(); byl = by.tolist()
+    abxl = abx.tolist(); abyl = aby.tolist()
+    invl = inv_len_sq.tolist()
+    for i in range(len(axl)):
+        sx = axl[i]; sy = ayl[i]
+        ex = bxl[i]; ey = byl[i]
+        c0 = max(0, int(math.floor((min(sx, ex) - max_dist - min_x) / spacing)))
+        c1 = min(nx - 1, int(math.ceil((max(sx, ex) + max_dist - min_x) / spacing)))
+        r0 = max(0, int(math.floor((min(sy, ey) - max_dist - min_y) / spacing)))
+        r1 = min(ny - 1, int(math.ceil((max(sy, ey) + max_dist - min_y) / spacing)))
+        if c0 > c1 or r0 > r1:
             continue
-        wy = min_y + r * spacing
-        for p in range(0, cnt, 2):
-            c0 = int(math.ceil((xs[p] - min_x) / spacing - 1e-9))
-            c1 = int(math.floor((xs[p + 1] - min_x) / spacing + 1e-9))
-            c0 = max(0, c0)
-            c1 = min(nx - 1, c1)
-            if c1 < c0:
-                continue
-            cols = np.arange(c0, c1 + 1, dtype=np.float64)
-            px = min_x + cols * spacing
-
-            # 包围盒快速排除：该行区间 ± max_dist 外的边不参与
-            sel = ((e_max_x >= xs[p] - max_dist) & (e_min_x <= xs[p + 1] + max_dist) &
-                   (e_max_y >= wy - max_dist) & (e_min_y <= wy + max_dist))
-            if not sel.any():
-                # 所有边都远 → 平台高度
-                field[r, c0:c1 + 1] = base_height
-                continue
-            d2 = _seg_dist_sq(px, wy, ax[sel], ay[sel], abx[sel], aby[sel],
-                              inv_len_sq[sel])
+        px = xs_axis[c0:c1 + 1]
+        abxi = abxl[i]; abyi = abyl[i]; invi = invl[i]
+        # 按行分块计算，控制临时数组内存（长边的大窗口）
+        for rs in range(r0, r1 + 1, 512):
+            re = min(rs + 512 - 1, r1)
+            wy = ys_axis[rs:re + 1]
+            apx = px[None, :] - sx
+            apy = wy[:, None] - sy
+            t = np.clip((apx * abxi + apy * abyi) * invi, 0.0, 1.0)
+            dx = px[None, :] - (sx + t * abxi)
+            dy = wy[:, None] - (sy + t * abyi)
+            d2 = dx * dx + dy * dy
             h = np.where(d2 >= max_dist_sq, base_height, np.sqrt(d2) * tan_base)
-            field[r, c0:c1 + 1] = h
+            win = field[rs:re + 1, c0:c1 + 1]
+            np.minimum(win, h, out=win)
     return field
 
 
@@ -579,8 +619,15 @@ def compute_smooth_dome_free_bulge(inside: np.ndarray, grid: Grid,
     coarse_dmax = float(coarse_sd.max())
     if coarse_dmax < 1e-3:
         return field
+    # 峰值必须按**细网格真实内切半径**算：粗网格（最大边 256）对 10mm 小圆在
+    # 大模型上只有几个格子，量化会把半径压小，高度随模型尺寸漂移。
+    # 粗网格只负责解的形状（解随后按峰值归一化），不影响高度。
+    fine_sd = compute_signed_distance(inside, spacing)
+    fine_dmax = float(fine_sd.max())
+    if fine_dmax < 1e-3:
+        return field
 
-    target_peak = (coarse_dmax * math.tan(math.radians(params.border_angle))
+    target_peak = (fine_dmax * math.tan(math.radians(params.border_angle))
                    * params.bulge_strength * params.height_calib)
     if target_peak <= 1e-9:
         return field
@@ -617,11 +664,8 @@ def compute_smooth_dome_free_bulge(inside: np.ndarray, grid: Grid,
     # 基高平台区不叠加鼓起（与棱角清晰路径保持同一约定）
     if base_height > 1e-9:
         tan_base = max(1e-6, math.tan(math.radians(max(1e-6, base_angle_deg))))
-        s_platform = max(0.0, min((base_height / tan_base) / coarse_dmax, 0.9))
-        fine_sd = compute_signed_distance(inside, spacing)
-        fine_dmax = float(fine_sd.max())
-        if fine_dmax > 1e-6:
-            field[(fine_sd / fine_dmax) <= s_platform] = 0.0
+        s_platform = max(0.0, min((base_height / tan_base) / fine_dmax, 0.9))
+        field[(fine_sd / fine_dmax) <= s_platform] = 0.0
     return field
 
 
@@ -719,23 +763,30 @@ def compute_chamfer_height_field(inside: np.ndarray, sd: np.ndarray,
 # ==================== 主入口 ====================
 
 def compute_region_relief_field(poly: np.ndarray, grid: Grid,
-                                params: RegionReliefParams) -> np.ndarray:
+                                params: RegionReliefParams,
+                                holes: Sequence[np.ndarray] | None = None) -> np.ndarray:
     """按截面类型算出总高度场 (ny, nx)：total = 基高 + 自由鼓起。
 
-    poly 为曲线密集采样点（世界坐标，闭合）。
+    poly 为曲线密集采样点（世界坐标，闭合）；holes 为内部孔洞环。
     """
     min_x, min_y, spacing, nx, ny = grid
     field = np.zeros((ny, nx), dtype=np.float64)
     if poly.shape[0] < 3:
         return field
 
+    hole_polys = [h for h in (holes or ())
+                  if h is not None and h.shape[0] >= 3]
     inside = build_inside_mask(poly, grid)
+    for h in hole_polys:
+        inside &= ~build_inside_mask(h, grid)
     if not inside.any():
         return field
 
     collapsed = collapse_collinear(poly)
+    collapsed_holes = [collapse_collinear(h) for h in hole_polys]
     base = compute_base_height_field(collapsed, grid,
-                                     params.base_height, params.base_angle)
+                                     params.base_height, params.base_angle,
+                                     holes=collapsed_holes)
 
     if params.shape == "rectangle":
         # 矩形 = 只有基高，无自由鼓起
@@ -756,7 +807,7 @@ def compute_region_relief_field(poly: np.ndarray, grid: Grid,
     else:
         # 穹顶用解析多边形 SDF：像素化掩码的 EDT 台阶会让高度曲线
         # 提取出"奇怪的多边形"（尤其小高度等值线贴着掩码边界走）
-        sd = compute_polygon_sd(collapsed, grid, inside)
+        sd = compute_polygon_sd(collapsed, grid, inside, collapsed_holes)
         free = compute_dome_free_bulge(inside, sd, params,
                                        params.base_height, params.base_angle)
 
@@ -774,10 +825,12 @@ def compute_region_relief_field(poly: np.ndarray, grid: Grid,
 def apply_region_relief(hf, poly: np.ndarray,
                         params: RegionReliefParams,
                         color_mask: np.ndarray | None = None,
-                        color_value: int = 0) -> int:
+                        color_value: int = 0,
+                        holes: Sequence[np.ndarray] | None = None) -> int:
     """把区域浮雕应用到高度场，返回被修改的顶点数。
 
     hf: HeightField（就地修改 data）。poly: 曲线采样点（世界坐标）。
+    holes: 区域内部孔洞环（可选，如一条闭合轮廓里包含的文字内圈）。
     拼合方式：add 叠加 / subtract 切除 / replace 取代。
 
     作用区域（params.color_scope，按色号蒙版裁剪，相对当前颜色 color_value）：
@@ -788,7 +841,7 @@ def apply_region_relief(hf, poly: np.ndarray,
     color_mask 必须与 hf.data 同形状（同栅格）。
     """
     grid = (hf.origin[0], hf.origin[1], hf.spacing, hf.nx, hf.ny)
-    total = compute_region_relief_field(poly, grid, params)
+    total = compute_region_relief_field(poly, grid, params, holes=holes)
     mask = total > 1e-6
     # 作用区域裁剪：按当前颜色把起浮雕范围限定在色号蒙版的内/外
     scope = getattr(params, "color_scope", "ignore")

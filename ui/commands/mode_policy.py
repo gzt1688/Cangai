@@ -22,6 +22,7 @@ MODE_LABELS = {"2d": "2D", "relief": "浮雕", "3d": "3D", "cnc": "CNC"}
 COMMAND_MODES = {
     # ---- 3D 实体命令：仅 3D 模式（build123d 内核，结果进 3D 空间） ----
     "Extrude":   ("3d",),   # 挤出
+    "Primitive": ("3d",),   # 标准体（立方体/圆柱体/圆环/圆锥体）
     "PushPull":  ("3d", "cnc"),   # 推拉（面挤出/挖孔/倒角；CNC 空间调整实体沿用原支持）
     "Boolean3D": ("3d",),   # 3D 布尔
     "Thread":    ("3d",),   # 螺纹
@@ -29,12 +30,17 @@ COMMAND_MODES = {
     "Fillet3D":  ("3d",),   # 3D 圆角
     "WallLine":  ("3d",),   # 墙线（双侧偏移挤出墙体实体）
 
+    # 2D → 3D 桥梁命令：只在有 2D/浮雕曲线的模式可用
+    "TransferTo3D": ("2d", "relief"),   # 转入3D（曲线复制到 3D 空间）
+
     # ---- 模具插件（cookie_cutter）：生成 3D 打印模具实体，仅 3D 模式 ----
     "cookie_cutter.create":          ("3d",),   # 模具（外切模）
     "cookie_cutter.mooncake_curve":  ("3d",),   # 月饼曲线
     "cookie_cutter.mooncake_extrude": ("3d",),  # 月饼拉伸
     "cookie_cutter.cookie_curve":    ("3d",),   # 饼干曲线
     "cookie_cutter.cookie_extrude":  ("3d",),   # 饼干拉伸
+    # 浮雕模式功能（模具组内用分割线与 3D 实体功能分开）
+    "cookie_cutter.biscuit_relief":  ("relief",),  # 浮雕饼干
 
     # ---- 浮雕命令：仅浮雕模式 ----
     "NewModel":        ("relief",),   # 新建模型

@@ -5,14 +5,15 @@ from PyInstaller.utils.hooks import collect_submodules
 binaries = []
 hiddenimports = ['pymillcam', 'shapely', 'pydantic', 'PySide6', 'PySide6.QtWidgets', 'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtOpenGL', 'numpy', 'moderngl', 'glcontext', 'fontTools', 'ezdxf']
 binaries += collect_dynamic_libs('shapely')
+hiddenimports += collect_submodules('build123d')
 hiddenimports += collect_submodules('pydantic')
 
 
 a = Analysis(
     ['main.py'],
-    pathex=['deps/pymillcam-main/src'],
+    pathex=['deps/pymillcam-main/src', 'deps/build123d-0.11.1/src'],
     binaries=binaries,
-    datas=[('icons', 'icons'), ('resources', 'resources'), ('deps/pymillcam-main/src/pymillcam', 'pymillcam')],
+    datas=[('icons', 'icons'), ('resources', 'resources'), ('deps/pymillcam-main/src/pymillcam', 'pymillcam'), ('deps/build123d-0.11.1/src/build123d/data', 'build123d/data'), ('.venv/Lib/site-packages/lib3mf/lib3mf.dll', 'lib3mf')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

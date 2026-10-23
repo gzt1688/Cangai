@@ -5,12 +5,16 @@
 实时更新命令状态与画布预览。
 """
 from __future__ import annotations
-from PySide6.QtCore import Qt, Signal
+import math
+import os
+from typing import List
+from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                                QGridLayout, QDoubleSpinBox, QSpinBox,
                                QPushButton, QCheckBox, QRadioButton,
                                QButtonGroup, QLabel, QGroupBox, QFrame,
-                               QComboBox, QStackedWidget)
+                               QComboBox, QStackedWidget, QSizePolicy,
+                               QAbstractSpinBox)
 
 import ui.styles.theme as theme
 from core.relief import HeightField
@@ -41,6 +45,53 @@ from core.relief.smooth import (SmoothParams, MODE_LABELS, STRENGTH_PRESETS,
 
 _SPIN_RANGE = (-999999.0, 999999.0)
 _LABEL_W = 52      # 行标签统一最小宽：容纳"指定角度"4 字不截断
+
+
+class _PanelStateStore:
+    """命令面板参数持久化（%APPDATA%/Cangai/command_panel_state.json）。
+
+    按面板类名分组存取；同一类名下按控件遍历序定位（面板构建顺序固定）。
+    """
+
+    @staticmethod
+    def path() -> str:
+        import os
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "Cangai")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            d = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(d, "command_panel_state.json")
+
+    @classmethod
+    def load(cls, key: str) -> dict:
+        import json
+        try:
+            with open(cls.path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            v = data.get(key)
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def save(cls, key: str, values: dict) -> None:
+        import json
+        data = {}
+        try:
+            with open(cls.path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[key] = values
+        try:
+            with open(cls.path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
 
 
 class _ClickLabel(QLabel):
@@ -253,6 +304,11 @@ class ParamPanelBase(QWidget):
             if isinstance(p, CommandParamHost):
                 p._fitHeight()
                 break
+            from PySide6.QtWidgets import QScrollArea
+            if isinstance(p, QScrollArea):
+                # 滚动区 adjustSize 会缩到自身 sizeHint，压缩可见高度——跳过
+                p = p.parentWidget()
+                continue
             pl = p.layout()
             if pl is not None:
                 pl.invalidate()
@@ -280,6 +336,122 @@ class ParamPanelBase(QWidget):
             s.setValue(v)
             s.blockSignals(False)
 
+    # ---------- 参数记忆（重开命令保留上次填的参数） ----------
+
+    def _persistKey(self) -> str:
+        return self.__class__.__name__
+
+    def _persistWidgets(self) -> list:
+        """收集可持久化的输入控件（按创建序定位；坐标 X/Y/Z 除外；
+        属于 QButtonGroup 的单选钮由按钮组统一收集，避免双重定位）。"""
+        excl = {id(w) for w in (self._spinX, self._spinY, self._spinZ)
+                if w is not None}
+        out = []
+        for cls in (QDoubleSpinBox, QSpinBox, QComboBox, QCheckBox,
+                    QRadioButton):
+            for w in self.findChildren(cls):
+                if id(w) in excl:
+                    continue
+                if isinstance(w, QRadioButton) and w.group() is not None:
+                    continue   # 按钮组统一负责
+                out.append(w)
+        return out
+
+    def _persistGroups(self) -> list:
+        return self.findChildren(QButtonGroup)
+
+    def _collectState(self) -> dict:
+        state = {}
+        counts: dict = {}
+        for w in self._persistWidgets():
+            cls = type(w).__name__
+            counts[cls] = counts.get(cls, 0) + 1
+            key = "%s#%d" % (cls, counts[cls] - 1)
+            if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+                state[key] = w.value()
+            elif isinstance(w, QComboBox):
+                state[key] = w.currentIndex()
+            elif isinstance(w, (QCheckBox, QRadioButton)):
+                state[key] = w.isChecked()
+        for i, g in enumerate(self._persistGroups()):
+            state["QButtonGroup#%d" % i] = g.checkedId()
+        return state
+
+    def _applyState(self, state: dict) -> None:
+        counts: dict = {}
+        changed_combos: list = []
+        changed_checks: list = []
+        changed_groups: list = []
+        for w in self._persistWidgets():
+            cls = type(w).__name__
+            idx = counts.get(cls, 0)
+            counts[cls] = idx + 1
+            key = "%s#%d" % (cls, idx)
+            if key not in state:
+                continue
+            v = state[key]
+            w.blockSignals(True)
+            try:
+                if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+                    w.setValue(float(v))
+                elif isinstance(w, QComboBox):
+                    if isinstance(v, int) and 0 <= v < w.count():
+                        old = w.currentIndex()
+                        w.setCurrentIndex(v)
+                        if w.currentIndex() != old:
+                            changed_combos.append(w)
+                elif isinstance(w, (QCheckBox, QRadioButton)):
+                    old = w.isChecked()
+                    w.setChecked(bool(v))
+                    if w.isChecked() != old:
+                        changed_checks.append(w)
+            except Exception:
+                pass
+            w.blockSignals(False)
+        # 按钮组（单选组）：恢复 checkedId 并重放 idClicked（kind 等联动
+        # 接的是 idClicked，toggled 重放不会触发它们）
+        for i, g in enumerate(self._persistGroups()):
+            key = "QButtonGroup#%d" % i
+            if key not in state:
+                continue
+            v = state[key]
+            if isinstance(v, int) and v != g.checkedId() \
+                    and g.button(v) is not None:
+                g.button(v).setChecked(True)
+                changed_groups.append((g, v))
+        # 恢复期间 blockSignals 抑制了面板联动（如下方内容区随选择切换）
+        # —— 对值有变化的控件补发联动信号（幂等，只影响真正变化的项）
+        for w in changed_combos:
+            w.currentIndexChanged.emit(w.currentIndex())
+        for w in changed_checks:
+            w.toggled.emit(w.isChecked())
+        for g, v in changed_groups:
+            g.idClicked.emit(v)
+
+    def savePanelState(self) -> None:
+        try:
+            _PanelStateStore.save(self._persistKey(), self._collectState())
+        except Exception:
+            pass
+
+    def restorePanelState(self) -> None:
+        try:
+            state = _PanelStateStore.load(self._persistKey())
+            if state:
+                self._applyState(state)
+        except Exception:
+            pass
+
+    def showEvent(self, ev) -> None:
+        if not getattr(self, "_stateRestored", False):
+            self._stateRestored = True
+            self.restorePanelState()
+        super().showEvent(ev)
+
+    def hideEvent(self, ev) -> None:
+        self.savePanelState()
+        super().hideEvent(ev)
+
 
 # ==================== Point ====================
 
@@ -302,78 +474,175 @@ class LineParamPanel(ParamPanelBase):
     undoClicked = Signal()
     closeToggled = Signal(bool)
     confirmRequested = Signal()
-    drawParamRequested = Signal()   # 按参数画点：指定长度 + 指定角度一键落点
+    drawParamRequested = Signal()   # 兼容旧引用（新面板改用开关式指定长度/角度）
     bisectorToggled = Signal(bool)  # 角平分线模式开关
+
+    def _modeButton(self, text: str, tip: str) -> QPushButton:
+        """可按下高亮的模式按钮（标题即开关：按下生效、再按关闭）。"""
+        b = self._button2(text)
+        b.setCheckable(True)
+        b.setToolTip(tip)
+        b.setStyleSheet(
+            "QPushButton { background:%s; color:%s; border:1px solid %s;"
+            " border-radius:2px; padding:3px 8px; }"
+            "QPushButton:hover { border-color:%s; color:%s; }"
+            "QPushButton:checked { background:%s; color:%s;"
+            " border-color:%s; font-weight:bold; }"
+            % (theme.BG_PANEL, theme.TEXT, theme.BORDER, theme.PRIMARY,
+               theme.PRIMARY_DARK, theme.PRIMARY, theme.TEXT_ON_PRIMARY,
+               theme.PRIMARY))
+        return b
+
+    def isLengthMode(self) -> bool:
+        return self._btnLenMode.isChecked()
+
+    def isAngleMode(self) -> bool:
+        return self._btnAngMode.isChecked()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._addCoordRows(withZ=True)
+        # 坐标用网格而非固定像素宽：X/Z 同处第 1 列（拉伸），Y/添加点同处第 3 列，
+        # 列内宽度由布局统一分配 → 永远等宽且左端对齐，且任何面板宽度下都能压缩，
+        # 不会撑出横向滚动条（默认内容宽 ≈258，含竖滚动条时 ≈252）。
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(5)
+        self._spinX = self._spin()
+        self._spinY = self._spin()
+        self._spinZ = self._spin()
+        for sp in (self._spinX, self._spinY, self._spinZ):
+            sp.setMinimumWidth(44)          # 允许压缩，防溢出
+            sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        labX, labY, labZ = QLabel("X"), QLabel("Y"), QLabel("Z")
+        for lb in (labX, labY, labZ):
+            lb.setFixedWidth(14)
         btnAdd = self._button2("添加点")
+        btnAdd.setMinimumWidth(44)
+        btnAdd.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btnAdd.clicked.connect(self.addPointRequested.emit)
-        self._layout.addWidget(btnAdd)
+        grid.addWidget(labX, 0, 0)
+        grid.addWidget(self._spinX, 0, 1)
+        grid.addWidget(labY, 0, 2)
+        grid.addWidget(self._spinY, 0, 3)
+        grid.addWidget(labZ, 1, 0)
+        grid.addWidget(self._spinZ, 1, 1)
+        grid.addWidget(btnAdd, 1, 3)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 1)
+        self._layout.addLayout(grid)
 
-        # 长度：实时显示当前段长 + 输入目标长度（按参数画点时生效）
+        # 实时读数同行、各占一半：长度 | 角度（同一网格列宽保证对半分）
         self._labelLength = self._label("--")
-        self._addRow("长度", self._labelLength)
-        self._spinLength = self._spin(0.0, decimals=3)
-        self._addRow("指定长度", self._spinLength)
-
-        # 角度：实时偏转角 + 角度弧预览勾选（同行）；顺/逆 + 指定角度（相对上段）
         self._labelAngle = self._label("--")
-        angRow = QHBoxLayout()
-        angRow.setSpacing(4)
-        labA = QLabel("角度")
-        labA.setMinimumWidth(_LABEL_W)
-        self._chkAnglePreview = QCheckBox("预览")
-        angRow.addWidget(labA)
-        angRow.addWidget(self._labelAngle)
-        angRow.addWidget(self._chkAnglePreview)
-        angRow.addStretch(1)
-        self._layout.addLayout(angRow)
+        for lb in (self._labelLength, self._labelAngle):
+            # 水平 Ignored：读数再长也不会撑宽面板（超宽时裁切而非出滚动条）
+            lb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lb.setMinimumWidth(0)
+            lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        info = QGridLayout()
+        info.setContentsMargins(0, 0, 0, 0)
+        info.setHorizontalSpacing(4)
+        labLen, labAng = QLabel("长度："), QLabel("角度：")
+        for lb in (labLen, labAng):
+            lb.setFixedWidth(34)
+        info.addWidget(labLen, 0, 0)
+        info.addWidget(self._labelLength, 0, 1)
+        info.addWidget(labAng, 0, 2)
+        info.addWidget(self._labelAngle, 0, 3)
+        info.setColumnStretch(0, 0)
+        info.setColumnStretch(1, 1)
+        info.setColumnStretch(2, 0)
+        info.setColumnStretch(3, 1)
+        self._layout.addLayout(info)
 
+        # 指定长度：标题按钮即开关（按下高亮生效，再按关闭）
+        self._btnLenMode = self._modeButton(
+            "指定长度", "按下后按此长度落点，再按关闭")
+        self._spinLength = self._spin(0.0, decimals=3)
+        self._spinLength.setMinimumWidth(44)
+        self._spinLength.setToolTip("指定长度（配合左侧开关使用）")
+        rowLen = QHBoxLayout()
+        rowLen.setSpacing(4)
+        rowLen.addWidget(self._btnLenMode)
+        rowLen.addWidget(self._spinLength, 1)
+        self._layout.addLayout(rowLen)
+
+        # 指定角度：标题按钮即开关 + 顺/逆 + 角度
         self._angleCCW = True
-        arow = QHBoxLayout()
-        arow.setSpacing(4)
-        lab = QLabel("指定角度")
-        lab.setMinimumWidth(_LABEL_W)
+        self._btnAngMode = self._modeButton(
+            "指定角度", "按下后按此角度落点（相对上段方向），再按关闭")
         self._btnAngleSign = self._button2("逆")
         self._btnAngleSign.setToolTip("切换：逆时针/顺时针")
         self._btnAngleSign.clicked.connect(self._onSignToggled)
         self._spinAngle = self._spin(0.0, decimals=2)
-        self._spinAngle.setFixedWidth(90)   # 收窄，给左侧标签腾出完整显示空间
-        arow.addWidget(lab)
-        arow.addWidget(self._btnAngleSign)
-        arow.addWidget(self._spinAngle)
-        arow.addStretch(1)
-        self._layout.addLayout(arow)
+        self._spinAngle.setMinimumWidth(44)
+        rowAng = QHBoxLayout()
+        rowAng.setSpacing(4)
+        rowAng.addWidget(self._btnAngMode)
+        rowAng.addWidget(self._btnAngleSign)
+        rowAng.addWidget(self._spinAngle, 1)
+        self._layout.addLayout(rowAng)
 
-        btnDraw = self._button("按参数画点")
-        btnDraw.setToolTip("按指定长度和角度画一段：角度为 0 时沿光标方向")
-        btnDraw.clicked.connect(self.drawParamRequested.emit)
-        self._layout.addWidget(btnDraw)
-
-        # 角平分线模式：选两条直线 → 预览平分线 → 点击定终点（本命令新增）
+        # 角平分线 / 闭合：同一行勾选项（角度弧预览恒开，不再提供勾选项）
         self._chkBisector = QCheckBox("角平分线")
         self._chkBisector.setToolTip(
             "依次选两条直线，预览角平分线，再点击确定终点")
         self._chkBisector.toggled.connect(self.bisectorToggled.emit)
-        self._layout.addWidget(self._chkBisector)
-
-        row = QHBoxLayout()
-        self._btnUndo = self._button2("撤回上一点")
-        self._btnUndo.clicked.connect(self.undoClicked.emit)
         self._chkClose = QCheckBox("闭合")
         self._chkClose.toggled.connect(self.closeToggled.emit)
-        row.addWidget(self._btnUndo)
-        row.addWidget(self._chkClose)
-        self._layout.addLayout(row)
-        self._closeHint = self._label("")
-        self._layout.addWidget(self._closeHint)
+        rowOpt = QHBoxLayout()
+        rowOpt.setSpacing(6)
+        rowOpt.addWidget(self._chkBisector)
+        rowOpt.addWidget(self._chkClose)
+        self._layout.addLayout(rowOpt)
 
+        # 撤回 / 确认完成：网格两等分列，宽度恒等
+        self._btnUndo = self._button2("撤回（Z）")
+        self._btnUndo.setMinimumWidth(44)
+        self._btnUndo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._btnUndo.clicked.connect(self.undoClicked.emit)
         btnOk = self._button("确认完成", primary=True)
+        btnOk.setMinimumWidth(44)
+        btnOk.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btnOk.clicked.connect(self.confirmRequested.emit)
-        self._layout.addWidget(btnOk)
+        act = QGridLayout()
+        act.setContentsMargins(0, 0, 0, 0)
+        act.setHorizontalSpacing(6)
+        act.addWidget(self._btnUndo, 0, 0)
+        act.addWidget(btnOk, 0, 1)
+        act.setColumnStretch(0, 1)
+        act.setColumnStretch(1, 1)
+        self._layout.addLayout(act)
+
+        # 闭合不可用提示：无提示时不占高度
+        self._closeHint = self._label("")
+        self._closeHint.setWordWrap(True)
+        self._closeHint.setVisible(False)
+        self._layout.addWidget(self._closeHint)
         self._layout.addStretch(1)
+
+        # 数值框会因"落点后自动聚焦长度"而抢走键盘焦点，导致 B/Z 等
+        # 快捷键打在输入框里失效；这里把字母键/Esc 转发给命令处理。
+        self._keyHandler = None
+        for sp in (self._spinX, self._spinY, self._spinZ,
+                   self._spinLength, self._spinAngle):
+            sp.installEventFilter(self)
+
+    def setKeyHandler(self, handler) -> None:
+        """handler(key, mods) -> bool（True=命令已消费，吞掉该键）。"""
+        self._keyHandler = handler
+
+    def eventFilter(self, obj, ev) -> bool:
+        if ev.type() == QEvent.Type.KeyPress and isinstance(obj, QAbstractSpinBox):
+            key = ev.key()
+            if key == Qt.Key_Escape or Qt.Key_A <= key <= Qt.Key_Z:
+                if self._keyHandler is not None \
+                        and self._keyHandler(key, ev.modifiers()):
+                    return True
+        return super().eventFilter(obj, ev)
 
     def _onSignToggled(self) -> None:
         self._angleCCW = not self._angleCCW
@@ -395,11 +664,13 @@ class LineParamPanel(ParamPanelBase):
         self._labelAngle.setText(f"{degrees:.2f}°")
 
     def isAnglePreviewChecked(self) -> bool:
-        return self._chkAnglePreview.isChecked()
+        return True     # 角度弧预览恒开（用户要求去掉勾选项，默认始终预览）
 
     def setCloseEnabled(self, enabled: bool, hint: str = "") -> None:
         self._chkClose.setEnabled(enabled)
         self._closeHint.setText(hint)
+        # 有提示才占高度（面板宽度仅 270px，长提示会换行）
+        self._closeHint.setVisible(bool(hint))
 
     def focusOnLength(self) -> None:
         self._spinLength.setFocus()
@@ -419,10 +690,11 @@ class LineParamPanel(ParamPanelBase):
 # ==================== Curve ====================
 
 class CurveParamPanel(ParamPanelBase):
-    """样条曲线参数面板：坐标加点/撤销/闭合/确认（固定插值样条，无模式切换）。"""
+    """样条曲线参数面板：坐标加点/撤销/闭合/确认（C2 插值样条）。"""
     addPointRequested = Signal()
     undoClicked = Signal()
-    closeToggled = Signal(bool)
+    closeToggled = Signal(bool)     # 保留：其它调用方/自动闭合的状态同步
+    closeRequested = Signal()       # 点"闭合（B）"按钮：请求闭合结束
     confirmRequested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -433,12 +705,15 @@ class CurveParamPanel(ParamPanelBase):
         self._layout.addWidget(btnAdd)
 
         row = QHBoxLayout()
-        btnUndo = self._button2("撤回上一点")
+        row.setSpacing(6)
+        btnUndo = self._button2("撤回（Z）")
         btnUndo.clicked.connect(self.undoClicked.emit)
-        self._chkClose = QCheckBox("闭合")
-        self._chkClose.toggled.connect(self.closeToggled.emit)
-        row.addWidget(btnUndo)
-        row.addWidget(self._chkClose)
+        # 闭合是"动作"按钮（不是开关）：按下即闭合结束，与快捷键 B 同一逻辑
+        self._btnClose = self._button2("闭合（B）")
+        self._btnClose.setToolTip("按 B 或点此按钮：闭合曲线并结束（至少 3 点）")
+        self._btnClose.clicked.connect(self.closeRequested.emit)
+        row.addWidget(btnUndo, 1)
+        row.addWidget(self._btnClose, 1)
         self._layout.addLayout(row)
 
         btnOk = self._button("确认完成", primary=True)
@@ -447,9 +722,14 @@ class CurveParamPanel(ParamPanelBase):
         self._layout.addStretch(1)
 
     def setClosed(self, closed: bool) -> None:
-        self._chkClose.blockSignals(True)
-        self._chkClose.setChecked(closed)
-        self._chkClose.blockSignals(False)
+        """同步闭合状态（自动闭合时按钮变主题色，仅视觉反馈）。"""
+        self._btnClose.setStyleSheet(
+            "QPushButton { background:%s; color:%s; border:1px solid %s; }"
+            % ((theme.PRIMARY, theme.TEXT_ON_PRIMARY, theme.PRIMARY)
+               if closed else (theme.BG_PANEL, theme.TEXT, theme.BORDER)))
+
+    def isClosed(self) -> bool:
+        return False
 
 
 # ==================== Arc ====================
@@ -720,10 +1000,17 @@ class RectangleParamPanel(ParamPanelBase):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._addCoordRows()
+        for sp in (self._spinX, self._spinY):
+            sp.setMinimumWidth(44)
+            sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._spinLen = self._spin(0.0, step=0.5)
         self._spinLen.setMinimum(0.0)
+        self._spinLen.setMinimumWidth(44)
+        self._spinLen.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._spinWid = self._spin(0.0, step=0.5)
         self._spinWid.setMinimum(0.0)
+        self._spinWid.setMinimumWidth(44)
+        self._spinWid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._spinLen.valueChanged.connect(self._emitSize)
         self._spinWid.valueChanged.connect(self._emitSize)
         # 长/宽标题可点击联动（同原版）：点长度 → 宽度=长度，方便画正方形；反之亦然
@@ -745,6 +1032,7 @@ class RectangleParamPanel(ParamPanelBase):
         self._layout.addLayout(rowWid)
 
         row = QHBoxLayout()
+        row.setSpacing(4)
         self._chamferGroup = QButtonGroup(self)
         self._radioNone = QRadioButton("无倒角")
         self._radioFillet = QRadioButton("圆角")
@@ -757,6 +1045,7 @@ class RectangleParamPanel(ParamPanelBase):
         row.addWidget(self._radioNone)
         row.addWidget(self._radioFillet)
         row.addWidget(self._radioBevel)
+        row.addStretch(1)
         self._layout.addLayout(row)
 
         # 倒角半径：四角独立（同原版）+ 同半径联动开关；
@@ -764,7 +1053,7 @@ class RectangleParamPanel(ParamPanelBase):
         urow = QHBoxLayout()
         urow.setSpacing(4)
         self._labRadius = QLabel("半径")
-        self._labRadius.setMinimumWidth(_LABEL_W)
+        self._labRadius.setFixedWidth(34)
         self._chkUniform = QCheckBox("同半径")
         self._chkUniform.setChecked(True)
         self._chkUniform.toggled.connect(self._onUniformToggled)
@@ -805,7 +1094,9 @@ class RectangleParamPanel(ParamPanelBase):
         self._waveTypeGroup.addButton(self._radioWaveArc, 2)
         self._waveTypeGroup.idClicked.connect(
             lambda _i: self.waveParamChanged.emit())
-        trow.addWidget(QLabel("波形"))
+        labWave = QLabel("波形")
+        labWave.setFixedWidth(34)
+        trow.addWidget(labWave)
         trow.addWidget(self._radioWaveLine)
         trow.addWidget(self._radioWaveSmooth)
         trow.addWidget(self._radioWaveArc)
@@ -833,13 +1124,21 @@ class RectangleParamPanel(ParamPanelBase):
         self._waveWidget.hide()
         self._layout.addWidget(self._waveWidget)
 
-        brow = QHBoxLayout()
+        brow = QGridLayout()
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.setHorizontalSpacing(6)
         btnOk = self._button("确认创建", primary=True)
+        btnOk.setMinimumWidth(44)
+        btnOk.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btnOk.clicked.connect(self.confirmRequested.emit)
         btnCancel = self._button2("取消")
+        btnCancel.setMinimumWidth(44)
+        btnCancel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btnCancel.clicked.connect(self.cancelRequested.emit)
-        brow.addWidget(btnOk)
-        brow.addWidget(btnCancel)
+        brow.addWidget(btnOk, 0, 0)
+        brow.addWidget(btnCancel, 0, 1)
+        brow.setColumnStretch(0, 1)
+        brow.setColumnStretch(1, 1)
         self._layout.addLayout(brow)
         self._layout.addStretch(1)
 
@@ -849,19 +1148,32 @@ class RectangleParamPanel(ParamPanelBase):
         self._notifyResize()
 
     def _wavePair(self, lab1: str, w1: QWidget, lab2: str,
-                  w2: QWidget) -> QHBoxLayout:
-        """波浪参数双列紧凑行（原版 waveGrid 两列布局的简化）。"""
-        row = QHBoxLayout()
-        row.setSpacing(4)
-        l1 = QLabel(lab1)
-        l1.setMinimumWidth(36)
-        l2 = QLabel(lab2)
-        l2.setMinimumWidth(36)
-        row.addWidget(l1)
-        row.addWidget(w1, 1)
-        row.addWidget(l2)
-        row.addWidget(w2, 1)
-        return row
+                  w2: QWidget) -> QGridLayout:
+        """双列紧凑行：标签固定窄宽、两个输入框各占一列拉伸。
+
+        以前用 QHBoxLayout + QDoubleSpinBox 默认 sizeHint（≈172px），
+        两个并排最小宽 ≈428px，远超面板 258px 可视宽 → 撑出横向滚动条。
+        改为网格 + 显式压缩下限后，宽度恒在面板内，且左右两列等宽。"""
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        l1, l2 = QLabel(lab1), QLabel(lab2)
+        # 定宽放得下 3 个汉字（原 34 会把"边半径"截成"边半…"）；多出的宽度
+        # 从两侧输入框各匀一点（输入框仍 ≥44，够显示 "0.00" + 箭头）
+        for lb in (l1, l2):
+            lb.setFixedWidth(46)
+        for w in (w1, w2):
+            w.setMinimumWidth(44)
+            w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        grid.addWidget(l1, 0, 0)
+        grid.addWidget(w1, 0, 1)
+        grid.addWidget(l2, 0, 2)
+        grid.addWidget(w2, 0, 3)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 1)
+        return grid
 
     def waveEnabled(self) -> bool:
         return self._chkWave.isChecked()
@@ -1874,6 +2186,8 @@ class RegionReliefParamPanel(ParamPanelBase):
         # 倒角：隐藏高度模式、显示倒角模式
         self._rowMode.setVisible(not is_chamfer)
         self._rowChamfer.setVisible(is_chamfer)
+        # 矩形只用基高+基角：自由高度/局部等高这一组本身也无意义，整行置灰
+        self._rowMode.setEnabled(not is_chamfer and not is_rect)
 
         border_strength = not is_rect and not is_chamfer
         self._rowBorder.setEnabled(border_strength)
@@ -2206,8 +2520,8 @@ class AddMaterialParamPanel(ParamPanelBase):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-
-        # ---- 笔刷形状 ----
+        # 命令指定的初始效果（堆料/去料）；None = 未指定，沿用面板记忆
+        self._forcedApplyMode = None
         gShape, lShape = self._group("笔刷形状")
         self._shapeGroup = QButtonGroup(self)
         for i, t in enumerate(BRUSH_SHAPE_LABELS):
@@ -2341,6 +2655,23 @@ class AddMaterialParamPanel(ParamPanelBase):
     def applyMode(self) -> str:
         """效果：add=堆料（升高）/ remove=去料（雕刻去除）。"""
         return "remove" if self._applyGroup.checkedId() == 1 else "add"
+
+    def setApplyMode(self, mode: str) -> None:
+        """设置效果（快捷键直接以堆料/去料启动命令时用）。
+
+        同时记为“强制效果”：面板首次显示时会恢复上次记忆的面板状态
+        （ParamPanelBase.showEvent），若不记住，恢复动作会把这里选的
+        堆料/去料覆盖掉——之前 Shift+Q 也变去料就是这个原因。
+        """
+        self._forcedApplyMode = "remove" if mode == "remove" else "add"
+        btn = self._applyGroup.button(1 if self._forcedApplyMode == "remove" else 0)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+
+    def restorePanelState(self) -> None:
+        super().restorePanelState()
+        if self._forcedApplyMode is not None:
+            self.setApplyMode(self._forcedApplyMode)
 
     def params(self) -> _BrushSweepParams:
         # 高度以符号编码效果：去料 = 负高度（笔刷写回时雕刻去除）
@@ -2476,11 +2807,18 @@ class RegionTransformParamPanel(ParamPanelBase):
         self._status.setMinimumHeight(40)
         self._layout.addWidget(self._status)
         zRow = QHBoxLayout()
-        zRow.addWidget(QLabel("Z 高度缩放:"))
+        zRow.setSpacing(4)
+        labZ = QLabel("Z缩放:")
+        labZ.setFixedWidth(40)
+        zRow.addWidget(labZ)
         self._spinZ = self._spin(1.0, decimals=2, step=0.1)
         self._spinZ.setRange(-9999.0, 9999.0)
+        # 默认 sizeHint 的数值框会把整行撑到 260px+ → 出现横向滚动条
+        self._spinZ.setMinimumWidth(44)
+        self._spinZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._spinZ.setToolTip("区域内高度均匀缩放（负值=翻转）")
         self._spinZ.valueChanged.connect(self.zChanged.emit)
-        zRow.addWidget(self._spinZ)
+        zRow.addWidget(self._spinZ, 1)
         zWidget = QWidget()
         zWidget.setLayout(zRow)
         zWidget.setMinimumHeight(32)
@@ -2521,9 +2859,15 @@ class RegionDeformParamPanel(ParamPanelBase):
         self._status.setMinimumHeight(40)
         self._layout.addWidget(self._status)
         zRow = QHBoxLayout()
-        zRow.addWidget(QLabel("Z 高度缩放:"))
+        zRow.setSpacing(4)
+        labZ = QLabel("Z缩放:")
+        labZ.setFixedWidth(40)
+        zRow.addWidget(labZ)
         self._spinZ = self._spin(1.0, decimals=2, step=0.1)
         self._spinZ.setRange(0.0, 9999.0)
+        self._spinZ.setMinimumWidth(44)
+        self._spinZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._spinZ.setToolTip("区域内高度均匀缩放")
         self._spinZ.valueChanged.connect(self.zChanged.emit)
         zRow.addWidget(self._spinZ)
         zWidget = QWidget()
@@ -2983,10 +3327,16 @@ class RegionSymmetryParamPanel(ParamPanelBase):
         super().__init__(parent)
 
         self._dirGroup = QButtonGroup(self)
+        # 标题与选项都压缩成 2 字：完整语义放 tooltip。原来"左右对称/
+        # 上下对称/自由对称" + 52px 标签宽使整行最小宽 298px → 横向滚动条。
         self._layout.addWidget(self._radioRow("对称",
-                                               ("左右对称", "上下对称", "自由对称"),
+                                               ("左右", "上下", "自由"),
                                                self._dirGroup, 0))
         self._dirGroup.button(0).setChecked(True)
+        for i, tip in enumerate(("左右对称（关于竖轴镜像）",
+                                 "上下对称（关于横轴镜像）",
+                                 "自由对称（任意角度轴，仅区域模式）")):
+            self._dirGroup.button(i).setToolTip(tip)
         self._dirGroup.idClicked.connect(self._onDirChanged)
 
         self._scopeGroup = QButtonGroup(self)
@@ -3024,7 +3374,7 @@ class RegionSymmetryParamPanel(ParamPanelBase):
         lay.setContentsMargins(0, 0, 0, 0)
         if label:
             lab = QLabel(label)
-            lab.setMinimumWidth(_LABEL_W)
+            lab.setFixedWidth(40)   # 2 字标签：不用 52px 统一宽，避免整行溢出
             lay.addWidget(lab)
         for i, t in enumerate(texts):
             rb = QRadioButton(t)
@@ -4111,19 +4461,57 @@ class PanelScaleParamPanel(ParamPanelBase):
     paramsChanged = Signal()              # 选项变化：通知命令重绘预览
     confirmed = Signal()                  # 用户按「应用目标长度」或在数值框回车
     cancelRequested = Signal()            # 取消命令
+    modeChanged = Signal(str)             # "point" / "object"
+    objectConfirmed = Signal()            # 对象模式「确认」
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._objs: list = []
+        self._loading: bool = False
 
+        # ---- 模式切换：点模式（默认）/ 对象模式 ----
+        rowMode = QHBoxLayout()
+        rowMode.setSpacing(4)
+        self._btnPoint = self._button("点模式", primary=True)
+        self._btnObject = self._button2("对象模式")
+        for b in (self._btnPoint, self._btnObject):
+            b.setCheckable(True)
+            b.setMinimumHeight(24)
+        self._btnPoint.setChecked(True)
+        self._btnPoint.setToolTip("三点缩放：基准点 → 参考起点 → 目标点/目标长度")
+        self._btnObject.setToolTip(
+            "对象模式：选基准对象，按其包围盒尺寸输入目标值，"
+            "其余选中对象按同一比例跟随缩放")
+        # 不做 QButtonGroup：checkable QPushButton 不进面板状态持久化，
+        # 互斥置位完全由 _setMode 负责（避免恢复状态与堆栈页不一致）
+        # 选中态高亮（按钮即开关）
+        for b in (self._btnPoint, self._btnObject):
+            b.setStyleSheet(
+                "QPushButton { background:%s; color:%s; border:1px solid %s;"
+                " border-radius:2px; padding:3px 8px; }"
+                "QPushButton:checked { background:%s; color:%s;"
+                " border-color:%s; }"
+                % (theme.BG_PANEL, theme.TEXT, theme.BORDER,
+                   theme.PRIMARY, theme.TEXT_ON_PRIMARY, theme.PRIMARY))
+        self._btnPoint.clicked.connect(lambda: self._setMode("point"))
+        self._btnObject.clicked.connect(lambda: self._setMode("object"))
+        rowMode.addWidget(self._btnPoint, 1)
+        rowMode.addWidget(self._btnObject, 1)
+        self._layout.addLayout(rowMode)
+
+        self._stack = QStackedWidget()
+
+        # ---------- 点模式页 ----------
+        pagePoint = QWidget()
+        layPoint = QVBoxLayout(pagePoint)
+        layPoint.setContentsMargins(0, 0, 0, 0)
+        layPoint.setSpacing(4)
         self._labRef = QLabel("参考长度：—")
         self._labRef.setStyleSheet("color:%s;" % theme.TEXT)
-        self._layout.addWidget(self._labRef)
-
+        layPoint.addWidget(self._labRef)
         self._labRatio = QLabel("当前比例：—")
         self._labRatio.setStyleSheet("color:%s;" % theme.TEXT_DIM)
-        self._layout.addWidget(self._labRatio)
-
-        # 目标长度输入行
+        layPoint.addWidget(self._labRatio)
         row = QHBoxLayout()
         row.setSpacing(4)
         lab = QLabel("目标长度")
@@ -4135,26 +4523,188 @@ class PanelScaleParamPanel(ParamPanelBase):
             "点完基准点和参考起点后填入目标长度。\n"
             "第一个点不动，沿P1→P2方向把P2拉到新长度，立即执行缩放。")
         row.addWidget(self._spinTarget, 1)
-        self._layout.addLayout(row)
-
+        layPoint.addLayout(row)
         btnApply = self._button("应用目标长度", primary=True)
         btnApply.setMinimumHeight(32)
         btnApply.clicked.connect(self.confirmed.emit)
-        self._layout.addWidget(btnApply)
-
-        btnCancel = self._button2("取消")
-        btnCancel.clicked.connect(self.cancelRequested.emit)
-        self._layout.addWidget(btnCancel)
-
+        layPoint.addWidget(btnApply)
         self._hint = QLabel(
             "① 点基准点 → ② 点参考起点 → ③ 拖动预览或填目标长度")
         self._hint.setStyleSheet("color:%s;" % theme.TEXT_DIM)
         self._hint.setWordWrap(True)
-        self._layout.addWidget(self._hint)
+        layPoint.addWidget(self._hint)
+        layPoint.addStretch(1)
+        self._spinTarget.lineEdit().returnPressed.connect(self.confirmed.emit)
+        self._stack.addWidget(pagePoint)
+
+        # ---------- 对象模式页 ----------
+        pageObj = QWidget()
+        layObj = QVBoxLayout(pageObj)
+        layObj.setContentsMargins(0, 0, 0, 0)
+        layObj.setSpacing(4)
+        # 基准对象：画布点选（不用下拉）
+        self._labRefObj = QLabel("基准：未选择（在画布上点选对象）")
+        self._labRefObj.setStyleSheet("color:%s;" % theme.TEXT)
+        self._labRefObj.setWordWrap(True)
+        self._labRefObj.setToolTip(
+            "在画布上点选对象作为准确尺寸基准；其尺寸按输入值精确变化，"
+            "其余选中对象按同一比例跟随缩放（绕基准对象包围盒中心）")
+        layObj.addWidget(self._labRefObj)
+        self._refObj = None
+
+        self._dimSpins: list[QDoubleSpinBox] = []
+        self._ratioChecks: list[QCheckBox] = []
+        for ax, tip in (
+                ("X", "基准对象的 X 尺寸（包围盒宽度）"),
+                ("Y", "基准对象的 Y 尺寸（包围盒高度）"),
+                ("Z", "基准对象的 Z 尺寸（包围盒厚度）")):
+            row = QWidget()
+            row.setFixedHeight(28)
+            row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(3)
+            lab = QLabel(ax)
+            lab.setFixedWidth(14)
+            lab.setToolTip(tip)
+            rl.addWidget(lab)
+            sp = self._spin(value=0.0, decimals=3, step=1.0)
+            sp.setRange(1e-6, 9999999.0)
+            sp.setToolTip(tip)
+            sp.lineEdit().returnPressed.connect(self.objectConfirmed.emit)
+            rl.addWidget(sp, 1)
+            self._dimSpins.append(sp)
+            uc = QCheckBox("等比")
+            uc.setFixedHeight(24)
+            # 三轴互斥：勾选某轴等比 = 该轴为主动轴，其余轴按同一比例跟随
+            uc.stateChanged.connect(
+                lambda _s, i=len(self._ratioChecks): self._onRatioToggled(i))
+            rl.addWidget(uc)
+            self._ratioChecks.append(uc)
+            layObj.addWidget(row)
+
+        self._labObjHint = QLabel(
+            "改尺寸后按确认：基准对象精确到目标尺寸，其余对象同比例跟随")
+        self._labObjHint.setStyleSheet("color:%s;" % theme.TEXT_DIM)
+        self._labObjHint.setWordWrap(True)
+        layObj.addWidget(self._labObjHint)
+        btnObjOk = self._button("确认", primary=True)
+        btnObjOk.setMinimumHeight(32)
+        btnObjOk.clicked.connect(self.objectConfirmed.emit)
+        layObj.addWidget(btnObjOk)
+        layObj.addStretch(1)
+        self._stack.addWidget(pageObj)
+
+        self._layout.addWidget(self._stack)
+
+        btnCancel = self._button2("取消")
+        btnCancel.clicked.connect(self.cancelRequested.emit)
+        self._layout.addWidget(btnCancel)
         self._layout.addStretch(1)
 
-        # 回车在输入框：等效点击"应用"
-        self._spinTarget.lineEdit().returnPressed.connect(self.confirmed.emit)
+    # ---------- 模式 ----------
+
+    def mode(self) -> str:
+        return "object" if self._btnObject.isChecked() else "point"
+
+    def _setMode(self, mode: str) -> None:
+        point = (mode == "point")
+        if self._btnPoint.isChecked() == point and \
+                self._btnObject.isChecked() == (not point):
+            return
+        self._btnPoint.setChecked(point)
+        self._btnObject.setChecked(not point)
+        self._stack.setCurrentIndex(0 if point else 1)
+        self.modeChanged.emit(mode)
+
+    # ---------- 对象模式 ----------
+
+    def setRefObject(self, obj) -> None:
+        """命令在画布上点选对象后调用：设为基准并回填其包围盒尺寸。"""
+        self._refObj = obj
+        if obj is None:
+            self._labRefObj.setText("基准：未选择（在画布上点选对象）")
+        else:
+            try:
+                t = obj.type()
+                name = getattr(t, "name", "") or str(t)
+            except Exception:
+                name = ""
+            self._labRefObj.setText(f"基准：{name}" if name else "基准：已选择")
+        self._refreshDims()
+
+    def refObject(self):
+        return self._refObj
+
+    def objectDims(self) -> tuple:
+        return tuple(float(sp.value()) for sp in self._dimSpins)
+
+    def ratioAxis(self) -> int:
+        """当前勾选“等比”的轴（0/1/2）；未勾选返回 -1。"""
+        for i, uc in enumerate(self._ratioChecks):
+            if uc.isChecked():
+                return i
+        return -1
+
+    def _onRatioToggled(self, i: int) -> None:
+        """三轴等比互斥；勾选的轴为唯一可输入轴，其余变灰跟随。"""
+        if self._loading:
+            return
+        uc = self._ratioChecks[i]
+        self._loading = True
+        try:
+            if uc.isChecked():
+                for j, other in enumerate(self._ratioChecks):
+                    if j != i and other.isChecked():
+                        other.setChecked(False)
+        finally:
+            self._loading = False
+        anyRatio = self._ratioChecks[i].isChecked()
+        for j, sp in enumerate(self._dimSpins):
+            sp.setEnabled(not anyRatio or self._ratioChecks[j].isChecked())
+
+    def _refreshDims(self) -> None:
+        obj = self._refObj
+        bb = None
+        if obj is not None:
+            try:
+                bb = obj.getBoundingBox()
+            except Exception:
+                bb = None
+        self._loading = True
+        try:
+            self._dimSpins[0].setEnabled(True)
+            self._dimSpins[1].setEnabled(True)
+            self._dimSpins[2].setEnabled(True)
+            if bb is None or not bb.isValid():
+                for sp in self._dimSpins:
+                    sp.setValue(0.0)
+            else:
+                self._dimSpins[0].setValue(bb.width())
+                self._dimSpins[1].setValue(bb.height())
+                self._dimSpins[2].setValue(bb.depth())
+            # 浮雕模型 Z 尺寸由高度场决定，放置缩放的 sz 被忽略
+            isRelief = False
+            if obj is not None:
+                try:
+                    from core.vector.object_type import ObjectType
+                    isRelief = (obj.type() == ObjectType.SURFACE)
+                except Exception:
+                    isRelief = False
+            self._dimSpins[2].setToolTip(
+                "浮雕模型的 Z 尺寸请在变换面板“模型Z”修改（高度场缩放）"
+                if isRelief else "基准对象的 Z 尺寸（包围盒厚度）")
+            r = self.ratioAxis()
+            for j, sp in enumerate(self._dimSpins):
+                if j == 2 and isRelief:
+                    sp.setEnabled(False)
+                elif r >= 0:
+                    # 勾选等比：只有主动轴可输入，其余灰显跟随
+                    sp.setEnabled(self._ratioChecks[j].isChecked())
+                else:
+                    sp.setEnabled(True)
+        finally:
+            self._loading = False
 
     # ---------- 命令调用 ----------
 
@@ -4218,9 +4768,11 @@ class ImageToModelParamPanel(ParamPanelBase):
         self._labImgName.setStyleSheet("color:%s;" % theme.TEXT_DIM)
         layImg.addRow("对象", self._labImgName)
         self._labImgPixels = QLabel("--")
+        self._labImgPixels.setWordWrap(True)
         self._labImgPixels.setStyleSheet("color:%s;" % theme.PRIMARY_DARK)
         layImg.addRow("像素", self._labImgPixels)
         self._labImgWorld = QLabel("--")
+        self._labImgWorld.setWordWrap(True)
         self._labImgWorld.setStyleSheet("color:%s;" % theme.PRIMARY_DARK)
         layImg.addRow("放置大小", self._labImgWorld)
         rowBtn = QHBoxLayout()
@@ -4269,11 +4821,12 @@ class ImageToModelParamPanel(ParamPanelBase):
         self._spinPixel.setRange(0.0005, 100.0)
         self._spinPixel.setToolTip("像素间距 (mm/px)：生成 HeightField 时的栅格间距；默认按图片放置大小自动换算。勾选“尺寸匹配原图”后，生成的模型会按画布图片放置尺寸严格对齐。")
         lay3.addRow("像素间距", self._spinPixel)
-        self._chkFitSize = QCheckBox("尺寸匹配原图（超分只提高清晰度，不放大模型整体）")
+        self._chkFitSize = QCheckBox("尺寸匹配原图")
         self._chkFitSize.setChecked(True)
         self._chkFitSize.setToolTip("默认勾选：生成的浮雕模型物理尺寸（宽×高 mm）严格等于图片在画布上的放置尺寸，放大倍率×4/网格降采样都只改变栅格密度而不改变整体大小。")
         lay3.addRow("", self._chkFitSize)
         self._labModelSize = QLabel("-- × -- mm")
+        self._labModelSize.setWordWrap(True)
         self._labModelSize.setStyleSheet("color:%s;" % theme.PRIMARY_DARK)
         lay3.addRow("预估模型尺寸", self._labModelSize)
         self._layout.addWidget(gbx3)
@@ -4366,9 +4919,15 @@ class ImageToModelParamPanel(ParamPanelBase):
                     name = nm
             except Exception:
                 pass
-        self._labImgName.setText(name)
-        self._labImgName.setToolTip(f"对象ID: {oid}")
+        # 对象名可能是含路径的长文件名（无空格无法换行），直接显示会把
+        # 表单最小宽度顶开、导致整行参数溢出面板——这里按像素宽度省略中段，
+        # 完整名称放 tooltip。先套样式（粗体更宽），再按像素截断。
         self._labImgName.setStyleSheet("color:%s; font-weight:bold;" % theme.TEXT)
+        fm = self._labImgName.fontMetrics()
+        shown = fm.elidedText(str(name).replace("\\", "/").split("/")[-1],
+                              Qt.ElideMiddle, 140)
+        self._labImgName.setText(shown)
+        self._labImgName.setToolTip(f"{name}\n对象ID: {oid}")
         self._labImgPixels.setText(f"{pw} × {ph}  px")
         self._labImgWorld.setText(f"{obj.width():.2f} × {obj.height():.2f} mm")
         # 自动换算像素间距：按放置大小 ÷ (像素-1) 平均
@@ -4510,6 +5069,211 @@ class ExtrudeParamPanel(ParamPanelBase):
 
     def draftAngle(self) -> float:
         return self._spinDraft.value()
+
+
+# ==================== Primitive 标准体 ====================
+
+class PrimitiveParamPanel(ParamPanelBase):
+    """标准体参数面板：立方体/圆柱体/圆环/圆锥体（圆台）。
+
+    选形状 → 调尺寸/拔模/边处理 → 画布单击落点生成（命令保持激活可
+    连放）。参数改动发 paramsChanged 刷新实时预览；确认/结束按钮与
+    挤出面板同风格。
+    """
+
+    confirmed = Signal()        # 点击"创建"：在当前落点生成
+    finished = Signal()         # 点击"结束"：退出命令
+    paramsChanged = Signal()    # 任一参数变更（实时预览）
+
+    SHAPE_KEYS = ("box", "cylinder", "torus", "cone")
+    SHAPE_LABELS = ("立方体", "圆柱体", "圆环", "圆锥体")
+    SHAPE_NAMES = {"box": "立方体", "cylinder": "圆柱体",
+                   "torus": "圆环", "cone": "圆锥体"}
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+
+        # ---- 形状单选（2+2 两行，避免一行 4 项溢出面板宽） ----
+        self._shapeGroup = QButtonGroup(self)
+        self._layout.addWidget(
+            self._radioRow(None, self.SHAPE_LABELS[:2], self._shapeGroup, 0))
+        self._layout.addWidget(
+            self._radioRow(None, self.SHAPE_LABELS[2:], self._shapeGroup, 2))
+        self._shapeGroup.button(0).setChecked(True)
+
+        # ---- 尺寸组（行按形状显隐） ----
+        g, lay = self._group("尺寸")
+
+        def spin(v, lo=0.01, hi=99999.0, dec=2, step=1.0):
+            s = self._spin(v, decimals=dec, step=step)
+            s.setRange(lo, hi)
+            s.setMinimumWidth(62)
+            return s
+
+        self._spinLen = spin(50.0)      # box 长 X
+        self._spinWid = spin(50.0)      # box 宽 Y
+        self._spinH = spin(20.0)        # box/cyl/cone 高
+        self._spinDia = spin(40.0)      # cylinder 直径
+        self._spinD1 = spin(40.0)       # cone 底直径
+        self._spinD2 = spin(0.0, 0.0)   # cone 顶直径（0=尖锥）
+        self._spinMaj = spin(60.0)      # torus 环中心直径
+        self._spinMin = spin(20.0)      # torus 管直径
+        self._rowLen = self._row("长 X", self._spinLen)
+        self._rowWid = self._row("宽 Y", self._spinWid)
+        self._rowH = self._row("高度", self._spinH)
+        self._rowDia = self._row("直径", self._spinDia)
+        self._rowD1 = self._row("底直径", self._spinD1)
+        self._rowD2 = self._row("顶直径", self._spinD2)
+        self._rowMaj = self._row("环径", self._spinMaj)
+        self._rowMin = self._row("管径", self._spinMin)
+        for row in (self._rowLen, self._rowWid, self._rowH, self._rowDia,
+                    self._rowD1, self._rowD2, self._rowMaj, self._rowMin):
+            lay.addWidget(row)
+
+        self._spinDraft = self._spin(0.0, decimals=1)
+        self._spinDraft.setRange(-89.0, 89.0)
+        self._spinDraft.setMinimumWidth(62)
+        self._rowDraft = self._row("拔模角度", self._spinDraft)
+        lay.addWidget(self._rowDraft)
+        tip = QLabel("＞0 顶收，＜0 顶扩")
+        tip.setStyleSheet("color:%s; font-size:9pt;" % theme.TEXT_DIM)
+        tip.setToolTip("角度＞0 顶面向内收，＜0 向外扩；\n"
+                       "过大时自动收到当前尺寸的限制值")
+        lay.addWidget(tip)
+
+        # 圆环轴向
+        self._axisGroup = QButtonGroup(self)
+        self._rowAxis = self._radioRow("轴向", ("Z 水平", "X", "Y"),
+                                       self._axisGroup, 0)
+        self._axisGroup.button(0).setChecked(True)
+        lay.addWidget(self._rowAxis)
+        self._layout.addWidget(g)
+
+        # ---- 边处理组（圆环隐藏） ----
+        gE, layE = self._group("边处理")
+        self._edgeGroup = QButtonGroup(self)
+        layE.addWidget(self._radioRow(None, ("无", "倒角", "圆角"),
+                                      self._edgeGroup, 0))
+        self._edgeGroup.button(0).setChecked(True)
+        self._spinEdge = spin(0.5, 0.0)
+        layE.addWidget(self._row("数值", self._spinEdge))
+        self._scopeGroup = QButtonGroup(self)
+        layE.addWidget(self._radioRow(None, ("仅顶边", "顶+底边", "全部边"),
+                                      self._scopeGroup, 0))
+        self._scopeGroup.button(0).setChecked(True)
+        self._groupEdge = gE
+        self._layout.addWidget(gE)
+
+        # ---- 放置组 ----
+        gP, layP = self._group("放置")
+        self._spinZ = spin(0.0, -99999.0)
+        layP.addWidget(self._row("Z 基准", self._spinZ))
+        self._spinRot = self._spin(0.0, decimals=1, step=5.0)
+        self._spinRot.setRange(-360.0, 360.0)
+        self._spinRot.setMinimumWidth(62)
+        layP.addWidget(self._row("旋转", self._spinRot))
+        self._alignGroup = QButtonGroup(self)
+        layP.addWidget(self._radioRow(None, ("底面", "中心"),
+                                      self._alignGroup, 0))
+        self._alignGroup.button(0).setChecked(True)
+        gP.setToolTip("Z 基准 = 底面高度；选「中心」时为体心高度")
+        self._layout.addWidget(gP)
+
+        # ---- 创建 / 结束 ----
+        btnConfirm = self._button("创建", primary=True)
+        btnConfirm.clicked.connect(self.confirmed.emit)
+        self._layout.addWidget(btnConfirm)
+        btnEnd = self._button("结束")
+        btnEnd.clicked.connect(self.finished.emit)
+        self._layout.addWidget(btnEnd)
+        self._layout.addStretch(1)
+
+        # ---- 信号 ----
+        self._shapeGroup.idClicked.connect(lambda *_: self._onShapeChanged())
+        self._axisGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
+        self._edgeGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
+        self._scopeGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
+        self._alignGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
+        for s in (self._spinLen, self._spinWid, self._spinH, self._spinDia,
+                  self._spinD1, self._spinD2, self._spinMaj, self._spinMin,
+                  self._spinDraft, self._spinEdge, self._spinZ,
+                  self._spinRot):
+            s.valueChanged.connect(lambda *_: self.paramsChanged.emit())
+        self._onShapeChanged()
+
+    # ---------- 形状切换显隐 ----------
+
+    def _onShapeChanged(self) -> None:
+        k = self.shape()
+        is_torus = (k == "torus")
+        self._rowLen.setVisible(k == "box")
+        self._rowWid.setVisible(k == "box")
+        self._rowDia.setVisible(k == "cylinder")
+        self._rowD1.setVisible(k == "cone")
+        self._rowD2.setVisible(k == "cone")
+        self._rowMaj.setVisible(is_torus)
+        self._rowMin.setVisible(is_torus)
+        self._rowAxis.setVisible(is_torus)
+        self._rowH.setVisible(k in ("box", "cylinder", "cone"))
+        self._rowDraft.setVisible(k in ("box", "cylinder"))
+        self._groupEdge.setVisible(not is_torus)
+        self._notifyResize()
+        self.paramsChanged.emit()
+
+    # ---------- 取值 ----------
+
+    def shape(self) -> str:
+        idx = self._shapeGroup.checkedId()
+        return self.SHAPE_KEYS[idx] if 0 <= idx < len(self.SHAPE_KEYS) \
+            else "box"
+
+    def params(self) -> dict:
+        """构建参数字典（含钳制：拔模受尺寸限制、圆环管径 ≤ 环径 80%、
+        倒角/圆角值 ≤ 最小 feature 的 1/3）。"""
+        k = self.shape()
+        p = {"kind": k,
+             "cz": self._spinZ.value(),
+             "rot": self._spinRot.value(),
+             "align": "center" if self._alignGroup.checkedId() == 1
+                      else "bottom",
+             "edge_mode": ("none", "chamfer", "fillet")[
+                 max(0, self._edgeGroup.checkedId())],
+             "edge_val": self._spinEdge.value(),
+             "edge_scope": self._scopeGroup.checkedId() + 1}
+        import math
+        if k == "box":
+            l, w, h = self._spinLen.value(), self._spinWid.value(), \
+                self._spinH.value()
+            draft = self._spinDraft.value()
+            lim = math.degrees(math.atan(min(l, w) / max(h, 1e-6)))
+            p.update(l=l, w=w, h=h, draft=max(-lim, min(lim, draft)))
+        elif k == "cylinder":
+            d, h = self._spinDia.value(), self._spinH.value()
+            draft = self._spinDraft.value()
+            lim = math.degrees(math.atan((d * 0.5) / max(h, 1e-6)))
+            p.update(d=d, h=h, draft=max(-lim, min(lim, draft)))
+        elif k == "cone":
+            p.update(d1=self._spinD1.value(), d2=self._spinD2.value(),
+                     h=self._spinH.value())
+        else:
+            dmaj = self._spinMaj.value()
+            dmin = min(self._spinMin.value(), dmaj * 0.8)
+            p.update(dmaj=dmaj, dmin=dmin,
+                     axis=("z", "x", "y")[max(0, self._axisGroup.checkedId())])
+        if k != "torus":
+            # 倒角/圆角上限：最小 feature（高/半径）的 1/3
+            feats = [p.get("h", 0.0)]
+            if "l" in p:
+                feats += [p["l"], p["w"]]
+            if "d" in p:
+                feats.append(p["d"] * 0.5)
+            if "d1" in p:
+                feats.append(p["d1"] * 0.5)
+            if p.get("d2", 0.0) > 0:
+                feats.append(p["d2"] * 0.5)
+            p["edge_val"] = min(p["edge_val"],
+                                max(0.01, min(f for f in feats if f > 0) / 3))
+        return p
 
 
 # ==================== RevolveSlope 旋转面 ====================
@@ -5262,7 +6026,7 @@ class TextureFillParamPanel(ParamPanelBase):
 
         # ---- 几何纹理类型（一行单选：随机/编织/缠绕/填充）----
         self._kindGroup = QButtonGroup(self)
-        gKind, lKind = self._group("几何纹理类型")
+        gKind, lKind = self._section("纹理类型")
         lKind.addWidget(self._radioRow("", self._KIND_LABELS,
                                        self._kindGroup, 0))
         self._kindGroup.button(0).setChecked(True)
@@ -5368,9 +6132,8 @@ class TextureFillParamPanel(ParamPanelBase):
         self._layout.addWidget(self._rowSeed)
 
         # ---- 编织/缠绕公共参数（整面编织显示条数；缠绕显示提示并点曲线）----
-        self._weaveBox, _wl = self._group("编织")
-        _wl.setSpacing(6)
-        _wl.setContentsMargins(6, 6, 6, 6)
+        self._weaveBox, _wl = self._section("编织")
+        _wl.setSpacing(4)
         self._labWeaveHint = QLabel("缠绕：单击曲线开始预览\n（单条自相交"
                                     "如“8”字，或多条编组均可）")
         self._labWeaveHint.setWordWrap(True)
@@ -5441,7 +6204,7 @@ class TextureFillParamPanel(ParamPanelBase):
 
         # ---- 拼合方式 ----
         self._blendGroup = QButtonGroup(self)
-        gBlend, lBlend = self._group("拼合方式")
+        gBlend, lBlend = self._section("拼合方式")
         lBlend.addWidget(self._radioRow("", self._BLEND_LABELS,
                                         self._blendGroup, 0))
         self._blendGroup.button(0).setChecked(True)
@@ -5449,7 +6212,7 @@ class TextureFillParamPanel(ParamPanelBase):
 
         # ---- 颜色范围 ----
         self._scopeGroup = QButtonGroup(self)
-        gScope, lScope = self._group("颜色范围")
+        gScope, lScope = self._section("颜色范围")
         lScope.addWidget(self._radioRow("", self._SCOPE_LABELS,
                                         self._scopeGroup, 0))
         self._scopeGroup.button(0).setChecked(True)
@@ -5461,13 +6224,18 @@ class TextureFillParamPanel(ParamPanelBase):
         # 拼合方式、颜色范围始终在按钮上方。
         row = QHBoxLayout()
         row.setSpacing(6)
-        self._btnWeaveConfirm = self._button("确认生成", primary=True)
+        # 4 个按钮的 4 字文案原使整行最小宽恰好 250px（等于可视宽）→
+        # 一旦出现纵向滚动条就触发横向滚动条；文案缩为 2 字，语义放 tooltip
+        self._btnWeaveConfirm = self._button("确认", primary=True)
+        self._btnWeaveConfirm.setToolTip("确认生成（提交并退出预览）")
         self._btnWeaveConfirm.clicked.connect(self.confirmed.emit)
         row.addWidget(self._btnWeaveConfirm)
-        self._btnRefresh = self._button2("更新预览")
+        self._btnRefresh = self._button2("更新")
+        self._btnRefresh.setToolTip("立即重算一次预览")
         self._btnRefresh.clicked.connect(self.refreshPreview.emit)
         row.addWidget(self._btnRefresh)
         self._btnWeaveCancel = self._button2("取消")
+        self._btnWeaveCancel.setToolTip("取消并回滚到预览前")
         self._btnWeaveCancel.clicked.connect(self.cancelled.emit)
         row.addWidget(self._btnWeaveCancel)
         btnDone = self._button2("完成")
@@ -5478,6 +6246,19 @@ class TextureFillParamPanel(ParamPanelBase):
 
         # 初始按默认类型（随机）调度显隐
         self._onKindChanged()
+
+    def _section(self, title: str):
+        """紧凑分组：小号加粗标题 + 行容器（替代 QGroupBox 的框线与内边距，
+        整块可省 ~24px 纵向空间，避免参数区出现滚动条）。"""
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setSpacing(2)
+        lay.setContentsMargins(0, 0, 0, 2)
+        lab = QLabel(title)
+        lab.setStyleSheet("color:%s; font-weight:bold;" % theme.PRIMARY_DARK)
+        lay.addWidget(lab)
+        box._titleLabel = lab
+        return box, lay
 
     def kind(self) -> str:
         return self._KINDS[max(0, self._kindGroup.checkedId())]
@@ -5505,7 +6286,8 @@ class TextureFillParamPanel(ParamPanelBase):
         self._rowSeed.setVisible(k == "fractal")
         self._onFillPatternChanged()                  # 含径向间距显隐
         if is_weave:
-            self._weaveBox.setTitle("编织参数" if k == "weave" else "缠绕参数")
+            self._weaveBox._titleLabel.setText(
+                "编织参数" if k == "weave" else "缠绕参数")
         self._weaveBox.setVisible(is_weave)
         self._rowWeaveCounts.setVisible(k == "weave")  # 条数仅整面编织
         self._rowWeaveAngle.setVisible(k == "weave")   # 交叉角度仅整面编织
@@ -5644,3 +6426,111 @@ class SlopeZoneParamPanel(ParamPanelBase):
 
     def tolerance(self) -> float:
         return self._spinTol.value()
+
+
+# ==================== Revcloud（修订云线） ====================
+
+class RevcloudPanel(ParamPanelBase):
+    """修订云线面板：模式切换（矩形/多边形/手绘/选对象）+ 长宽 + 单弧尺寸。
+
+    模式按钮选中态高亮（主题青色底白字）。"""
+    modeChanged = Signal(str)          # 'rect' / 'poly' / 'free' / 'object'
+    sizeChanged = Signal(float, float) # 长/宽（矩形模式编辑对角）
+    arcLenChanged = Signal(float)      # 单弧尺寸（0 = 自适应）
+    confirmRequested = Signal()
+    cancelRequested = Signal()
+
+    _MODES = (('rect', '矩形'), ('poly', '多边形'),
+              ('free', '手绘'), ('object', '选对象'))
+    _HINTS = {'rect': '两点绘制矩形云线',
+              'poly': '连续点击，右击闭合完成',
+              'free': '按住鼠标沿路径拖动，松开完成',
+              'object': '点击一条闭合曲线，以它为边界生成云线'}
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._addCoordRows()
+        self._modeBtns = {}
+        row = QHBoxLayout()
+        for mode, text in self._MODES:
+            btn = self._button2(text)
+            btn.setCheckable(True)
+            btn.setStyleSheet(
+                'QPushButton:checked { background:#15b6c9; color:#ffffff; }')
+            btn.clicked.connect(lambda _=False, m=mode: self._onMode(m))
+            self._modeBtns[mode] = btn
+            row.addWidget(btn)
+        self._layout.addLayout(row)
+        self._modeBtns['rect'].setChecked(True)
+        self._hint = self._label(self._HINTS['rect'])
+        self._layout.addWidget(self._hint)
+
+        # 长/宽（边界外接框尺寸；矩形模式可编辑对角，选对象模式禁用）
+        self._spinLen = self._spin(0.0, step=0.5)
+        self._spinWid = self._spin(0.0, step=0.5)
+        self._spinLen.setMinimum(0.0)
+        self._spinWid.setMinimum(0.0)
+        self._spinLen.valueChanged.connect(self._emitSize)
+        self._spinWid.valueChanged.connect(self._emitSize)
+        rowLen = QHBoxLayout()
+        rowLen.setSpacing(4)
+        labLen = self._label('长')
+        labLen.setMinimumWidth(28)
+        rowLen.addWidget(labLen)
+        rowLen.addWidget(self._spinLen, 1)
+        self._layout.addLayout(rowLen)
+        rowWid = QHBoxLayout()
+        rowWid.setSpacing(4)
+        labWid = self._label('宽')
+        labWid.setMinimumWidth(28)
+        rowWid.addWidget(labWid)
+        rowWid.addWidget(self._spinWid, 1)
+        self._layout.addLayout(rowWid)
+
+        # 单弧尺寸（每段弧的弦长；0 = 自适应）
+        self._spinArc = self._spin(0.0, step=0.5)
+        self._spinArc.setMinimum(0.0)
+        self._spinArc.valueChanged.connect(self._emitArc)
+        rowArc = QHBoxLayout()
+        rowArc.setSpacing(4)
+        labArc = self._label('单弧')
+        labArc.setMinimumWidth(28)
+        rowArc.addWidget(labArc)
+        rowArc.addWidget(self._spinArc, 1)
+        self._layout.addLayout(rowArc)
+
+        btnOk = self._button('确认完成', primary=True)
+        btnOk.clicked.connect(self.confirmRequested.emit)
+        self._layout.addWidget(btnOk)
+        self._layout.addStretch(1)
+
+    def _emitSize(self) -> None:
+        self.sizeChanged.emit(self._spinLen.value(), self._spinWid.value())
+
+    def _emitArc(self) -> None:
+        self.arcLenChanged.emit(self._spinArc.value())
+
+    def setSize(self, length: float, width: float) -> None:
+        for s, v in ((self._spinLen, length), (self._spinWid, width)):
+            s.blockSignals(True)
+            s.setValue(v)
+            s.blockSignals(False)
+
+    def setArcLen(self, v: float) -> None:
+        """回写实际生效的单弧尺寸（blockSignals 防回环）。"""
+        self._spinArc.blockSignals(True)
+        self._spinArc.setValue(v)
+        self._spinArc.blockSignals(False)
+
+    def setSizesEnabled(self, on: bool) -> None:
+        self._spinLen.setEnabled(on)
+        self._spinWid.setEnabled(on)
+
+    def _onMode(self, mode: str) -> None:
+        for m, btn in self._modeBtns.items():
+            btn.blockSignals(True)
+            btn.setChecked(m == mode)
+            btn.blockSignals(False)
+        self._hint.setText(self._HINTS.get(mode, ''))
+        self.setSizesEnabled(mode in ('rect', 'poly', 'free'))
+        self.modeChanged.emit(mode)

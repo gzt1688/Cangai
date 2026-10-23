@@ -40,6 +40,7 @@ class StatusBarWidget(QStatusBar):
             b.setFixedHeight(22)
             b.setMinimumWidth(w)
             b.setStyleSheet(_toggleStyle)
+            b.setToolTip(tr(b.text()))
         self._btnOrtho.setChecked(False)
         self._btnGizmo.setChecked(True)
         # 编辑曲线开关：打开后选中曲线才显示控制点，可点选/框选/拖动控制点
@@ -64,6 +65,7 @@ class StatusBarWidget(QStatusBar):
             b.setFixedHeight(22)
             b.setMinimumWidth(w)
             b.setStyleSheet(self._btnStyle())
+            b.setToolTip(tr("开关打开后显示选中对象的测量值"))
         self._lblLen = QLabel("--")
         self._lblArea = QLabel("--")
         self._lblLen.setFixedWidth(104)
@@ -92,6 +94,14 @@ class StatusBarWidget(QStatusBar):
         self._spinLineW.valueChanged.connect(self.lineWidthChanged.emit)
         self._btnLen.toggled.connect(self._onMeasureToggled)
         self._btnArea.toggled.connect(self._onMeasureToggled)
+
+        # 最右下角：当前软件版本号与版本日期（常驻，不随左侧内容挤压）
+        from version import APP_VERSION, APP_VERSION_DATE
+        self._lblVersion = QLabel(f"{APP_VERSION} · {APP_VERSION_DATE}")
+        self._lblVersion.setStyleSheet("color: #666; padding: 0 8px;")
+        self._lblVersion.setToolTip(tr(f"版本 {APP_VERSION}（更新日期 {APP_VERSION_DATE}）"))
+        self.addPermanentWidget(self._lblVersion)
+
         languageChanged().connect(self.retranslateUi)
 
     def retranslateUi(self) -> None:
@@ -102,6 +112,10 @@ class StatusBarWidget(QStatusBar):
         self._lblLineW.setText(tr("线宽:"))
         self._btnLen.setText(tr("长度"))
         self._btnArea.setText(tr("面积"))
+        self._btnOrtho.setToolTip(tr("正交"))
+        self._btnGizmo.setToolTip(tr("操作轴"))
+        self._btnLen.setToolTip(tr("开关打开后显示选中对象的测量值"))
+        self._btnArea.setToolTip(tr("开关打开后显示选中对象的测量值"))
         self._btnEditCurve.setToolTip(
             tr("编辑曲线：打开后选中曲线显示控制点，点选/框选控制点即编辑，"
                "可用操作轴批量变换控制点"))

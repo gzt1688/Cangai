@@ -15,7 +15,7 @@ import numpy as np
 
 from core.vector.geometry_types import ObjectType, Point3D
 from core.vector.brep_object import BRepObject
-from core.vector.brep_shape import BrepShape, bdKernelReady
+from core.vector.brep_shape import BrepShape, bdKernelReady, bdKernelError
 from core.vector.poly_solid import PolySolid
 from ..command_instance import CommandInstance
 from ..param_panels import ExtrudeParamPanel
@@ -132,6 +132,10 @@ class ExtrudeCommand(CommandInstance):
     def _confirmExtrude(self) -> None:
         """确认挤出当前预览（多组 = 全部挤出，一次撤销），回到拾取态。"""
         if not bdKernelReady():
+            err = bdKernelError()
+            if err is not None:
+                self._notify("3D 内核不可用：%s（详见 crash.log）" % err)
+                return
             # 预载线程仍在导入 build123d：此刻构建会在模块锁上冻结 UI
             # 数秒到数十秒（冷盘首次导入）——提示稍候，不阻塞
             self._notify("几何内核预热中，请稍候 2~3 秒再确认（仅首次启动）")
@@ -515,7 +519,11 @@ class ExtrudeCommand(CommandInstance):
             # 定时补建（鼠标不动也能恢复预览）；只提示一次避免刷屏
             if not getattr(self, "_kernelWaitHinted", False):
                 self._kernelWaitHinted = True
-                self._notify("几何内核预热中，预览稍候自动出现（仅首次启动）")
+                err = bdKernelError()
+                if err is not None:
+                    self._notify("3D 内核不可用：%s（详见 crash.log）" % err)
+                else:
+                    self._notify("几何内核预热中，预览稍候自动出现（仅首次启动）")
             if not getattr(self, "_kernelRetryPending", False):
                 self._kernelRetryPending = True
                 try:

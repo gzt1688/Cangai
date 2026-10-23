@@ -5,8 +5,9 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QPen
 
 
 def makeTextIcon(text: str = "字", size: int = 64,
-                 family: str = "YouYuan") -> QIcon:
-    """生成白色文字透明背景图标。size 为像素分辨率（越大越清晰，按比例缩放显示）。
+                 family: str = "YouYuan", color: str = "#ffffff") -> QIcon:
+    """生成文字透明背景图标（默认白色，供彩色按钮底；浅底传深色 color）。
+    size 为像素分辨率（越大越清晰，按比例缩放显示）。
 
     支持多字：超过 2 字自动拆成两行（每行 2 字，如"纹理填充"→
     "纹理"/"填充"），也可用 "\n" 显式分行；字号按行数自动缩小。
@@ -33,7 +34,7 @@ def makeTextIcon(text: str = "字", size: int = 64,
     font.setWeight(QFont.Black)
     font.setBold(True)
     p.setFont(font)
-    p.setPen(QPen(QColor("#ffffff")))
+    p.setPen(QPen(QColor(color)))
     fm = p.fontMetrics()
     line_h = fm.height()
     total_h = line_h * len(lines)

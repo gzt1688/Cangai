@@ -20,6 +20,7 @@ from .vector.relief_model_object import ReliefModelObject
 from .vector.image_object import ImageObject
 from .vector.dimension_object import DimensionObject
 from .vector.brep_object import BRepObject
+from .vector.revcloud_object import RevcloudObject
 from .vector.geometry_types import ObjectType
 
 
@@ -37,6 +38,7 @@ _TYPE_FACTORY = {
     "DIMENSION": DimensionObject,
     # 3D 实体（挤出/墙线/布尔/螺纹/推拉等 BRepObject 产物）
     "BREP": BRepObject,
+    "REVCLOUD": RevcloudObject,
 }
 
 
@@ -66,14 +68,14 @@ LAYER_3D_MODEL_ID = 4
 LAYER_CNC_ID = 5        # 加工模具：固定层，专放 CNC 加工模型
 LAYER_FIXED_COUNT = 6   # 固定层数量；id ≥ LAYER_FIXED_COUNT 的层全部为子图层
 
-# (id, 默认名, 默认颜色)：曲线层沿用描边主色，模型层沿用模型默认轮廓色，
-# 图片层取中性紫（仅作图层标识色，图片本身按原始像素显示），标注层取绿色，
+# (id, 默认名, 默认颜色)：曲线层沿用描边主色，模型层取芥黄 #c9c909，
+# 图片层取中性紫（仅作图层标识色，图片本身按原始像素显示），标注层取红色，
 # 3D模型层取青绿（3D 模式挤出实体默认归此层，与曲线/浮雕模型区分）
 _FIXED_LAYERS = (
     (LAYER_CURVES_ID, "曲线", (255, 100, 0)),
-    (LAYER_MODEL_ID, "浮雕模型", (21, 182, 201)),
+    (LAYER_MODEL_ID, "浮雕模型", (201, 201, 9)),
     (LAYER_IMAGE_ID, "图片", (155, 89, 182)),
-    (LAYER_ANNOTATION_ID, "标注", (46, 204, 113)),
+    (LAYER_ANNOTATION_ID, "标注", (231, 76, 60)),
     (LAYER_3D_MODEL_ID, "3D模型", (0, 200, 200)),
     (LAYER_CNC_ID, "加工模具", (216, 175, 68)),
 )

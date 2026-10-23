@@ -1,16 +1,19 @@
 """设置对话框：外观（主题色）等偏好设置。"""
 from __future__ import annotations
+import os
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                 QPushButton, QGroupBox, QFormLayout,
                                 QSpinBox, QDoubleSpinBox, QColorDialog,
                                 QCheckBox, QWidget, QListWidget, QStackedWidget,
                                 QButtonGroup, QRadioButton, QComboBox,
-                                QLineEdit, QFileDialog, QFontComboBox)
+                                QLineEdit, QFileDialog, QFontComboBox,
+                                QMessageBox)
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
 import ui.styles.theme as theme
 import core.app_settings as app_settings
 from core.api import API_VERSION
+from version import APP_NAME, APP_VERSION, APP_VERSION_DATE
 from i18n import tr, languageChanged
 
 
@@ -19,10 +22,6 @@ _PRESET_COLORS = ["#15b6c9", "#ff6400", "#27ae60", "#1e88e5"]
 
 # 导航页名（key 顺序对应 _stack 各页）
 _NAV_NAMES = ["外观样式", "渲染性能", "通用", "文件", "键盘", "插件", "说明"]
-
-# 软件基本信息（设置-说明页展示；发新版时更新版本号）
-APP_NAME = "Cangai 浮雕设计"
-APP_VERSION = "V1.0"
 
 
 class SettingsDialog(QDialog):
@@ -296,6 +295,10 @@ class SettingsDialog(QDialog):
         self._selBoxCheck.setChecked(app_settings.show_selection_box)
         self._selBoxCheck.toggled.connect(self.selectionBoxChanged.emit)
         form2.addRow(self._selBoxCheck)
+        self._invertWheelCheck = QCheckBox("反向滚轮缩放")
+        self._invertWheelCheck.setChecked(app_settings.invert_wheel_zoom)
+        self._invertWheelCheck.toggled.connect(self._onInvertWheelToggled)
+        form2.addRow(self._invertWheelCheck)
         layout.addWidget(box2)
 
         layout.addStretch()
@@ -359,6 +362,10 @@ class SettingsDialog(QDialog):
         self._meshGpuSpin.setRange(lo, hi)
         self._meshGpuSpin.setValue(int(app_settings.mesh_max_dim_gpu))
         self._meshGpuSpin.valueChanged.connect(self._onMeshGpuChanged)
+        self._meshGpuSpin.setToolTip(
+            "浮雕曲面显示网格每边最大格数。越大越细腻（1024≈千像素级图片接近 1:1，"
+            "2048≈1:1 全像素）；越大越吃显存，2048 建议 8GB 以上显卡；"
+            "只影响 3D 显示，不影响模型数据与导出 STL。")
         fg.addRow("3D 曲面网格密度 (GPU):", self._meshGpuSpin)
 
         lo, hi = app_settings.MESH_MAX_DIM_CPU_RANGE
@@ -556,6 +563,12 @@ class SettingsDialog(QDialog):
         self._btnApply.setText(tr("应用"))
         self._btnOk.setText(tr("确认"))
         self._btnCancel.setText(tr("取消"))
+        if hasattr(self, "_invertWheelCheck"):
+            self._invertWheelCheck.setText(tr("反向滚轮缩放"))
+
+    def _onInvertWheelToggled(self, on: bool) -> None:
+        """反向滚轮缩放：写入设置，2D/3D 视图滚轮事件即时按新方向生效。"""
+        app_settings.invert_wheel_zoom = bool(on)
 
     def _onUnitChanged(self, text: str) -> None:
         app_settings.unit = text
@@ -592,18 +605,24 @@ class SettingsDialog(QDialog):
         self._keyConflictLabel.setStyleSheet("color: #e74c3c; font-size: 12px;")
         layout.addWidget(self._keyConflictLabel)
 
-        self._keyTable = QTableWidget(0, 3)
-        self._keyTable.setHorizontalHeaderLabels(["功能", "快捷键", "说明"])
+        self._keyTable = QTableWidget(0, 4)
+        self._keyTable.setHorizontalHeaderLabels(["分组", "功能", "快捷键", "说明"])
         self._keyTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self._keyTable.horizontalHeader().resizeSection(0, 100)
+        self._keyTable.horizontalHeader().resizeSection(0, 70)
         self._keyTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self._keyTable.horizontalHeader().resizeSection(1, 120)
-        self._keyTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._keyTable.horizontalHeader().resizeSection(1, 105)
+        self._keyTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self._keyTable.horizontalHeader().resizeSection(2, 115)
+        self._keyTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self._keyTable.verticalHeader().setVisible(False)
 
         self._keyCaptures = []
-        for func, key, desc in app_settings.shortcuts:
-            self._addShortcutRow(func, key, desc)
+        for row in app_settings.shortcuts:
+            # 兼容旧格式 [功能, 快捷键, 说明]
+            if len(row) >= 4:
+                self._addShortcutRow(row[0], row[1], row[2], row[3])
+            else:
+                self._addShortcutRow("通用", row[0], row[1], row[2])
 
         layout.addWidget(self._keyTable, 1)
 
@@ -629,26 +648,38 @@ class SettingsDialog(QDialog):
         layout.addLayout(btnRow)
         return page
 
-    def _addShortcutRow(self, func: str = "", key: str = "", desc: str = "") -> None:
-        """在快捷键表格末尾追加一行（功能名/快捷键捕获框/说明）。"""
+    def _addShortcutRow(self, group: str = "通用", func: str = "",
+                        key: str = "", desc: str = "") -> None:
+        """在快捷键表格末尾追加一行（分组/功能名/快捷键捕获框/说明）。"""
         from PySide6.QtWidgets import QTableWidgetItem
+        from PySide6.QtGui import QBrush, QColor
         self._keyCaptures = getattr(self, "_keyCaptures", [])
         row = self._keyTable.rowCount()
         self._keyTable.insertRow(row)
-        self._keyTable.setItem(row, 0, QTableWidgetItem(func))
+        gItem = QTableWidgetItem(group)
+        gItem.setTextAlignment(Qt.AlignCenter)
+        gItem.setForeground(QBrush(QColor("#15b6c9")))
+        self._keyTable.setItem(row, 0, gItem)
+        self._keyTable.setItem(row, 1, QTableWidgetItem(func))
         capture = KeyCaptureWidget(key)
         capture.changed.connect(self._checkKeyConflicts)
-        self._keyTable.setCellWidget(row, 1, capture)
+        self._keyTable.setCellWidget(row, 2, capture)
         self._keyCaptures.append(capture)
-        self._keyTable.setItem(row, 2, QTableWidgetItem(desc))
+        self._keyTable.setItem(row, 3, QTableWidgetItem(desc))
         self._keyTable.setRowHeight(row, 28)
 
     def _onAddShortcut(self) -> None:
-        self._addShortcutRow("", "", "")
+        row = self._keyTable.currentRow()
+        group = "通用"
+        if row >= 0:
+            item = self._keyTable.item(row, 0)
+            if item is not None and item.text().strip():
+                group = item.text().strip()
+        self._addShortcutRow(group, "", "", "")
         row = self._keyTable.rowCount() - 1
-        item = self._keyTable.item(row, 0)
+        item = self._keyTable.item(row, 1)
         if item is not None:
-            self._keyTable.setCurrentCell(row, 0)
+            self._keyTable.setCurrentCell(row, 1)
             self._keyTable.editItem(item)
 
     def _onDeleteShortcut(self) -> None:
@@ -656,7 +687,7 @@ class SettingsDialog(QDialog):
         if row < 0:
             return
         self._keyTable.removeRow(row)
-        if row < len(self._keyCaptures):
+        if len(self._keyCaptures) > row:
             del self._keyCaptures[row]
         self._checkKeyConflicts()
 
@@ -664,13 +695,15 @@ class SettingsDialog(QDialog):
         """把表格内容写回 app_settings（应用/确认时调用）。"""
         rows = []
         for i in range(self._keyTable.rowCount()):
-            item = self._keyTable.item(i, 0)
+            gItem = self._keyTable.item(i, 0)
+            group = gItem.text().strip() if gItem is not None else "通用"
+            item = self._keyTable.item(i, 1)
             func = item.text().strip() if item is not None else ""
-            cap = self._keyTable.cellWidget(i, 1)
+            cap = self._keyTable.cellWidget(i, 2)
             key = cap.text().strip() if cap is not None else ""
-            dscItem = self._keyTable.item(i, 2)
+            dscItem = self._keyTable.item(i, 3)
             desc = dscItem.text().strip() if dscItem is not None else ""
-            rows.append([func, key, desc])
+            rows.append([group or "通用", func, key, desc])
         app_settings.shortcuts = rows
 
     def _checkKeyConflicts(self) -> None:
@@ -688,7 +721,7 @@ class SettingsDialog(QDialog):
             k = cap.text().strip()
             if k and k in conflicts:
                 cap.setStyleSheet("background: #fde; border: 1px solid #e74c3c;")
-                item = self._keyTable.item(i, 0)
+                item = self._keyTable.item(i, 1)
                 conflictFuncs.append(item.text() if item else f"第{i + 1}项")
             else:
                 cap.setStyleSheet("")
@@ -762,8 +795,69 @@ class SettingsDialog(QDialog):
             row.addWidget(browse)
             sl.addLayout(row)
         layout.addWidget(box2)
+
+        # ---- 文件关联（绿色版不写注册表，需要手动登记 .cai） ----
+        boxAssoc = QGroupBox("")
+        boxAssoc.setStyleSheet("QGroupBox { border: none; padding: 0; margin: 0; }")
+        al = QVBoxLayout(boxAssoc)
+        al.setSpacing(6)
+        assocRow = QHBoxLayout()
+        assocRow.setSpacing(8)
+        self._assocBtn = QPushButton("设为 .cai 默认打开程序")
+        self._assocBtn.setFixedWidth(170)
+        self._assocBtn.clicked.connect(self._onRegisterAssoc)
+        assocRow.addWidget(self._assocBtn)
+        self._assocStatus = QLabel("")
+        self._assocStatus.setStyleSheet("color: #666; font-size: 11px;")
+        assocRow.addWidget(self._assocStatus, 1)
+        al.addLayout(assocRow)
+        assocTip = QLabel(
+            "便携版免安装，系统默认不认识 .cai。点击后写入当前用户注册表，"
+            "资源管理器中的工程文件即显示 Cangai 图标并可双击打开（无需管理员权限）。")
+        assocTip.setWordWrap(True)
+        assocTip.setStyleSheet("color: #888; font-size: 11px;")
+        al.addWidget(assocTip)
+        layout.addWidget(boxAssoc)
+        self._refreshAssocStatus()
+
         layout.addStretch()
         return page
+
+    # ---- 文件关联 ----
+    def _refreshAssocStatus(self) -> None:
+        try:
+            from core.file_association import is_registered
+            ok = is_registered()
+        except Exception:
+            ok = False
+        self._assocStatus.setText(
+            "✓ 已关联 .cai（双击工程文件即用本程序打开）" if ok
+            else "● 未关联：双击 .cai 不会显示 Cangai 图标")
+
+    def _onRegisterAssoc(self) -> None:
+        try:
+            from core.file_association import (register, user_choice_progid,
+                                               APP_PROGID)
+            register()
+        except Exception as e:
+            QMessageBox.warning(self, "文件关联",
+                                f"写入注册表失败：{e}\n\n"
+                                "若系统策略禁止写入，请改用安装版。")
+            return
+        self._refreshAssocStatus()
+        extra = ""
+        old = user_choice_progid()
+        if old and old != APP_PROGID:
+            extra = (f"\n\n系统原先记录的默认程序是 {old}。\n"
+                     "请在 Windows 设置 → 应用 → 默认应用 → 按文件类型指定"
+                     "默认应用 中，把 .cai 改为 Cangai 即可覆盖它。")
+        QMessageBox.information(
+            self, "文件关联",
+            "已注册完成。\n\n"
+            "资源管理器里的 .cai 文件应显示为 Cangai 工程文件图标，"
+            "双击即用本程序打开。\n"
+            "若图标仍是旧的，注销/重启资源管理器或重启电脑后刷新。"
+            + extra)
 
     # ---- 文件页回调（自动保存 / 备份 / 保存槽） ----
     def _onAutosaveToggled(self, on: bool) -> None:
@@ -804,6 +898,7 @@ class SettingsDialog(QDialog):
         _rows = [
             ("软件名称:", APP_NAME),
             ("版本:", APP_VERSION),
+            ("更新日期:", APP_VERSION_DATE),
             ("开发语言:", "Python 3"),
             ("界面框架:", "PySide6（Qt 6）"),
             ("3D 渲染:", "OpenGL（ModernGL）"),
@@ -824,6 +919,47 @@ class SettingsDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666; font-size: 11px;")
         layout.addWidget(hint)
+
+        # ---- 开源免费声明 + 打赏收款码 ----
+        boxDonate = QGroupBox("开源与支持")
+        boxDonate.setStyleSheet(
+            "QGroupBox { border: 1px solid #ddd; border-radius: 4px;"
+            " margin-top: 8px; padding-top: 10px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px;"
+            " padding: 0 4px; }")
+        dv = QVBoxLayout(boxDonate)
+        dv.setSpacing(8)
+        lbOpen = QLabel(f"{APP_NAME} 是一款开源免费软件，你可以自由地使用、"
+                        "复制和分发，无需支付任何费用，所有功能不受任何限制。")
+        lbOpen.setWordWrap(True)
+        lbOpen.setStyleSheet("color: #333; font-weight: normal;")
+        dv.addWidget(lbOpen)
+        lbDonateTip = QLabel("软件的开发与维护纯属用爱发电。如果它对你的工作有帮助，"
+                             "欢迎扫描二维码请作者喝杯咖啡～ （完全自愿，不影响任何功能）")
+        lbDonateTip.setWordWrap(True)
+        lbDonateTip.setStyleSheet("color: #666; font-size: 11px; font-weight: normal;")
+        dv.addWidget(lbDonateTip)
+
+        from PySide6.QtGui import QPixmap
+        from resource_path import resource_path
+        qrPath = resource_path("resources/donate_qr.png")
+        qrLbl = QLabel()
+        qrLbl.setAlignment(Qt.AlignHCenter)
+        if os.path.exists(qrPath):
+            pm = QPixmap(qrPath)
+            if not pm.isNull():
+                qrLbl.setPixmap(pm.scaled(
+                    260, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                qrLbl.setToolTip("扫码打赏支持作者（自愿）")
+            else:
+                qrLbl.setText("（打赏二维码加载失败）")
+                qrLbl.setStyleSheet("color: #999; font-weight: normal;")
+        else:
+            qrLbl.setText("（未找到打赏二维码图片）")
+            qrLbl.setStyleSheet("color: #999; font-weight: normal;")
+        dv.addWidget(qrLbl, 0, Qt.AlignHCenter)
+        layout.addWidget(boxDonate)
+
         layout.addStretch()
         return page
 

@@ -332,6 +332,19 @@ class CangaiAPI:
         if self._host is not None:
             self._host.addToolButton(spec)
 
+    def registerToolDivider(self, group: str = "插件",
+                            pluginId: str = "") -> None:
+        """在顶部工具区的分组内插入一条竖向分割线（同组内区分子功能）。
+        以特殊 ToolButtonSpec 登记，插件停用时随按钮一并移除。"""
+        n = sum(1 for k in self._buttons if "::divider::" in k) + 1
+        key = f"{group}::divider::{n}"
+        spec = ToolButtonSpec(group=group, key=key, label="", tooltip="",
+                              icon="", pluginId=pluginId or self._pluginScope,
+                              meta={"divider": True})
+        self._buttons[key] = spec
+        if self._host is not None:
+            self._host.addToolButton(spec)
+
     # ---------------- 执行 ----------------
 
     def runAction(self, name: str, context: dict | None = None) -> Any:

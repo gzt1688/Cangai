@@ -82,6 +82,7 @@ TABLE: dict[str, str] = {
     "推拉": "PushPull",
     "圆角": "Fillet",
     "布尔": "Boolean",
+    "标准体": "Primitives",
     "螺纹": "Thread",
 
     # ==================== 按钮悬停提示 ====================

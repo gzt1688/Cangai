@@ -6,7 +6,7 @@
 from __future__ import annotations
 import math
 from typing import List
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QPointF
 from PySide6.QtGui import QPainterPath
 
 from core.vector.geometry_types import Point3D
@@ -20,7 +20,7 @@ from core.vector.poly_curve_object import PolyCurveObject
 from core.vector.wave_geometry import buildWaveCirclePoints
 from core.vector.fillet_processor import (nearestPointOnSegment,
                                           PICK_PIXEL_RADIUS)
-from core.spline_utils import catmullRom, catmullRomSegment
+from core.spline_utils import catmullRom
 from core.document import LAYER_CURVES_ID
 from ..command_instance import CommandInstance
 from ..param_panels import (PointParamPanel, LineParamPanel, CircleParamPanel,
@@ -122,8 +122,19 @@ class LineCommand(CommandInstance):
         return pts[-1] if pts else None
 
     def previewObjectIds(self) -> set:
-        # 直线绘制时不完全排除自身：保留端点/中点/最近点/垂足等吸附，
-        # 使光标可吸附回起点以闭合，也可吸附已画线段上的各点
+        # 直线绘制时不完全排除自身：保留端点吸附（可吸回起点闭合）
+        return set()
+
+    def partialSnapObjectIds(self) -> set:
+        # 自身几何照常参与全部吸附（中点/最近点/垂足都需要，沿线描画时用），
+        # 只由视口对"距最后输入点过近"的沿线候选做距离过滤——那是刚点下的
+        # 那一段，靠得太近会把光标往回拽（用户实测手感发黏）
+        if self._obj is not None:
+            return {self._obj.id()}
+        return set()
+
+    def excludedSnapTypesForPartial(self) -> set:
+        # 不按类型排除：自身端点可用于吸回起点闭合，中点/最近点用于沿线取点
         return set()
 
     def prompt(self) -> str:
@@ -138,7 +149,7 @@ class LineCommand(CommandInstance):
         n = len(self._obj.points()) if self._obj else 0
         if n == 0:
             return "指定直线起点"
-        return "指定下一点（右键/回车完成，C 闭合，Esc 取消）"
+        return "指定下一点（右键/回车完成，B 闭合，Z 撤点，Esc 取消）"
 
     def start(self) -> None:
         super().start()
@@ -161,8 +172,9 @@ class LineCommand(CommandInstance):
             self._panel.undoClicked.connect(self._onPanelUndo)
             self._panel.closeToggled.connect(self._onPanelClose)
             self._panel.confirmRequested.connect(self._onPanelConfirm)
-            self._panel.drawParamRequested.connect(self._onPanelDrawParam)
             self._panel.bisectorToggled.connect(self._onPanelBisector)
+            # 落点后长度框会自动抢焦点；字母键（B 闭合/Z 撤点/Esc）仍交给命令
+            self._panel.setKeyHandler(self.onKeyPress)
             self._updateCloseState()
         return self._panel
 
@@ -171,17 +183,25 @@ class LineCommand(CommandInstance):
         self._addPointAt(Point3D(self._panel.x(), self._panel.y(),
                                  self._panel.z()))
 
-    def _onPanelUndo(self) -> None:
-        if self._obj is None:
+    def _undoLastPoint(self) -> None:
+        """撤回上一个已确定的点（面板"撤回"按钮与 Z 键共用）。"""
+        if self._obj is None or not self._obj.points():
             return
         self._obj.removeLastPoint()
         self._doc.notifyObjectChanged(self._obj.id())
         self._updateCloseState()
+        # 尾段/光标点预览按新末点重算（鼠标未移动也要立刻跟上）
+        if self._lastCursor is not None and self._obj.points():
+            self._preview = self._lastCursor
+            self._updatePreviewPath(self._lastCursor)
         if not self._obj.points():
             # 原版：撤回到空 → 取消命令（经管理器同步 UI）
             self.cancel()
             from ..command_manager import CommandManager
             CommandManager.instance()._checkDone()
+
+    def _onPanelUndo(self) -> None:
+        self._undoLastPoint()
 
     def _onPanelClose(self, closed: bool) -> None:
         if closed:
@@ -194,41 +214,51 @@ class LineCommand(CommandInstance):
         if self._obj is not None and len(self._obj.points()) >= 2:
             self.finish()
 
-    def _onPanelDrawParam(self) -> None:
-        """按参数画点：一键沿（上段方向 ± 指定角度）画一段指定长度。
-        角度为 0 时沿当前光标方向；仅一次性生效，不改变后续绘制。
-        方向按当前视图绘制平面 (u,v) 度量（侧视 = XZ/YZ 平面）。"""
-        if self._obj is None or self._panel is None:
-            return
-        pts = self._obj.points()
-        length = self._panel.lengthValue()
-        if not pts or length <= 0:
-            return
-        ax = self._viewAxes()
+    def _constrainedPoint(self, wp: Point3D, pts: list) -> Point3D:
+        """按"指定长度/指定角度"开关约束落点（都未按下时原样返回）。
+
+        - 仅指定长度：沿光标方向走输入长度；
+        - 仅指定角度：方向 = 上段方向 ± 输入角度（首点以 +X 为基准），
+          长度取光标在该方向上的投影（可自由伸缩）；
+        - 两者都开：方向取指定角度，长度取输入值；
+        - 侧视（XZ/YZ 平面）：仅长度可用，沿用 _planeStepPoint 的光标方向。
+        """
+        if self._panel is None or not pts:
+            return wp
+        lenOn = self._panel.isLengthMode()
+        angOn = self._panel.isAngleMode()
+        if not lenOn and not angOn:
+            return wp
         last = pts[-1]
+        ax = self._viewAxes()
+        length = self._panel.lengthValue() if lenOn else 0.0
         if ax != (0, 1):
-            self._addPointAt(self._planeStepPoint(last, length))
-            return
-        angleDeg = self._panel.angleValue()
-        ccw = self._panel.angleCCW()
-        if angleDeg > 0:
+            return self._planeStepPoint(last, length) if length > 0 else wp
+        if angOn:
             if len(pts) >= 2:
                 prev = pts[-2]
                 base = math.atan2(last.y - prev.y, last.x - prev.x)
             else:
-                base = 0.0   # 仅有起点：以 +X 轴为基准取绝对角度
-            delta = math.radians(angleDeg) if ccw else -math.radians(angleDeg)
+                base = 0.0
+            delta = (math.radians(self._panel.angleValue())
+                     if self._panel.angleCCW()
+                     else -math.radians(self._panel.angleValue()))
             dirA = base + delta
+            if not lenOn:
+                dx = wp.x - last.x
+                dy = wp.y - last.y
+                proj = dx * math.cos(dirA) + dy * math.sin(dirA)
+                length = proj if proj > 1e-9 else math.hypot(dx, dy)
         else:
-            if self._preview is None:
-                return
-            dx = self._preview.x - last.x
-            dy = self._preview.y - last.y
-            if math.hypot(dx, dy) < 1e-10:
-                return
+            dx = wp.x - last.x
+            dy = wp.y - last.y
+            if math.hypot(dx, dy) < 1e-10 or length <= 0:
+                return wp
             dirA = math.atan2(dy, dx)
-        self._addPointAt(Point3D(last.x + length * math.cos(dirA),
-                                 last.y + length * math.sin(dirA), last.z))
+        if length <= 1e-9:
+            return wp
+        return Point3D(last.x + length * math.cos(dirA),
+                       last.y + length * math.sin(dirA), last.z)
 
     def _planeStepPoint(self, last: Point3D, length: float) -> Point3D:
         """侧视参数画点：沿当前光标在视图平面上的方向走 length。"""
@@ -295,6 +325,7 @@ class LineCommand(CommandInstance):
         pts = self._obj.points() if self._obj else []
         if pts:
             wp = self._orthoPoint(wp, pts[-1])
+            wp = self._constrainedPoint(wp, pts)
         self._lastCursor = wp
         self._addPointAt(wp)
 
@@ -305,8 +336,10 @@ class LineCommand(CommandInstance):
         pts = self._obj.points() if self._obj else []
         if pts:
             wp = self._orthoPoint(wp, pts[-1])
+        self._preview = wp
+        if pts:
+            wp = self._constrainedPoint(wp, pts)
         cursor = wp
-        self._preview = cursor
         self._lastCursor = wp
         pts = self._obj.points() if self._obj else []
         if self._panel is not None:
@@ -396,9 +429,16 @@ class LineCommand(CommandInstance):
         return self.onRightClick(Point3D())
 
     def onKeyPress(self, key, mods) -> bool:
-        # 原版 InputProcessor：C 键闭合（无修饰键）
-        if key == Qt.Key_C and mods == Qt.NoModifier:
+        # B 键闭合（无修饰键）——与曲线命令一致，统一用 B
+        if mods != Qt.NoModifier:
+            return False
+        if key == Qt.Key_B:
             self._closePolygon()
+            return True
+        if key == Qt.Key_Z:
+            # Z：撤回上一个已确定的点（与面板"撤回"同一逻辑），
+            # 画线时不用开面板就能退点重画
+            self._undoLastPoint()
             return True
         return False
 
@@ -1206,11 +1246,13 @@ class EllipseCommand(CommandInstance):
 
 
 class CurveCommand(CommandInstance):
-    """样条曲线（精雕式交互）：局部 Catmull-Rom 增量绘制，
-    严格经过每个点击点。远处的点采样后冻结不再重算（整条线重算会抖），
-    每次只重算最近几个点 + 光标；右键断开只是标记分段（同精雕多重曲线，
-    各段独立不继承走势），结束时所有段合并为一个多段曲线对象入文档，
-    其末点作为下一段起点续画，连续两次右键结束。"""
+    """样条曲线（Rhino InterpCrv 式交互）：全局 C2 三次样条插值，
+    严格经过每个点击点，曲率连续（C2）——这是工业 CAD（Rhino/NX/SolidWorks）
+    插值曲线的标准做法：每次点击把全部点重建为一条全局样条（点数少，
+    求解微秒级），节点参数化用弦长（Rhino 官方建议"拿不准就用弦长"）。
+    右键断开只是标记分段（同精雕多重曲线，各段独立不继承走势），
+    结束时所有段合并为一个多段曲线对象入文档，其末点作为下一段起点续画，
+    连续两次右键结束。"""
 
     _SEG_SAMPLES = 20   # 每段采样数（密度足够消除锯齿）
     previewPlaneBased = True    # 3D 预览按构造平面投影整条路径（含已画段）
@@ -1225,51 +1267,103 @@ class CurveCommand(CommandInstance):
         return self._pts[-1] if self._pts else None
 
     def extraSnapObjects(self) -> list:
-        # 曲线绘制期间已画段未入文档，提供临时代理对象供吸附；
-        # 不排除任何类型：起点/顶点/中点/最近点等均可吸附（含连回起点闭合）
-        if self._snapProxy is not None and len(self._snapProxy.points()) >= 2:
+        # 曲线绘制期间已画段未入文档，提供临时代理对象供吸附（起点可吸附闭合）
+        if self._snapProxy is not None \
+                and self._snapProxy.controlPointCount() >= 2:
             return [self._snapProxy]
         return []
+
+    def partialSnapObjectIds(self) -> set:
+        # 代理与固化后的曲线对象同类型同几何，吸附行为一致；仅用于让视口
+        # 对"距最后输入点过近"的沿线候选做距离过滤（见 _WALKING_SNAPS）
+        if self._snapProxy is not None:
+            return {self._snapProxy.id()}
+        return set()
+
+    def excludedSnapTypesForPartial(self) -> set:
+        return set()
 
     def prompt(self) -> str:
         if not self._pts:
             return "指定曲线起点"
-        return "指定下一点（右键断开续画，再右键完成，Esc 取消）"
+        return "指定下一点（右键断开续画，再右键完成，Z 撤点，Esc 取消）"
 
     def start(self) -> None:
         super().start()
         self._pts: List[Point3D] = []   # 当前段输入点（未固化，不入文档）
         self._closed = False
         self._panel = None
-        self._frozenSamples: List[Point3D] = []   # 远段冻结采样（首点起，含冻结末点）
-        self._frozenN = 0   # 冻结采样已覆盖的输入点数
         self._segments: List[List[Point3D]] = []   # 已断开段的采样（结束时合并入文档）
         self._segInputs: List[List[Point3D]] = []  # 已断开段的输入点（编辑控制点用）
-        self._snapProxy = LineObject()   # 已画段吸附代理（不入文档，仅用于吸附）
+        self._snapProxy = None           # 已画段吸附代理（按固化口径重建，不入文档）
+        self._lastCursor = None          # 最近一次光标世界坐标（撤点后重算预览用）
+
+    def _c2Samples(self, pts: List[Point3D], closed: bool = False) -> List[Point3D]:
+        """拟合点样条采样（完整复刻开源 CAD cadcraft 的 SPLINE/Fit：
+        Piegl & Tiller NURBS 书第 9 章全局插值，弦长参数化 + 节点平均 +
+        自由端点，严格过每个拟合点；闭合为周期样条）。
+        预览（末尾附光标伪点）与确认（仅真实点）共用本函数——点击
+        瞬间光标变真点、位置相同 → 点集相同 → 曲线逐位一致（零跳变）。"""
+        from core.spline_utils import nurbs_fit_samples
+        return nurbs_fit_samples(pts, self._SEG_SAMPLES, closed=closed)
+
+    def _incrementalPath(self, cursor: Point3D) -> QPainterPath:
+        """预览 = 全局 C2 样条（已放点 + 光标伪点）。
+
+        与开源 CAD（OCCT/FreeCAD/QCAD）一致的全局插值：每次加点/移动
+        整体重解，新点的影响按 C2 样条端部衰减律 ~0.27^k 指数衰减——
+        远处已描线视觉稳定（每段固定局部参数采样，顶点不漂移），
+        最近几段自然呼吸修正（同 Rhino/JDPaint）。点击瞬间光标变真点、
+        位置相同 → 曲线逐位一致（零跳变）。"""
+        pts = self._pts
+        n = len(pts)
+        if n == 0:
+            return self._uvPath([])
+        if self._closed and n >= 3:
+            # 已闭合（按钮/B/吸附回起点）：立即画出闭合腿，与最终固化形状
+            # 同一采样口径（周期 C2），所见即所得
+            return self._uvPath(self._c2Samples(list(pts) + [pts[0]],
+                                                closed=True))
+        if n == 1:
+            return self._uvPath([pts[0], cursor])   # 直线橡皮筋
+        return self._uvPath(self._c2Samples(list(pts) + [cursor]))
 
     def _updateSnapProxy(self) -> None:
-        """同步吸附代理点列 = 已断开段采样 + 当前段已确定采样。
-        光标预览段未确定，不参与；已画段可吸附中点/最近点/垂足等，
-        端点/顶点通过 partialSnapObjectIds 排除。"""
-        if self._snapProxy is None:
-            return
-        pts: List[Point3D] = []
-        for s in self._segments:
-            pts.extend(s)
+        """同步吸附代理 = 与固化后对象**同类型同几何**的临时对象（不入文档）。
+
+        以前用 LineObject + 密集采样点：LINE 类型对"每一段折线"各出一个中点/
+        垂足，20 采样/段 → 曲线上每 5% 就散布一个中点和垂足，回头吸附自身时
+        满屏都是候选（用户实测"到处都是垂足和中点"）。改为按 _finalize 的口径
+        构造 CurveObject / PolyCurveObject：每段只有一个半弧长中点、没有垂足，
+        与提交后的曲线对象吸附行为完全一致（最近点仍按真实样条采样）。
+        """
+        segs = list(self._segments)
+        inputs = list(self._segInputs)
         if len(self._pts) >= 2:
-            pts.extend(self._segmentSamples())
-        elif self._pts:
-            pts.extend(self._pts)
-        lst = self._snapProxy.points()
-        lst.clear()
-        lst.extend(pts)
+            segs.append(self._segmentSamples())
+            inputs.append(list(self._pts))
+        if not segs:
+            self._snapProxy = None
+            return
+        if len(segs) == 1:
+            prox = CurveObject()
+            prox.buildFromSampled(segs[0], inputs[0])
+            prox.setClosed(self._closed)
+        else:
+            prox = PolyCurveObject()
+            for s, inp in zip(segs, inputs):
+                prox.addSegment({
+                    "type": "Curve",
+                    "points": [[p.x, p.y, p.z] for p in s],
+                    "inputPoints": [[p.x, p.y, p.z] for p in inp]})
+        self._snapProxy = prox
 
     def paramPanel(self):
         if self._panel is None:
             self._panel = CurveParamPanel()
             self._panel.addPointRequested.connect(self._onPanelAddPoint)
             self._panel.undoClicked.connect(self._onPanelUndo)
-            self._panel.closeToggled.connect(self._onPanelClose)
+            self._panel.closeRequested.connect(self._onPanelCloseRequested)
             self._panel.confirmRequested.connect(self._onPanelConfirm)
         return self._panel
 
@@ -1285,79 +1379,86 @@ class CurveCommand(CommandInstance):
                                  self._panel.z()))
         self._updateSnapProxy()
 
-    def _onPanelUndo(self) -> None:
+    def _undoLastPoint(self) -> None:
+        """撤回上一个已确定的点（面板"撤回"按钮与 Z 键共用）。
+
+        当前段退空且有已断开段时，把上一段的输入点取回继续编辑（其末点
+        即被撤回的点），与 Rhino 曲线退点语义一致。
+        """
+        undone = False
         if self._pts:
             self._pts.pop()
+            undone = True
+        if not self._pts and self._segInputs:
+            self._pts = list(self._segInputs.pop())[:-1]
+            if self._segments:
+                self._segments.pop()
+            self._closed = False
+            if self._panel is not None:
+                self._panel.setClosed(False)
+            undone = True
+        if not undone:
+            return
         self._updateSnapProxy()
+        # 立即用最后光标位置整套重算预览：全局 C2 重解后整条曲线一次换成
+        # 新形状（含橡皮筋），与下一次鼠标移动的结果逐位一致——不先清再建，
+        # 否则会看到曲线塌成无尾段状态再弹回来（用户实测"整条曲线闪一下"）
+        if self._lastCursor is not None:
+            self.onMouseMove(self._lastCursor, None)
+        else:
+            self._setPreviewPath(self._committedPreview(), solid=True,
+                                 color=self._previewColor())
+        if self._manager is not None:
+            self._manager.promptChanged.emit(self.prompt())
 
-    def _onPanelClose(self, closed: bool) -> None:
-        self._closed = closed
+    def _onPanelUndo(self) -> None:
+        self._undoLastPoint()
+
+    def onKeyPress(self, key, mods) -> bool:
+        # Z：撤回上一个已确定的点（与面板"撤回"同一逻辑）
+        if key == Qt.Key_Z and mods == Qt.NoModifier:
+            self._undoLastPoint()
+            return True
+        # B：闭合曲线并结束（与面板"闭合（B）"按钮同一逻辑）
+        if key == Qt.Key_B and mods == Qt.NoModifier:
+            self._closeAndFinish()
+            return True
+        return False
+
+    def _closeAndFinish(self) -> None:
+        """闭合曲线：补闭合腿 → 入文档 → 结束命令（至少 3 个点）。"""
+        if len(self._pts) < 3:
+            if self._manager is not None:
+                self._manager.promptChanged.emit(
+                    "闭合至少需要 3 个点（当前 %d 个）" % len(self._pts))
+            return
+        self._closed = True
+        if self._panel is not None:
+            self._panel.setClosed(True)
         self._updateSnapProxy()
+        self._finalize()
+        self.finish()
+
+    def _onPanelCloseRequested(self) -> None:
+        self._closeAndFinish()
 
     def _onPanelConfirm(self) -> None:
         self._finalize()
         self.finish()
 
-    def _ensureFrozen(self) -> None:
-        """把已确定的远段采样冻结：段 i（pts[i]→pts[i+1]）形状由
-        pts[i-1..i+2] 决定，故 i ≤ n-3 的段已定型，冻结覆盖前 n-1 个输入点。
-        只增量追加冻结不重算远段；面板撤点时覆盖回缩并重建（低频）。"""
-        pts, n = self._pts, len(self._pts)
-        cover = max(n - 1, 0)            # 定型后应覆盖的输入点数
-        if cover < 2:
-            self._frozenSamples = pts[:cover]
-            self._frozenN = cover
-            return
-        if cover < self._frozenN:        # 撤点回缩：旧冻结失效，重建（点少低频）
-            self._frozenSamples = []
-            self._frozenN = 0
-        k = self._frozenN
-        if k < 2:
-            self._frozenSamples = pts[:k]   # 0/1 个原始点作起始锚
-        for i in range(max(k - 1, 0), cover - 1):
-            p0 = pts[i - 1] if i > 0 else pts[i]
-            seg = catmullRomSegment(p0, pts[i], pts[i + 1], pts[i + 2],
-                                    self._SEG_SAMPLES)
-            base = self._frozenSamples[:-1] if self._frozenSamples else []
-            self._frozenSamples = base + seg
-        self._frozenN = cover
-
-    def _incrementalPath(self, cursor: Point3D) -> QPainterPath:
-        """冻结远段 + 只用最近几个点与光标高密度重算近段。"""
-        self._ensureFrozen()
-        pts, m = self._pts, self._frozenN
-        if m >= 2:
-            # 尾两段 pts[m-1]→pts[m]→cursor：补真实前导点 pts[m-2] 保证
-            # 与冻结远段在接点处切线连续（前导点钳制会在接点出尖角）
-            segA = catmullRomSegment(pts[m - 2], pts[m - 1], pts[m], cursor,
-                                     self._SEG_SAMPLES)
-            segB = catmullRomSegment(pts[m - 1], pts[m], cursor, cursor,
-                                     self._SEG_SAMPLES)
-            allPts = self._frozenSamples[:-1] + segA + segB[1:]
-        else:
-            ctrl = pts + [cursor]
-            if len(ctrl) < 3:
-                allPts = ctrl   # 点数不足：直线预览（续画段起点→光标同全新段）
-            else:
-                allPts = catmullRom(ctrl, self._SEG_SAMPLES)
-        return self._uvPath(allPts)
-
     def _segmentSamples(self) -> List[Point3D]:
-        """计算当前段的固化采样（与绘制预览完全一致，断开/结束时调用）。
-        非闭合按冻结采样 + 尾部构建；闭合补起点成环整体计算。"""
+        """当前段固化采样（全局 C2 重解，不含光标伪点——与 Rhino 一致，
+        最后一段自然回正）。闭合时周期边界；仅 2 点为直线（用户明确要求）。"""
+        pts = self._pts
+        n = len(pts)
         if self._closed:
-            temp = self._pts + [self._pts[0]]
-            return catmullRom(temp, self._SEG_SAMPLES) if len(temp) >= 3 else temp
-        if len(self._pts) < 2:
-            return list(self._pts)
-        self._ensureFrozen()
-        m = self._frozenN
-        if m >= 2:                      # 冻结已覆盖到 pts[n-2]
-            tail = catmullRomSegment(self._pts[m - 2], self._pts[m - 1],
-                                     self._pts[m], self._pts[m],
-                                     self._SEG_SAMPLES)   # 尾段端点钳制（无后续点）
-            return self._frozenSamples[:-1] + tail
-        return list(self._pts)          # 仅 2 点：两点间就是直线（用户明确要求）
+            temp = pts + [pts[0]]
+            return self._c2Samples(temp, closed=True) if n >= 3 else temp
+        if n < 2:
+            return list(pts)
+        if n == 2:
+            return [pts[0], pts[1]]   # 两点=直线（用户明确要求）
+        return self._c2Samples(pts)
 
     def _finalize(self) -> None:
         """结果入文档：仅一段保持曲线对象；一旦断开过，所有段合并为
@@ -1372,6 +1473,7 @@ class CurveCommand(CommandInstance):
         if len(segs) == 1:
             obj = CurveObject()
             # 拟合点（用户点击点）作为编辑控制点，采样点仅作外观
+            # （编辑控制点重采样走同一全局 C2 插值，风格一致）
             obj.buildFromSampled(segs[0], inputs[0] if inputs else self._pts)
             obj.setClosed(self._closed)
             self._doc.addObject(obj)
@@ -1410,6 +1512,7 @@ class CurveCommand(CommandInstance):
     def onMouseMove(self, wp: Point3D, mods) -> None:
         if self._pts:
             wp = self._orthoPoint(wp, self._pts[-1])
+        self._lastCursor = wp
         if self._panel is not None:
             self._panel.setXYZ(wp.x, wp.y, wp.z)
         if not self._pts:
@@ -1417,13 +1520,9 @@ class CurveCommand(CommandInstance):
                                  solid=True, color=self._previewColor())
             self._setCursorMarker(wp)
             return
-        if self._closed and len(self._pts) >= 2:
-            # 闭合预览：闭环无冻结，补回起点成环整体计算（低频操作可接受）
-            temp = self._pts + [Point3D(wp.x, wp.y, wp.z), self._pts[0]]
-            sampled = catmullRom(temp, self._SEG_SAMPLES) if len(temp) >= 3 else temp
-            path = self._uvPath(sampled)
-        else:
-            path = self._incrementalPath(Point3D(wp.x, wp.y, wp.z))
+        # 闭合与开放预览同构（cadcraft SplineM.preview：光标作为拟合点
+        # 整体重拟合；闭合腿在 Close 确认时才出现）
+        path = self._incrementalPath(Point3D(wp.x, wp.y, wp.z))
         path.addPath(self._committedPreview())   # 拼上已断开段（结束前未入文档）
         self._setPreviewPath(path, solid=True, color=self._previewColor())
         # 光标处叠加与点对象同样式的光标点（白底实心圆）
@@ -1440,8 +1539,6 @@ class CurveCommand(CommandInstance):
             b = self._pts[-1]
             self._pts = [Point3D(b.x, b.y, b.z)]
             self._closed = False
-            self._frozenSamples = []   # 新段重新起算冻结
-            self._frozenN = 0
             if self._panel is not None:
                 self._panel.setClosed(False)
             self._updateSnapProxy()

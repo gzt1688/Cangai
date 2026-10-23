@@ -39,6 +39,7 @@ from ui.commands.concrete.edit_commands import registerAll as registerEdits
 from ui.commands.concrete.text_command import registerAll as registerText
 from ui.commands.concrete.relief_commands import registerAll as registerRelief
 from ui.commands.concrete.solid_commands import registerAll as registerSolids
+from ui.commands.concrete.primitive_commands import registerAll as registerPrimitives
 from ui.commands.concrete.thread_command import registerAll as registerThread
 from ui.commands.concrete.brep_wall_command import \
     registerAll as registerWall
@@ -46,6 +47,7 @@ from ui.commands.concrete.push_pull_commands import \
     registerAll as registerPushPull
 from ui.commands.concrete.boolean_commands import registerAll as registerBoolean
 from ui.commands.concrete.cnc_commands import registerAll as registerCnc
+from ui.commands.concrete.revcloud_command import registerAll as registerRevcloud
 
 from ui.commands.concrete.image_command import ImagePlaceCommand
 from ui.commands.concrete.image_trace_command import ImageTraceCommand
@@ -59,6 +61,7 @@ from ui.gizmo.gizmo_manager import GizmoManager, View2DAdapter, View3DAdapter
 
 from ui.widgets.status_bar import StatusBarWidget
 from ui.widgets.top_dock import TopDock
+from ui.widgets.title_bar import TitleBar
 from ui.widgets.left_panel import LeftPanelWidget
 from ui.widgets.layer_panel import LayerPanel
 from ui.widgets.property_panel import PropertyPanel
@@ -154,6 +157,10 @@ class _MainThreadInvoker(QObject):
 
 
 class MainWindow(QMainWindow):
+    # 启动加载页：后台预热进度（0~100, 当前加载项）与完成通知
+    startupProgress = Signal(int, str)
+    startupFinished = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(tr("Cangai 浮雕设计"))
@@ -193,11 +200,13 @@ class MainWindow(QMainWindow):
         registerText(self._cm)
         registerRelief(self._cm)
         registerSolids(self._cm)   # 3D 实体命令（挤出等）
+        registerPrimitives(self._cm)   # 3D 标准体（立方体/圆柱体/圆环/圆锥）
         registerThread(self._cm)       # 3D 螺纹（圆柱面内/外螺纹 + 独立螺柱）
         registerWall(self._cm)          # 墙线（曲线双侧偏移+挤出）
         registerPushPull(self._cm)      # 推拉（面推拉=挤出/凹陷，线推拉=倒角）
         registerBoolean(self._cm)       # 3D 布尔（并/差/交，实时预览）
         registerCnc(self._cm)           # CNC 轮廓铣/口袋/钻孔（复用 pymillcam）
+        registerRevcloud(self._cm)      # 修订云线（曲线编辑类目）
         self._cm.register("Image", ImagePlaceCommand)   # 图片放置（参数：路径）
         self._cm.register("ImageTrace", ImageTraceCommand)   # 图片转线稿
         registerDims(self._cm)   # 尺寸标注命令
@@ -211,6 +220,17 @@ class MainWindow(QMainWindow):
         # 命令行历史移除后，原 appendHistory 的 41 处反馈（含"G 代码生成
         # 失败"等必须可见的错误）接到 StepHint，不再静默丢弃
         self._topDock.setHistoryHandler(self._notifyTip)
+        # Win11 无边框窗口：自绘标题栏，分类标签（曲线绘制/曲线编辑…）
+        # 从工具区上移嵌入标题栏，节约一行垂直空间；切换逻辑不变
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self._preMaxGeo = None   # 最大化前几何（还原时恢复）
+        self._navTabBar = self._topDock.detachNavBar()
+        self._titleBar = TitleBar(self, self._navTabBar)
+        # 标题栏工具按钮：成本计算器 / 设置（原在左侧竖条，已上移）
+        self._titleBar.calcRequested.connect(self._onCalcCost)
+        self._titleBar.settingsRequested.connect(self._onShowSettings)
+        # 无边框窗口无系统边框：全局事件过滤实现边缘按住拖拽缩放
+        QCoreApplication.instance().installEventFilter(self)
         self._leftPanel = LeftPanelWidget()
         self._layerPanel = LayerPanel()
         self._propertyPanel = PropertyPanel()
@@ -243,17 +263,24 @@ class MainWindow(QMainWindow):
             "plugins": [p.pluginId for p in self._plugins.infos() if p.loaded]})
         # 语言变更：级联重绘所有子组件文本
         languageChanged().connect(self.retranslateUi)
-        # 启动后全量预热 3D 相关模块（窗口首帧渲染完再开始，见方法注释）
-        QTimer.singleShot(800, self._preloadHeavyModules)
+        # 注意：重模块预热不在此自动启动，由启动加载页调用
+        # beginStartupPreload()，全部就绪后才显示主窗口。
+
+    def beginStartupPreload(self) -> None:
+        """启动加载页调用：全量预热重模块，完成后发 startupFinished。
+
+        加载页先于主窗口显示，用户此时无法操作；预热期间主线程只负责
+        刷新加载页进度，避免"启动后直接使用、模块尚未加载导致卡死"。
+        """
+        self._preloadHeavyModules()
 
     def _preloadHeavyModules(self) -> None:
-        """启动后全量预热 3D/绘图相关模块（用户要求：打开软件就加载好）。
+        """全量预热 3D/绘图相关模块（启动加载页期间执行）。
 
-        后台线程按依赖序分步导入，每步之间 time.sleep 让出 GIL。
-        注意 CPython 导入本身持 GIL（单个大库如 scipy 一次 ~1s），
-        因此：窗口显示 0.8s 后才开始、大块头放最后——启动首帧不受
-        影响，预载期间 UI 至多偶发一次亚秒级微卡，此后首次 3D
-        画图/布尔/网格化/样条全部零等待。
+        后台线程按依赖序分步导入，每步之间 time.sleep 让出 GIL，并
+        通过 startupProgress 汇报进度。注意 CPython 导入本身持 GIL
+        （单个大库如 OCP 一次 2~4s），加载页在单步导入期间可能短暂
+        停顿，但主窗口尚未显示，不会出现可操作的卡死界面。
         """
         if getattr(self, "_heavyPreloading", False):
             return
@@ -262,60 +289,64 @@ class MainWindow(QMainWindow):
 
         class _HeavyPreloader(QThread):
             def run(self):
+                import os as _os
                 import time
                 w = self._win
-                try:
-                    # 1) build123d/OCP（分步让 GIL，最大头 2~4s）
-                    from core.vector.brep_shape import _stagedImportBd
-                    _stagedImportBd()
-                    w._bdKernelLoaded = True    # 首次进 3D 模式零等待
-                    time.sleep(0.01)
-                    # 2) 命令层热路径 OCP 子模块（OCP 二进制已载，薄封装）
-                    for mod in ("OCP.BRep", "OCP.BRepAlgoAPI",
-                                "OCP.BRepBuilderAPI", "OCP.BRepClass3d",
-                                "OCP.BRepExtrema", "OCP.BRepOffsetAPI",
-                                "OCP.BRepTools", "OCP.Geom", "OCP.gp",
-                                "OCP.ShapeFix", "OCP.TopAbs", "OCP.TopLoc",
-                                "OCP.TopoDS", "OCP.TopTools"):
-                        try:
-                            __import__(mod)
-                        except Exception:
-                            pass
-                        time.sleep(0.005)
-                    # 3) 本项目几何链（python 薄层，连带 thread_bg 依赖）
-                    import core.vector.thread_generator  # noqa: F401
-                    import core.vector.brep_object       # noqa: F401
-                    time.sleep(0.01)
-                    # 4) OCCT 内部预热：一次建模+体积+三角化+布尔融合/切割，
-                    #    首次真实操作不再付 OCCT 惰性初始化的一次性代价
-                    #    （布尔首次 ~2s：BOPAlgo/求交内核惰性加载）
+
+                def step(pct, text):
                     try:
-                        import build123d as bd
-                        from core.vector.brep_shape import BrepShape
-                        bs = BrepShape(bd.Box(1, 1, 1))
-                        _ = bs.part().volume
-                        _ = bs.triangulate()
-                        b1 = bd.Box(2, 2, 2)
-                        b2 = bd.Pos(1, 1, 1) * bd.Box(2, 2, 2)
-                        _ = (b1 + b2).volume   # 融合预热
-                        _ = (b1 - b2).volume   # 切割预热
+                        w.startupProgress.emit(int(pct), text)
                     except Exception:
                         pass
                     time.sleep(0.01)
-                    # 5) 2D/CNC/样条路径重库（单块导入持 GIL，放最后）
+
+                try:
+                    # 3D 内核（build123d/OCP）与 OCCT 预热也在加载页内完成：
+                    # 否则首次切到 3D 模式才后台导入，导入持 GIL，用户此时
+                    # 在 3D 画图会被间歇性冻住（实测直接表现为“卡死”）。
+                    # 放进加载页：卡顿发生在主窗口出现之前，用户看不到。
+                    step(10, "正在加载字体与文字模块…")
+                    try:
+                        from core.text.font import ttf_reader
+                        ttf_reader._loadFontTools()
+                        from core.text.font import FontManager
+                        _sgl = resource_path(
+                            "resources/fonts/细圆单线.sgl")
+                        if _os.path.isfile(_sgl):
+                            FontManager.instance().get(_sgl)
+                    except Exception:
+                        pass
+                    # 本项目几何薄层（顶层不触发 build123d 导入）
+                    step(28, "正在加载几何计算模块…")
+                    import core.vector.thread_generator  # noqa: F401
+                    import core.vector.brep_object       # noqa: F401
+                    step(40, "正在加载 3D 建模内核（build123d / OCCT）…")
+                    w._bdKernelLoading = True
+                    try:
+                        w._load3DKernelBlocking()
+                        w._bdKernelLoaded = True
+                    finally:
+                        w._bdKernelLoading = False
+                    # 2D/CNC/样条路径重库（多数已随主窗口模块导入缓存，近乎零耗时）
+                    step(82, "正在加载二维轮廓与 CNC 模块…")
                     for mod in ("shapely", "pyclipper", "ezdxf",
                                 "scipy.interpolate"):
                         try:
                             __import__(mod)
                         except Exception:
                             pass
-                        time.sleep(0.01)
+                    step(96, "正在完成最后的准备工作…")
                 except Exception:
                     import traceback
                     traceback.print_exc()
                 finally:
-                    self._win._heavyPreloading = False
-                    self._win._heavyPreloaded = True
+                    w._heavyPreloading = False
+                    w._heavyPreloaded = True
+                    try:
+                        w.startupProgress.emit(100, "加载完成")
+                        w.startupFinished.emit()
+                    except Exception:
+                        pass
 
         loader = _HeavyPreloader()
         loader._win = self
@@ -349,6 +380,10 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
+        if not getattr(self, "_dwmRounded", False):
+            self._dwmRounded = True
+            self._applyDwmRoundCorners()
+            self._enableTaskbarMinMax()
         if not getattr(self, "_dockAdjusted", False):
             self._dockAdjusted = True
             QTimer.singleShot(0, self._adjustDockHeights)
@@ -508,7 +543,8 @@ class MainWindow(QMainWindow):
     def addToolButton(self, spec) -> None:
         self._topDock.addToolButton(spec.group, spec.key, spec.label,
                                     spec.tooltip, spec.icon,
-                                    pluginId=spec.pluginId)
+                                    pluginId=spec.pluginId,
+                                    divider=bool(spec.meta.get("divider")))
 
     def removeToolButtons(self, keys) -> int:
         return self._topDock.removeToolButtons(keys)
@@ -594,7 +630,15 @@ class MainWindow(QMainWindow):
 
         cl.addWidget(self._topDock)
         cl.addWidget(self._dockManager)
-        self.setCentralWidget(container)
+
+        # 顶部自绘标题栏（含分类标签）+ 原工具区/停靠区
+        outer = QWidget()
+        ol = QVBoxLayout(outer)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setSpacing(0)
+        ol.addWidget(self._titleBar)
+        ol.addWidget(container)
+        self.setCentralWidget(outer)
 
         self._view.setMinimumSize(400, 300)
         self._viewport3D = Viewport3D()
@@ -711,11 +755,11 @@ class MainWindow(QMainWindow):
         self._dockManager.addDockWidgetTabToArea(propDock, layerDock.dockAreaWidget())
         layerDock.dockAreaWidget().setCurrentIndex(0)
 
-        # 初始高度比例：变换在上、图层（含属性 tab）在下，变换占更多高度
+        # 初始高度比例：变换在上、图层（含属性 tab）在下，图层面板初始高度加一些
         layerArea = layerDock.dockAreaWidget()
         splitter = layerArea.parentSplitter() if layerArea else None
         if splitter is not None:
-            splitter.setSizes([300, 140])
+            splitter.setSizes([280, 180])
 
         # 保存 dock 引用以便 retranslateUi 重设标题
         self._centerDock = centerDock
@@ -1241,39 +1285,49 @@ class MainWindow(QMainWindow):
             self._topDock.appendHistory("浮雕模式：模型已锁定编辑，曲线操作与 2D 一致")
         # 锁定该模型为浮雕编辑目标：视口/面板以它为准（与选中解耦），
         # 拾取与操作轴按 isLocked 排除
-        self._reliefLockedModel = model
-        self._transformPanel.setReliefModel(model)
-        self._viewport3D.setReliefModel(model)
-        self._fitReliefOnce(model)
-        if model is not None:
-            model.setLocked(True)
-            # 浮雕编辑态：画布只显示锁定模型，其他浮雕模型隐藏，
-            # 等于用户用当前锁定模型进行浮雕编辑；隐藏后框选/点选也不会命中。
-            changed = []
-            if not model.isVisible():
-                model.setVisible(True)
-                changed.append(model.id())
-            for o in self._doc.reliefModels():
-                if o.id() != model.id() and o.isVisible():
-                    o.setVisible(False)
-                    changed.append(o.id())
-            # 脱离“选中”：编辑态不占选择集，曲线选择完全自由
-            selChanged = False
-            if model.isSelected():
-                model.setSelected(False)
-                selChanged = True
-            for oid in changed:
-                self._doc.notifyObjectChanged(oid)
-            if selChanged:
-                self._doc.selectionChanged.emit()
+        self._applyReliefTarget(model)
+
+    def _load3DKernelBlocking(self) -> None:
+        """同步加载 3D 内核 + 预热 OCCT（可在加载页的后台线程里调用）。
+
+        正常路径下本方法只在启动加载页里跑一次；若启动页兜底超时被跳过，
+        首次进 3D 时由 _ensure3DKernel 的线程再调一次。"""
+        import time
+        from core.vector.brep_shape import _stagedImportBd
+        _stagedImportBd()
+        # 命令层热路径 OCP 子模块（OCP 二进制已载，薄封装）
+        for mod in ("OCP.BRep", "OCP.BRepAlgoAPI",
+                    "OCP.BRepBuilderAPI", "OCP.BRepClass3d",
+                    "OCP.BRepExtrema", "OCP.BRepOffsetAPI",
+                    "OCP.BRepTools", "OCP.Geom", "OCP.gp",
+                    "OCP.ShapeFix", "OCP.TopAbs", "OCP.TopLoc",
+                    "OCP.TopoDS", "OCP.TopTools"):
+            try:
+                __import__(mod)
+            except Exception:
+                pass
+            time.sleep(0.005)
+        # OCCT 内部预热：建模+体积+三角化+布尔融合/切割，
+        # 首次挤出/布尔不再付惰性初始化的一次性代价（~2s）
+        try:
+            import build123d as bd
+            from core.vector.brep_shape import BrepShape
+            bs = BrepShape(bd.Box(1, 1, 1))
+            _ = bs.part().volume
+            _ = bs.triangulate()
+            b1 = bd.Box(2, 2, 2)
+            b2 = bd.Pos(1, 1, 1) * bd.Box(2, 2, 2)
+            _ = (b1 + b2).volume   # 融合预热
+            _ = (b1 - b2).volume   # 切割预热
+        except Exception:
+            pass
 
     def _ensure3DKernel(self) -> None:
         """首次进入 3D 模式：不等待内核，立即切换画布。
 
-        内核（build123d/OCP）由后台线程分步导入（_stagedImportBd：
-        每步之间让出 GIL，主线程事件循环照常跑），导入期间 3D 画布
-        正常显示网格/曲线，用户无感。完成后 _import_bd() 零开销；
-        若用户在此期间立即执行挤出，命令处同步兜底导入一次。"""
+        内核（build123d/OCP）正常已在启动加载页内加载完毕（
+        _load3DKernelBlocking），此方法只是兜底；未完成时后台分步导入
+        （_stagedImportBd 每步让出 GIL），期间 3D 画布正常显示网格/曲线。"""
         if getattr(self, "_bdKernelLoaded", False):
             return
         if getattr(self, "_bdKernelLoading", False):
@@ -1284,8 +1338,7 @@ class MainWindow(QMainWindow):
         class _KernelLoader(QThread):
             def run(self):
                 try:
-                    from core.vector.brep_shape import _stagedImportBd
-                    _stagedImportBd()
+                    self._win._load3DKernelBlocking()
                     self._win._bdKernelLoaded = True
                 except Exception:
                     import traceback
@@ -1308,63 +1361,104 @@ class MainWindow(QMainWindow):
             pass
 
     def _fitReliefOnce(self, model) -> None:
-        """新浮雕编辑目标首次进入视口时自动适配相机一次。
+        """浮雕编辑目标**变化**后自动适配相机一次（同一目标重复进入不改视角）。
 
-        用户流程"2D 导入/新建模型 → 切浮雕"时模型从未被 3D 视口取景，
-        高模型（STL 圆柱等）会顶出画面、看起来像花屏。只对每个模型适配
-        一次：同一模型再进浮雕模式保留用户调整过的视角（切模式不改相机
-        的既有约定），要重新取景用"全部观察"。
+        用户流程"2D 导入/新建模型 → 切浮雕"时模型从未被 3D 视口取景，高模型
+        （STL 圆柱等）会顶出画面；浮雕模式里新生成模型时相机可能还对着上一个
+        模型（或远离新模型的世界坐标），不重新取景就只看到空白/参考图——
+        "切到 2D 再回浮雕才正常"正是那条路径。
+
+        只按"上一个适配过的目标 id"判断（不是累积集合）：目标 A→B→A 切换时
+        A 也会重新取景，避免切回旧目标后画面停在 B 的取景范围。同一目标
+        反复进入浮雕模式仍保留用户调整过的视角（切模式不改相机的既有约定），
+        要重新取景用"全部观察"。
         """
         if model is None:
             return
-        fitted = getattr(self._viewport3D, "_reliefFittedIds", None)
-        if fitted is None:
-            fitted = set()
-            self._viewport3D._reliefFittedIds = fitted
-        if model.id() in fitted:
+        last = getattr(self._viewport3D, "_reliefFittedId", None)
+        if last == model.id():
             return
-        fitted.add(model.id())
+        self._viewport3D._reliefFittedId = model.id()
         self._viewport3D.fitReliefModel()
 
     def _exitReliefLock(self) -> None:
-        """离开浮雕编辑态：解锁模型，恢复可选中/变换；默认重新选中便于继续变换。
+        """离开浮雕编辑态：解锁**所有**浮雕模型，恢复可见/可选中；默认重新选中便于继续变换。
 
-        同时恢复所有浮雕模型可见——浮雕编辑态会隐藏非编辑模型，离开时需还原，
-        这样切回 2D 画布能看到全部模型。
+        浮雕编辑态会隐藏非编辑模型并加编辑锁，离开时必须全部还原——只解锁
+        跟踪到的那一个模型会让此前多次生成遗留的编辑锁留在文档里（表现为
+        切回 2D 后模型点不中、再切回浮雕显示的是旧模型）。
         """
         model = self._reliefLockedModel
-        self._reliefLockedModel = None
-        self._viewport3D.setReliefModel(None)
-        self._transformPanel.setReliefModel(None)
-        if model is not None:
-            model.setLocked(False)
-            # 恢复所有浮雕模型可见（编辑态隐藏的非编辑模型还原）
-            changed = []
-            for o in self._doc.reliefModels():
-                if not o.isVisible():
-                    o.setVisible(True)
-                    changed.append(o.id())
-            for oid in changed:
-                self._doc.notifyObjectChanged(oid)
-            if not self._doc.selectedObjects():
-                self._doc.selectObject(model.id())
+        self._applyReliefTarget(None)
+        if model is None or self._doc is None:
+            return
+        if self._doc.object(model.id()) is not model:
+            return
+        if not self._doc.selectedObjects():
+            self._doc.selectObject(model.id())
 
     def _onObjectRemoved(self, oid: str) -> None:
         """锁定的浮雕模型被移除（含撤销/重做的快照替换）：记录 id 等待可能的重建。"""
         m = self._reliefLockedModel
         if m is not None and m.id() == oid:
             self._reliefRestoreId = oid
-            self._reliefLockedModel = None
-            self._viewport3D.setReliefModel(None)
-            self._transformPanel.setReliefModel(None)
-            # 锁定模型被移除：恢复其他浮雕模型可见
-            changed = []
-            for o in self._doc.reliefModels():
-                if not o.isVisible():
-                    o.setVisible(True)
+            self._applyReliefTarget(None)
+
+    def _applyReliefTarget(self, obj) -> None:
+        """把 obj 设为浮雕编辑目标——唯一的锁定 + 唯一的可见浮雕模型。
+
+        进入浮雕模式、撤销恢复、浮雕模式下新生成模型共用这一个入口，保证
+        状态一次性收敛，不留中间态：
+        - 其余浮雕模型一律**解除编辑锁**（残留编辑锁会让
+          ``Document.activeReliefModel`` 返回旧模型：浮雕里显示的不是刚生成的
+          模型、切到 2D 后模型因仍被锁而选不中，来回切模式才慢慢自愈）；
+        - 目标可见且锁定，其余浮雕模型隐藏（隐藏后框选/点选也不会命中）；
+        - 目标脱离选中（编辑态不占选择集），视口/变换面板同步到目标。
+
+        obj=None：解锁全部、恢复全部可见、清空视口目标（离开浮雕/目标被删）。
+        """
+        relief = self._doc.reliefModels() if self._doc is not None else []
+        changed = []
+        for o in relief:
+            if o is obj:
+                continue
+            if o.isEditLocked():
+                o.setLocked(False)
+            if obj is not None:
+                if o.isVisible():
+                    o.setVisible(False)
                     changed.append(o.id())
-            for cid in changed:
-                self._doc.notifyObjectChanged(cid)
+            elif not o.isVisible():
+                o.setVisible(True)
+                changed.append(o.id())
+        if obj is not None:
+            obj.setLocked(True)
+            if not obj.isVisible():
+                obj.setVisible(True)
+                changed.append(obj.id())
+            if obj.isSelected():
+                obj.setSelected(False)
+                self._doc.selectionChanged.emit()
+        self._reliefLockedModel = obj
+        for cid in changed:
+            self._doc.notifyObjectChanged(cid)
+        self._transformPanel.setReliefModel(obj)
+        self._viewport3D.setReliefModel(obj)
+        if obj is not None:
+            self._fitReliefOnce(obj)
+        try:
+            self._viewport3D.update()
+        except Exception:
+            pass
+
+    def _pinReliefModelAsTarget(self, obj) -> None:
+        """把 obj 设为浮雕编辑目标：锁定（不可移动）+ 只显示它 + 脱离选中。
+
+        进入浮雕模式、撤销恢复、以及浮雕模式下新生成模型时共用。锁定后
+        拾取/框选/操作轴均排除该模型，位置由高度场 origin 决定。"""
+        if obj is None or obj.type() != ObjectType.SURFACE:
+            return
+        self._applyReliefTarget(obj)
 
     def _onObjectAdded(self, oid: str) -> None:
         """撤销/重做按 id 重建对象：浮雕模式下同 id 回来则恢复锁定编辑态。"""
@@ -1373,30 +1467,10 @@ class MainWindow(QMainWindow):
         self._reliefRestoreId = None
         if self._canvasModeBar.current() != "relief":
             return
-        obj = self._doc.object(oid)
-        if obj is None or obj.type() != ObjectType.SURFACE:
-            return
-        self._reliefLockedModel = obj
-        obj.setLocked(True)
-        # 恢复锁定编辑态：隐藏其他浮雕模型，只显示该模型
-        changed = []
-        if not obj.isVisible():
-            obj.setVisible(True)
-            changed.append(obj.id())
-        for o in self._doc.reliefModels():
-            if o.id() != obj.id() and o.isVisible():
-                o.setVisible(False)
-                changed.append(o.id())
-        if obj.isSelected():
-            obj.setSelected(False)
-            self._doc.selectionChanged.emit()
-        for cid in changed:
-            self._doc.notifyObjectChanged(cid)
-        self._transformPanel.setReliefModel(obj)
-        self._viewport3D.setReliefModel(obj)
+        self._pinReliefModelAsTarget(self._doc.object(oid))
 
 
-    def _onCommandRequested(self, name: str) -> None:
+    def _onCommandRequested(self, name: str, *args) -> None:
         # 浮雕撤销/重做/固化：动作类（非命令），直接转调；仅浮雕模式可用
         # （与快捷条 RELIEF_COMMAND_KEYS 门禁一致，矩阵见 mode_policy.py）
         if name in ("ReliefUndo", "ReliefRedo", "Solidify"):
@@ -1414,6 +1488,9 @@ class MainWindow(QMainWindow):
         if name == "Solidify":
             self._onCureBase()
             return
+        if name == "ToggleCurveLayer":
+            self._toggleCurveLayerVisible()
+            return
         if self._cm.hasActive():
             self._cm.cancelActive()
         # 2D 画布绘制命令：若实体模拟面板还开着（遮挡画布左侧），先关闭模拟，
@@ -1429,12 +1506,28 @@ class MainWindow(QMainWindow):
             self._ensure2DCanvas()
         # 浮雕类命令（新建/区域浮雕）均在当前画布交互：新建后自动进编辑态并切到
         # 3D 视口，区域浮雕直接在 3D 视口点选曲线，右键用于旋转查看，不切回 2D
-        if self._cm.executeCommand(name):
+        if self._cm.executeCommand(name, *args):
             self._topDock.appendHistory(f"启动命令: {name}")
         else:
             # 被模式门禁拒绝 → 显示拒绝原因；否则为未实现/已有活动命令
             ref = self._cm.lastRefusal()
             self._topDock.appendHistory(ref if ref else f"命令未实现: {name}")
+
+    def _toggleCurveLayerVisible(self) -> None:
+        """浮雕模式下 E：显示/隐藏曲线图层（固定根层，级联到全部曲线子图层）。"""
+        from core.document import LAYER_CURVES_ID
+        if self._canvasModeBar.current() != "relief":
+            self._topDock.appendHistory("E：仅在浮雕模式下切换曲线图层显示")
+            return
+        layer = self._doc.layer(LAYER_CURVES_ID)
+        if layer is None:
+            return
+        show = not layer.visible
+        self._doc.setLayerFlag(LAYER_CURVES_ID, visible=show)
+        # 2D 场景与 3D/浮雕视口都需重绘（视口按对象可见性过滤曲线）
+        self._scene.update()
+        self._viewport3D.update()
+        self._topDock.appendHistory(f"曲线图层：{'显示' if show else '隐藏'}")
 
     def _onMouseMoved(self, wp: "Point3D") -> None:
         self._statusBar.setCoordinates(wp.x, wp.y, wp.z)
@@ -1501,7 +1594,7 @@ class MainWindow(QMainWindow):
         sel = self._doc.selectedObjects()
         obj = sel[0] if sel else None
         self._propertyPanel.showObject(obj)
-        self._transformPanel.showObject(obj)
+        self._transformPanel.showObjects(sel)
         if obj is not None:
             self._statusBar.setLineWidth(obj.lineWidth())
         self._updateMeasure()
@@ -2006,11 +2099,12 @@ class MainWindow(QMainWindow):
         self._notifyTip(f"自动分色完成：{regions} 个闭合区域")
 
     def _onModelZCommit(self, target: float) -> None:
-        """变换面板“模型Z”确认：把浮雕模型高度场整体缩放到目标高度 Z。
+        """变换面板“模型Z”确认：把浮雕模型高度场缩放到目标 Z 尺寸。
 
-        缩放系数 = 目标值 / 当前最高高度；只动网格数据（最低点保持 Z=0，
-        XY 布局与色号蒙版不变），可经浮雕撤销逐步回退。3D 模式下则作用于
-        当前选中的 SURFACE 模型。
+        目标值是最高点到最低点的高度差（不是 Z 正方向尺寸）；缩放系数 =
+        目标值 / 当前高度差，以最低点为锚点（最低点位置不变），XY 布局与
+        色号蒙版不变，可经浮雕撤销逐步回退。3D 模式下则作用于当前选中的
+        SURFACE 模型。
         """
         model = self._reliefLockedModel
         if model is None:
@@ -2018,12 +2112,15 @@ class MainWindow(QMainWindow):
             model = next((o for o in sel
                           if o.type() == ObjectType.SURFACE), None)
         if model is None or target <= 0.0:
+            if model is None:
+                self._topDock.appendHistory("模型Z：未找到浮雕模型，请先在浮雕模式下打开模型")
             return
         hf = model.heightField()
         data = hf.data
         if data.size == 0:
             return
-        cur = float(data.max())
+        lo = float(data.min())
+        cur = float(data.max()) - lo
         if cur <= 0.0:
             self._topDock.appendHistory("模型Z：当前模型无高度（平面），无法缩放")
             return
@@ -2032,10 +2129,10 @@ class MainWindow(QMainWindow):
             return
         self._doc.beginEdit()
         try:
-            hf.setData(data * factor)
+            hf.setData(lo + (data.astype(np.float64) - lo) * factor)
             model.bumpVersion()
             self._doc.notifyObjectChanged(model.id())
-            self._topDock.appendHistory(f"模型Z：高度场已缩放到 {target:g}")
+            self._topDock.appendHistory(f"模型Z：Z 尺寸已缩放到 {target:g}")
         finally:
             self._doc.endEdit()
         self._scene.update()
@@ -2052,6 +2149,7 @@ class MainWindow(QMainWindow):
             model = next((o for o in sel
                           if o.type() == ObjectType.SURFACE), None)
         if model is None:
+            self._topDock.appendHistory("限高保底：未找到浮雕模型，请先在浮雕模式下打开模型")
             return
         hf = model.heightField()
         data = hf.data
@@ -2060,6 +2158,11 @@ class MainWindow(QMainWindow):
 
         clipped = np.clip(data, z_min, z_max)
         if np.array_equal(clipped, data):
+            # 明确告知为何“没变化”：截断只削掉超出区间的峰/谷，
+            # 输入区间完整覆盖当前高度时模型本就不会变。
+            self._topDock.appendHistory(
+                f"限高保底：数值未改变模型（当前范围 {float(data.min()):g} ~ "
+                f"{float(data.max()):g}，截断区间 [{z_min:g}, {z_max:g}]）")
             return
         self._doc.beginEdit()
         try:
@@ -2085,6 +2188,8 @@ class MainWindow(QMainWindow):
         dlg.dimensionSettingsChanged.connect(self._scene.update)
         dlg.exec()
         dlg.deleteLater()   # 用完即弃：避免控件树与信号连接随打开次数累积
+        # 键盘页可能改了快捷键：立即重建映射
+        self._reloadShortcuts()
         # 文件页设置（自动保存开关/间隔）可能已改变：按新设置重启自动保存定时器
         self._restartAutosaveTimer()
 
@@ -2438,11 +2543,16 @@ class MainWindow(QMainWindow):
             closableFlags=[len(self._openDocs) > 1 or not d.isEmpty()
                            for d in self._openDocs])
         title = ("*" if self._doc.isDirty() else "") + self._doc.title()
-        self.setWindowTitle(f"{title} - {tr('Cangai 浮雕设计')}")
+        self.setWindowTitle(f"{title} - Cangai")   # 标题栏短格式（未命名1 - Cangai）
         self._positionViewSwitchBar()   # 标签宽度变化后重新贴右下角
 
     def _onImageSelected(self, path: str) -> None:
-        """右侧“图片”按钮：选图 → 两点框放命令（先验证图片可解码）。"""
+        """右侧“图片”按钮：选图 → 两点框放命令（先验证图片可解码）。
+
+        3D/CNC 模式下不再切回 2D 画布：直接在当前 3D 视口两点放置，
+        图片进入当前模式空间（视口可显示参考图片）；此前会静默把可见
+        视图换成 2D 画布，导致图片进了 3D 空间却看不见、方向栏点击
+        全部作用在隐藏视口上（观感即“卡住”）。"""
         from core.vector.image_object import ImageObject
         try:
             ImageObject.fromFile(path)
@@ -2451,7 +2561,8 @@ class MainWindow(QMainWindow):
             return
         if self._cm.hasActive():
             self._cm.cancelActive()
-        self._ensure2DCanvas()
+        if self._canvasModeBar.current() not in ("3d", "cnc"):
+            self._ensure2DCanvas()
         if self._cm.executeCommand("Image", path):
             self._topDock.appendHistory(f"放置图片: {path}")
         else:
@@ -2667,16 +2778,33 @@ class MainWindow(QMainWindow):
             return False
 
     def _placeImagesAt(self, paths: list, worldPt) -> None:
-        """把拖入图片直接落到画布落点（默认宽 100 等比，多张依次错开），
-        一次撤销记录；落点无效时放当前 2D 视图中心。"""
+        """把拖入图片直接落到落点（默认宽 100 等比，多张依次错开），
+        一次撤销记录。
+
+        3D/CNC 模式：不切回 2D 画布，图片进当前模式空间，落点取拖入
+        的地面点（无效时取 3D 视口中心的地面交点）；2D/浮雕模式维持
+        原行为（落点无效时放 2D 视图中心）。"""
         if self._cm.hasActive():
             self._cm.cancelActive()
-        self._ensure2DCanvas()
+        mode = self._canvasModeBar.current()
         center = worldPt
-        if center is None:
-            vp = self._view.viewport()
-            sp = self._view.mapToScene(vp.rect().center())
-            center = Point3D(sp.x(), sp.y(), 0.0)
+        if mode in ("3d", "cnc"):
+            if center is None:
+                try:
+                    vp = self._viewport3D
+                    g = vp._screenToGround(
+                        vp.width() / 2.0, vp.height() / 2.0,
+                        vp._camera(), float(vp.width()), float(vp.height()))
+                    center = Point3D(g[0], g[1], 0.0) if g \
+                        else Point3D(0.0, 0.0, 0.0)
+                except Exception:
+                    center = Point3D(0.0, 0.0, 0.0)
+        else:
+            self._ensure2DCanvas()
+            if center is None:
+                vp = self._view.viewport()
+                sp = self._view.mapToScene(vp.rect().center())
+                center = Point3D(sp.x(), sp.y(), 0.0)
         from core.vector.image_object import ImageObject
         failed = []
         self._doc.beginEdit()
@@ -2849,6 +2977,7 @@ class MainWindow(QMainWindow):
     def _refreshStyle(self) -> None:
         QCoreApplication.instance().setStyleSheet(theme.globalQss())
         self._dockManager.setStyleSheet(theme.dockManagerQss())
+        self._titleBar.refreshStyle()
         for btn in self._leftPanel.tabButtons():
             btn.updateHighlightColor(theme.PRIMARY)
         self._leftPanel.refreshFileButtonsStyle()
@@ -2862,11 +2991,224 @@ class MainWindow(QMainWindow):
         self._scene.update()
         self._viewport3D.update()
 
+    def _applyDwmRoundCorners(self) -> None:
+        """Windows 11：给无边框窗口启用系统圆角（Win10 / 失败时静默跳过）。"""
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            pref = ctypes.c_int(2)   # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(pref), 4)   # 33 = DWMWA_WINDOW_CORNER_PREFERENCE
+        except Exception:
+            pass
+
+    def _enableTaskbarMinMax(self) -> None:
+        """无边框窗口补回 WS_THICKFRAME/MINIMIZEBOX/MAXIMIZEBOX/SYSMENU 样式位：
+        - WS_THICKFRAME：没有它 Windows 不执行边缘拖拽缩放（WM_NCHITTEST
+          的 HT* 命中码只报告位置，真正进入缩放循环需要厚边框样式；
+          非客户区视觉由 nativeEvent 的 WM_NCCALCSIZE=0 抹平）；
+        - MINIMIZEBOX/MAXIMIZEBOX/SYSMENU：否则单击任务栏图标无法
+          最小化/还原（FramelessWindowHint 移除了这些位）。"""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            GWL_STYLE = -16
+            WS_THICKFRAME = 0x00040000
+            WS_MAXIMIZEBOX = 0x00010000
+            WS_MINIMIZEBOX = 0x00020000
+            WS_SYSMENU = 0x00080000
+            GetWLP = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            SetWLP = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            hwnd = int(self.winId())
+            style = GetWLP(hwnd, GWL_STYLE)
+            style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+            SetWLP(hwnd, GWL_STYLE, style)
+            # SWP_FRAMECHANGED 让新样式立即生效（不移动不缩放）
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                0x2 | 0x1 | 0x4 | 0x20)
+        except Exception:
+            pass
+
+    # ---- 无边框窗口原生边框缩放（WM_NCHITTEST）----
+    # 返回 HT* 命中码后 Windows 直接进入系统缩放循环：自带缩放光标、
+    # 原生边框拖拽与贴边分屏，Qt 层不会收到边缘区的鼠标按下事件。
+    _HT = {"L": 10, "R": 11, "T": 12, "TL": 13, "TR": 14,
+           "B": 15, "BL": 16, "BR": 17}   # HTLEFT..HTBOTTOMRIGHT
+
+    def nativeEvent(self, eventType, message):
+        if eventType == b"windows_generic_MSG":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+                # 0x0083 = WM_NCCALCSIZE：WS_THICKFRAME 的非客户区（粗边框）
+                # 整体抹平为 0 —— 整个窗口即客户区，外观仍是全无边框，
+                # 但系统缩放循环（HT* 命中 → 拖拽缩放）得以生效
+                if msg.message == 0x0083 and msg.wParam:
+                    return True, 0
+                # 0x0084 = WM_NCHITTEST；最大化/全屏时不提供缩放边框
+                if msg.message == 0x0084 and \
+                        not self.isMaximized() and not self.isFullScreen():
+                    x = msg.lParam & 0xFFFF
+                    y = (msg.lParam >> 16) & 0xFFFF
+                    if x >= 0x8000:
+                        x -= 0x10000
+                    if y >= 0x8000:
+                        y -= 0x10000
+                    rect = wintypes.RECT()
+                    if ctypes.windll.user32.GetWindowRect(
+                            int(self.winId()), ctypes.byref(rect)):
+                        m = max(6, round(6 * self.devicePixelRatioF()))
+                        l = x - rect.left <= m
+                        r = rect.right - x <= m
+                        t = y - rect.top <= m
+                        b = rect.bottom - y <= m
+                        ht = None
+                        if l and t:
+                            ht = self._HT["TL"]
+                        elif r and t:
+                            ht = self._HT["TR"]
+                        elif l and b:
+                            ht = self._HT["BL"]
+                        elif r and b:
+                            ht = self._HT["BR"]
+                        elif l:
+                            ht = self._HT["L"]
+                        elif r:
+                            ht = self._HT["R"]
+                        elif t:
+                            ht = self._HT["T"]
+                        elif b:
+                            ht = self._HT["B"]
+                        if ht is not None:
+                            return True, ht
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def changeEvent(self, event: QEvent) -> None:
+        """窗口状态变化：
+        1) 无边框窗口被系统最大化时会盖住任务栏 → 修正到工作区几何；
+        2) 还原时恢复最大化前几何；3) 同步标题栏最大化/还原图标。"""
+        if event.type() == QEvent.WindowStateChange:
+            st = self.windowState()
+            maximized = bool(st & Qt.WindowMaximized)
+            if maximized:
+                avail = self.screen().availableGeometry()
+                if self.geometry() != avail:
+                    self.setGeometry(avail)
+            elif not (st & (Qt.WindowFullScreen | Qt.WindowMinimized)):
+                if self._preMaxGeo is not None:
+                    self.setGeometry(self._preMaxGeo)
+                    self._preMaxGeo = None
+            if getattr(self, "_titleBar", None) is not None:
+                self._titleBar.syncMaxButton(maximized)
+        super().changeEvent(event)
+
+    # 无边框窗口边缘热区宽度（像素）：靠边按住即触发系统缩放
+    RESIZE_MARGIN = 5
+
+    def _windowEdgeAt(self, globalPos) -> "Qt.Edges":
+        """全局坐标 → 无边框窗口边缘方向组合（空 Edges = 不在边缘）。"""
+        if self.isMaximized() or self.isFullScreen():
+            return Qt.Edges()
+        g = self.geometry()
+        m = self.RESIZE_MARGIN
+        x, y = globalPos.x() - g.left(), globalPos.y() - g.top()
+        w, h = g.width(), g.height()
+        edges = Qt.Edges()
+        if x <= m:
+            edges |= Qt.LeftEdge
+        if w - x <= m:
+            edges |= Qt.RightEdge
+        if y <= m:
+            edges |= Qt.TopEdge
+        if h - y <= m:
+            edges |= Qt.BottomEdge
+        return edges
+
     def eventFilter(self, obj: object, event: QEvent) -> bool:
+        et = event.type()
+        # 设置 → 键盘 里登记的快捷键（浮雕类）：全局拦截按键并触发命令
+        if et == QEvent.KeyPress and self._tryShortcut(event):
+            return True
+        # 无边框窗口边缘缩放：任何子控件上靠窗缘按下左键 → 原生缩放循环
+        if (et == QEvent.MouseButtonPress and isinstance(obj, QWidget)
+                and obj.window() is self
+                and not self.isMaximized() and not self.isFullScreen()
+                and event.button() == Qt.LeftButton):
+            edge = self._windowEdgeAt(event.globalPosition().toPoint())
+            if edge:
+                handle = self.windowHandle()
+                if handle is not None:
+                    handle.startSystemResize(edge)
+                    return True
         if (obj is getattr(self, "_canvasContainer", None)
-                and event.type() == QEvent.Resize):
+                and et == QEvent.Resize):
             self._positionViewSwitchBar()
         return super().eventFilter(obj, event)
+
+    # ---------------- 设置 → 键盘：快捷键映射 ----------------
+    def _reloadShortcuts(self) -> None:
+        """按 app_settings.shortcuts 重建“按键 → 命令”映射。
+
+        只有功能名登记在 app_settings.shortcut_commands 里的行才会生效；
+        撤销/重做/正交等由主窗口既有逻辑处理，不在此重复绑定。
+        """
+        self._shortcutMap = {}
+        cmds = getattr(app_settings, "shortcut_commands", {})
+        for row in getattr(app_settings, "shortcuts", []):
+            if len(row) >= 4:
+                func, key = row[1], row[2]
+            elif len(row) == 3:
+                func, key = row[0], row[1]
+            else:
+                continue
+            key = (key or "").strip().replace(" ", "")
+            cmd = cmds.get(func)
+            if key and cmd:
+                # 值可以是 "命令名" 或 ("命令名", 初始参数, ...)：
+                # 后者用于同一命令的不同变体（堆料/去料）
+                self._shortcutMap[key] = (cmd,) if isinstance(cmd, str) else tuple(cmd)
+
+    @staticmethod
+    def _eventKeyText(event: QKeyEvent) -> str:
+        """把按键事件格式化为与设置页捕获框一致的字符串（Ctrl+Shift+A）。"""
+        mods = event.modifiers()
+        parts = []
+        if mods & Qt.ControlModifier:
+            parts.append("Ctrl")
+        if mods & Qt.ShiftModifier:
+            parts.append("Shift")
+        if mods & Qt.AltModifier:
+            parts.append("Alt")
+        parts.append(QKeySequence(event.key()).toString())
+        return "+".join(parts)
+
+    def _tryShortcut(self, event: QKeyEvent) -> bool:
+        """命中设置页登记的快捷键则执行命令。焦点在文本输入控件、
+        或主窗口不是活动窗口（弹出了设置等对话框）时不拦截。"""
+        if not hasattr(self, "_shortcutMap"):
+            self._reloadShortcuts()
+        if not self._shortcutMap:
+            return False
+        from PySide6.QtWidgets import (QApplication, QLineEdit, QAbstractSpinBox,
+                                       QTextEdit, QPlainTextEdit, QComboBox)
+        if QApplication.activeWindow() is not self:
+            return False
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QAbstractSpinBox, QTextEdit,
+                           QPlainTextEdit, QComboBox)):
+            return False
+        if event.key() in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt,
+                           Qt.Key_Meta):
+            return False
+        hit = self._shortcutMap.get(self._eventKeyText(event))
+        if not hit:
+            return False
+        self._onCommandRequested(hit[0], *hit[1:])
+        event.accept()
+        return True
 
     def _positionViewSwitchBar(self) -> None:
         c = self._canvasContainer

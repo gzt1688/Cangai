@@ -10,12 +10,20 @@ XY 投影重合的点上（表现为前视画线第二个点被吸回第一个�
 """
 from __future__ import annotations
 import math
+from collections import OrderedDict
 from typing import List, Set, Optional, Tuple
+
+import numpy as np
+
 from .snap_types import SnapType, SnapResult
 from ..vector.geometry_types import Point3D, ObjectType
 
 
 _AXES_XY: Tuple[int, int] = (0, 1)
+
+# 采样折线缓存上限（LRU 淘汰）：大场景对象数远超此值，原实现超限整体
+# 清空会让缓存反复失效（清空后首帧重建上百个圆 → 数百 ms 卡顿）
+_SAMPLE_CACHE_MAX = 2048
 
 
 def _comp(p: Point3D, i: int) -> float:
@@ -121,10 +129,12 @@ class SnapManager:
             SnapType.CENTER, SnapType.INTERSECTION, SnapType.PERPENDICULAR,
             SnapType.TANGENT, SnapType.QUARTER, SnapType.VERTEX,
         }
-        self._snapRadius: float = 12.0
+        # 捕捉半径（屏幕像素）：12px 太大——画线时刚点下的点/短线段的中点、
+        # 垂足都会在光标还很远时就把光标拽走，手感"发黏"；6px 与主流 CAD 接近
+        self._snapRadius: float = 6.0
         # 解析对象（圆/弧/椭圆/直线）→ 采样折线缓存：键为几何签名（内容变化即换键），
-        # 超上限整体清空；非解析对象不走此缓存（显示点列由对象自身缓存）
-        self._sampleCache = {}
+        # 超上限按 LRU 淘汰最早项；非解析对象不走此缓存（显示点列由对象自身缓存）
+        self._sampleCache: "OrderedDict" = OrderedDict()
         # 当前捕捉平面轴（snap() 入口设置；主线程串行调用，无重入）
         self._ax: Tuple[int, int] = _AXES_XY
 
@@ -182,18 +192,39 @@ class SnapManager:
              eye: Optional[tuple] = None) -> SnapResult:
         """求吸附。eye 为相机位置（3D 视口传入）：多个候选在捕捉平面上
         距离/优先级完全并列时（如顶视下圆柱上下两圆投影重合），取离
-        相机更近（看得见的）那个；2D 画布不传，行为不变。"""
+        相机更近（看得见的）那个；2D 画布不传，行为不变。
+
+        refPoint 是命令**刚落下的输入点**：与该点重合的候选会被剔除——
+        画直线/曲线时刚点下去的点立刻变成自己的端点/顶点候选，光标在
+        捕捉半径内稍微一动就被拽回该点，无法正常拖动；剔除的只是
+        "刚落的那一个点"，曲线的起点（闭合用）等其它点仍可正常吸附。"""
         self._ax = axes if axes in ((0, 1), (0, 2), (1, 2)) else _AXES_XY
         candidates: List[SnapResult] = []
+        uw, vw = _comp(worldPos, self._ax[0]), _comp(worldPos, self._ax[1])
+        # 鼠标粗筛：包围盒离鼠标超过捕捉半径的对象不可能产生可视捕捉点，
+        # 整体跳过（不跑任何捕捉算法、不构造采样折线）。唯一例外是
+        # 垂足·情况2——它把鼠标投到"过参考点且垂直于目标线"的无限直线上，
+        # 吸附点可远离该对象，故仅对有参考点的直线豁免粗筛。
+        prescreen = viewRadius > 0
+        perp_lines = refPoint is not None and \
+            SnapType.PERPENDICULAR in self._enabledTypes
         # 单对象捕捉
         for obj in objects:
             if not obj.isVisible() or obj.isLocked():
                 continue
             featGetter = getattr(obj, "snapFeatures", None)
+            feats = None
+            if callable(featGetter):
+                feats = featGetter()
+            bb = self._objectBBox(obj, feats)
+            if prescreen and bb is not None and not (
+                    perp_lines and obj.type() == ObjectType.LINE) and (
+                    uw < bb[0] - viewRadius or uw > bb[2] + viewRadius
+                    or vw < bb[1] - viewRadius or vw > bb[3] + viewRadius):
+                continue
             if callable(featGetter):
                 # B-Rep 实体：按解析边特征吸附（圆心/端点/中点/象限/
                 # 最近点/顶点），不走常规类型分发
-                feats = featGetter()
                 if feats:
                     for r in self._snapSolid(obj, feats, worldPos,
                                              viewRadius):
@@ -208,6 +239,14 @@ class SnapManager:
         # 交点捕捉：需两两对象求交
         if SnapType.INTERSECTION in self._enabledTypes:
             candidates.extend(self._snapIntersections(worldPos, objects, viewRadius))
+        if refPoint is not None and candidates:
+            # 剔除与"刚落下的输入点"重合的候选（自己的端点/顶点/最近点）：
+            # 否则画线/画曲线时刚点的点会一直把光标吸住，微动一下就被拽回。
+            # 容差取捕捉半径的万分之一（≈0.001px 级别），只杀真正重合的点，
+            # 不影响线段上的最近点吸附。
+            eps = max(1e-9, abs(float(viewRadius)) * 1e-4)
+            candidates = [r for r in candidates
+                          if self._dist2d(r.position, refPoint) > eps]
         if not candidates:
             return SnapResult.invalid()
         # 优先级：最近点级别最低，只要存在非最近点命中就只用非最近点
@@ -637,12 +676,14 @@ class SnapManager:
     def _snapIntersections(self, wp: Point3D, objects: List,
                            viewRadius: float) -> List[SnapResult]:
         out: List[SnapResult] = []
-        # 先一次性取各对象采样折线 + (u,v) 包围盒再配对：
+        # 先用各对象的 (u,v) 包围盒粗筛再配对：
         # 1) 鼠标预筛——交点必然落在两个对象上，包围盒离鼠标超出捕捉半径
         #    的对象不可能贡献可视交点，直接剔除（大场景下把 O(N²) 配对
         #    压到只配视口附近的少数对象）；
-        # 2) 包围盒每帧每对象只算一次，不再每对重算（圆/椭圆 1025 点采样
-        #    全列表扫描 × N²/2 对是鼠标移动的主要卡顿源）。
+        # 2) 包围盒用 _objectBBox（解析对象 O(1)）而非构造 1025 点采样后
+        #    全表扫描——后者在圆较多时是鼠标移动的主要卡顿源，
+        #    采样折线改为只在配对真正发生时（_intersectPair 内）按需构造。
+        uw, vw = self._u(wp), self._v(wp)
         infos = []
         for o in objects:
             if not o.isVisible() or o.isLocked():
@@ -650,17 +691,16 @@ class SnapManager:
             featGetter = getattr(o, "snapFeatures", None)
             if callable(featGetter):
                 continue   # B-Rep 实体走解析特征吸附，不参与折线求交
-            pts = self._cachedSamples(o)
-            if len(pts) < 2:
-                continue
-            bb = _bboxOf(pts, self._ax)
+            bb = self._objectBBox(o)
             if bb is None:
                 continue
             if viewRadius > 0 and (
-                    bb[0] - self._u(wp) > viewRadius
-                    or self._u(wp) - bb[2] > viewRadius
-                    or bb[1] - self._v(wp) > viewRadius
-                    or self._v(wp) - bb[3] > viewRadius):
+                    bb[0] - uw > viewRadius or uw - bb[2] > viewRadius
+                    or bb[1] - vw > viewRadius or vw - bb[3] > viewRadius):
+                continue
+            # 几何级邻域剪枝（比包围盒紧得多）：长直线的包围盒往往虚大，
+            # 对象本身若没有任何几何落在半径内，其交点必然也不在半径内
+            if viewRadius > 0 and not self._nearMouse(o, wp, viewRadius):
                 continue
             infos.append((o, bb))
         n = len(infos)
@@ -676,6 +716,33 @@ class SnapManager:
                         out.append(SnapResult(position=p, type=SnapType.INTERSECTION,
                                               objectId=oi.id(), distance=d, isValid=True))
         return out
+
+    def _nearMouse(self, obj, wp: Point3D, viewRadius: float) -> bool:
+        """对象几何是否落在鼠标捕捉半径内（交点级剪枝）。
+
+        交点必落在对象几何上：若整个对象离鼠标都超过捕捉半径，则它不可能
+        贡献可视交点，可整对象剔除。直线/曲线按弦精确判定；圆/弧/椭圆在
+        捕捉平面为 XY 时用解析距离（弧按其完整圆、椭圆按其中心距区间取
+        保守界限）；其余平面无法解析，保守返回 True（宁可多算不漏）。"""
+        t = obj.type()
+        if t == ObjectType.POINT:
+            return False                     # 点对象不参与求交
+        if t in (ObjectType.LINE, ObjectType.CURVE, ObjectType.POLYCURVE):
+            return bool(self._chordsNear(self._cachedSamples(obj),
+                                         wp, viewRadius))
+        if self._ax == _AXES_XY:
+            try:
+                c = obj.center()
+                d = math.hypot(wp.x - c.x, wp.y - c.y)
+                if t == ObjectType.CIRCLE or t == ObjectType.ARC:
+                    return abs(d - float(obj.radius())) <= viewRadius
+                if t == ObjectType.ELLIPSE:
+                    a = float(obj.majorAxis())
+                    b = float(obj.minorAxis())
+                    return b - viewRadius <= d <= a + viewRadius
+            except Exception:
+                return True
+        return True
 
     def _intersectPair(self, a, b, wp: Optional[Point3D] = None,
                        viewRadius: float = 0.0) -> List[Point3D]:
@@ -717,6 +784,7 @@ class SnapManager:
             if wp is not None and viewRadius > 0 and \
                     (len(pa) > 32 or len(pb) > 32):
                 # 多段折线：只保留经过鼠标附近（捕捉半径内）的弦，控制组合数
+                # （对象级的粗筛已由 _nearMouse 完成，此处仅压缩弦对数量）
                 nearA = self._chordsNear(pa, wp, viewRadius)
                 nearB = self._chordsNear(pb, wp, viewRadius)
             else:
@@ -762,12 +830,72 @@ class SnapManager:
         if key is None:
             return self._samplePointsOf(obj)
         hit = self._sampleCache.get(key)
-        if hit is None:
-            hit = self._samplePointsOf(obj)
-            if len(self._sampleCache) > 256:
-                self._sampleCache.clear()
-            self._sampleCache[key] = hit
+        if hit is not None:
+            self._sampleCache.move_to_end(key)
+            return hit
+        hit = self._samplePointsOf(obj)
+        self._sampleCache[key] = hit
+        while len(self._sampleCache) > _SAMPLE_CACHE_MAX:
+            self._sampleCache.popitem(last=False)
         return hit
+
+    def _objectBBox(self, obj, feats: Optional[List] = None):
+        """对象在捕捉平面 (u,v) 上的包围盒 (u0,v0,u1,v1)，无法判定时返回 None。
+
+        解析对象（圆/弧/椭圆）用 O(1) 保守盒（圆心±半径，宁大勿漏），
+        直线取端点，B-Rep 实体取解析特征坐标；其余类型回退到采样折线扫描。
+        这是鼠标粗筛的基础：捕捉点必落在对象几何上，故包围盒离鼠标超过
+        捕捉半径的对象不可能产生可视捕捉点，可整体跳过（不必构造其采样
+        折线、不必跑各类捕捉算法）——大场景鼠标移动卡顿的主因即在此。"""
+        t = obj.type()
+        ui, vi = self._ax
+        try:
+            if t in (ObjectType.CIRCLE, ObjectType.ARC):
+                c = obj.center()
+                r = float(obj.radius())
+                u, v = _comp(c, ui), _comp(c, vi)
+                return (u - r, v - r, u + r, v + r)
+            if t == ObjectType.ELLIPSE:
+                c = obj.center()
+                r = max(float(obj.majorAxis()), float(obj.minorAxis()))
+                u, v = _comp(c, ui), _comp(c, vi)
+                return (u - r, v - r, u + r, v + r)
+            if t == ObjectType.LINE:
+                pts = obj.points()
+                if not pts:
+                    return None
+                us = [_comp(p, ui) for p in pts]
+                vs = [_comp(p, vi) for p in pts]
+                return (min(us), min(vs), max(us), max(vs))
+            if t == ObjectType.POINT:
+                p = obj.position()
+                u, v = _comp(p, ui), _comp(p, vi)
+                return (u, v, u, v)
+        except Exception:
+            return None
+        if feats:
+            us: List[float] = []
+            vs: List[float] = []
+            for f in feats:
+                k = f["kind"]
+                if k == "circle":
+                    c = Point3D(*f["center"])
+                    r = float(f["radius"])
+                    cu, cv = _comp(c, ui), _comp(c, vi)
+                    us.extend((cu - r, cu + r))
+                    vs.extend((cv - r, cv + r))
+                elif k == "line":
+                    for p in (f["a"], f["b"]):
+                        us.append(_comp(p, ui))
+                        vs.append(_comp(p, vi))
+                elif k == "vertex":
+                    p = f["p"]
+                    us.append(_comp(p, ui))
+                    vs.append(_comp(p, vi))
+            if not us:
+                return None
+            return (min(us), min(vs), max(us), max(vs))
+        return _bboxOf(self._cachedSamples(obj), self._ax)
 
     def _samplePointsOf(self, obj) -> List[Point3D]:
         """对象的显示采样折线（交点/最近点等通用求交的数据源）。
@@ -778,31 +906,35 @@ class SnapManager:
         n = 1024
         if t == ObjectType.CIRCLE:
             c, r = obj.center(), obj.radius()
-            return [Point3D(c.x + r * math.cos(2 * math.pi * i / n),
-                            c.y + r * math.sin(2 * math.pi * i / n), c.z)
-                    for i in range(n + 1)]
+            # 三角函数整体向量化（.tolist() 回退为 Python float，语义与原实现一致）
+            th = np.linspace(0.0, 2.0 * math.pi, n + 1)
+            xs = (c.x + r * np.cos(th)).tolist()
+            ys = (c.y + r * np.sin(th)).tolist()
+            z = c.z
+            return [Point3D(xs[i], ys[i], z) for i in range(n + 1)]
         if t == ObjectType.ARC:
             c, r = obj.center(), obj.radius()
             sa, ea = obj.startAngle(), obj.endAngle()
             span = ea - sa
             if abs(span) < 1e-9:
                 span = 2 * math.pi
-            return [Point3D(c.x + r * math.cos(sa + span * i / n),
-                            c.y + r * math.sin(sa + span * i / n), c.z)
-                    for i in range(n + 1)]
+            th = np.linspace(sa, sa + span, n + 1)
+            xs = (c.x + r * np.cos(th)).tolist()
+            ys = (c.y + r * np.sin(th)).tolist()
+            z = c.z
+            return [Point3D(xs[i], ys[i], z) for i in range(n + 1)]
         if t == ObjectType.ELLIPSE:
             c = obj.center()
             a, b = obj.majorAxis(), obj.minorAxis()
-            rot = obj.rotation()
+            rot = float(obj.rotation())
             cr, sr = math.cos(rot), math.sin(rot)
-            out: List[Point3D] = []
-            for i in range(n + 1):
-                th = 2 * math.pi * i / n
-                lx = a * math.cos(th)
-                ly = b * math.sin(th)
-                out.append(Point3D(c.x + lx * cr - ly * sr,
-                                   c.y + lx * sr + ly * cr, c.z))
-            return out
+            th = np.linspace(0.0, 2.0 * math.pi, n + 1)
+            lx = (a * np.cos(th)).tolist()
+            ly = (b * np.sin(th)).tolist()
+            z = c.z
+            return [Point3D(c.x + lx[i] * cr - ly[i] * sr,
+                            c.y + lx[i] * sr + ly[i] * cr, z)
+                    for i in range(n + 1)]
         if t == ObjectType.LINE:
             pts = list(obj.points())
         elif t == ObjectType.CURVE:

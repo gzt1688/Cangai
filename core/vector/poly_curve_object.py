@@ -175,22 +175,22 @@ class PolyCurveObject(BaseObject):
         self._dirty = True
 
     def _rebuildSegment(self, si: int) -> None:
-        """按该段控制点重采样外观（与画曲线预览一致的 Catmull-Rom）。
-        旧数据无 inputPoints 时以当前折线为锚重建，保持原形状。"""
+        """按该段控制点重采样外观（cadcraft 式拟合点样条，与画曲线预览
+        同一套数学）。旧数据无 inputPoints 时以当前折线为锚重建。"""
         seg = self._segments[si]
         inp = seg.get("inputPoints")
         if inp:
             cps = [Point3D(p[0], p[1], p[2]) for p in inp]
             if len(cps) >= 3:
-                from core.spline_utils import catmullRom
-                seg["points"] = [[p.x, p.y, p.z] for p in catmullRom(cps, 20)]
+                from core.spline_utils import nurbs_fit_samples
+                seg["points"] = [[p.x, p.y, p.z] for p in nurbs_fit_samples(cps, 20)]
             else:
                 seg["points"] = [[p.x, p.y, p.z] for p in cps]
             return
         pts = [Point3D(p[0], p[1], p[2]) for p in seg.get("points", [])]
         if len(pts) >= 3:
-            from core.spline_utils import catmullRom
-            seg["points"] = [[p.x, p.y, p.z] for p in catmullRom(pts, 20)]
+            from core.spline_utils import nurbs_fit_samples
+            seg["points"] = [[p.x, p.y, p.z] for p in nurbs_fit_samples(pts, 20)]
 
     def pathLength(self) -> float:
         total = 0.0

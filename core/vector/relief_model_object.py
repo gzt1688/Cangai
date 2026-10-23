@@ -3,7 +3,7 @@
 设计（对齐方案 v2）：
 - 2D 显示为带着色预览的网格面（见 ui/view_2d/items/relief_model_item.py）。
 - 变换只改 XY：translate / rotate(Z) / scale 累积到 ``_place``（无损、实时预览）；
-  dz / sz 一律忽略（Z=高度不可经变换改变，只能在浮雕编辑态改）。
+  dz / sz 一律忽略（Z=高度不可经变换改变，只能在浮雕编辑态直接平移/缩放高度场）。
 - "重构"(bake) 把 ``_place`` 重采样烘焙进网格并复位为单位阵（唯一有损步骤）。
 - 曲线与模型彻底解耦：本对象不持有任何曲线引用。
 - 序列化：metadata + 网格(zlib 压缩 base64)，可正确存盘/撤销。
@@ -402,7 +402,8 @@ class ReliefModelObject(BaseObject):
     # ---------------- 变换（累积到 _place，无损；仅 XY） ----------------
 
     def translate(self, dx: float, dy: float, dz: float) -> None:
-        # 忽略 dz：Z（高度）不可经变换改变
+        # 忽略 dz：Z（高度）不可经放置变换改变；整体 Z 上下移动由
+        # 变换面板双击 Z 最小/最大直接平移高度场数据实现。
         T = np.eye(3, dtype=np.float64)
         T[0, 2] += float(dx)
         T[1, 2] += float(dy)

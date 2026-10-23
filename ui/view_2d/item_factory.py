@@ -76,6 +76,8 @@ def _buildPath(obj, viewScale: float = 1.0) -> QPainterPath:
                 path.moveTo(pts[0][0], pts[0][1])
                 for p in pts[1:]:
                     path.lineTo(p[0], p[1])
+    elif t == ObjectType.REVCLOUD:
+        path = obj.path()
     elif t == ObjectType.IMAGE:
         # 图片：四角旋转后的矩形轮廓（预览/命中辅助用）
         pts = obj.points()

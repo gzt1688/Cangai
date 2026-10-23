@@ -48,11 +48,18 @@ if exist build rmdir /s /q build
 if exist "dist\Cangai.exe" del /q "dist\Cangai.exe"
 if exist Cangai.spec del /q Cangai.spec
 
+REM Ensure a plugins folder exists (non-empty) so it is delivered next to the
+REM exe and users can drop in their own plugins. builtinPluginDir() resolves to
+REM {app}\plugins at runtime (NOT the onefile temp _MEIPASS), so plugins must be
+REM shipped as real files beside the exe, not bundled via --add-data.
+if not exist plugins mkdir plugins
+if not exist "plugins\README.txt" > "plugins\README.txt" echo Drop your own plugins into this folder: a folder containing plugin.json, or a single .py file. Restart the app to load them.
+
 REM ---- 4. Build (onefile: single exe) ----
 REM 注意：不能 --exclude-module unittest —— numpy.testing 模块级 import unittest，
 REM 排除了会导致打包后的程序启动即崩（ModuleNotFoundError）。
 echo [Build] Generating single-file exe...
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name Cangai --icon "icons\Cangai.ico" --add-data "icons;icons" --add-data "resources;resources" --add-data "plugins;plugins" --paths "deps\pymillcam-main\src" --add-data "deps\pymillcam-main\src\pymillcam;pymillcam" --hidden-import "pymillcam" --hidden-import "shapely" --hidden-import "pydantic" --collect-binaries "shapely" --collect-submodules "pydantic" --hidden-import "PySide6" --hidden-import "PySide6.QtWidgets" --hidden-import "PySide6.QtCore" --hidden-import "PySide6.QtGui" --hidden-import "PySide6.QtOpenGL" --hidden-import "numpy" --hidden-import "moderngl" --hidden-import "glcontext" --hidden-import "fontTools" --hidden-import "ezdxf" --exclude-module pytest --exclude-module tkinter --exclude-module test --exclude-module tests --exclude-module __pycache__ main.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name Cangai --icon "icons\Cangai.ico" --add-data "icons;icons" --add-data "resources;resources" --paths "deps\pymillcam-main\src" --add-data "deps\pymillcam-main\src\pymillcam;pymillcam" --hidden-import "pymillcam" --hidden-import "shapely" --hidden-import "pydantic" --collect-binaries "shapely" --collect-submodules "pydantic" --hidden-import "PySide6" --hidden-import "PySide6.QtWidgets" --hidden-import "PySide6.QtCore" --hidden-import "PySide6.QtGui" --hidden-import "PySide6.QtOpenGL" --hidden-import "numpy" --hidden-import "moderngl" --hidden-import "glcontext" --hidden-import "fontTools" --hidden-import "ezdxf" --exclude-module pytest --exclude-module tkinter --exclude-module test --exclude-module tests --exclude-module __pycache__ main.py
 
 if errorlevel 1 (
     echo [ERROR] Build failed
@@ -150,7 +157,7 @@ echo Source: "dist\Cangai.exe"; DestDir: "{app}"; Flags: ignoreversion
 echo Source: "icons\Cangai.ico"; DestDir: "{app}"; Flags: ignoreversion
 echo Source: "icons\*"; DestDir: "{app}\icons"; Flags: ignoreversion recursesubdirs createallsubdirs
 echo Source: "resources\*"; DestDir: "{app}\resources"; Flags: ignoreversion recursesubdirs createallsubdirs
-echo Source: "plugins\*"; DestDir: "{app}\plugins"; Flags: ignoreversion recursesubdirs createallsubdirs
+echo Source: "plugins\*"; DestDir: "{app}\plugins"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 echo.
 echo [Icons]
 echo Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Cangai.ico"

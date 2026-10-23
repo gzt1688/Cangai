@@ -104,13 +104,13 @@ class QuickAccessBar(QWidget):
         self._buttonHasIcon: dict[QPushButton, bool] = {}
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 1, 0, 0)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFixedHeight(1)
-        line.setStyleSheet("QFrame { background: #c8c8c8; border: none; }")
+        line.setStyleSheet(f"QFrame {{ background: {theme.BORDER}; border: none; }}")
         outer.addWidget(line)
 
         layout = QHBoxLayout()
@@ -128,8 +128,9 @@ class QuickAccessBar(QWidget):
         for key, text in ACTION_BUTTONS:
             btn = QPushButton(self._wrapText(tr(text)))
             btn.setFixedSize(36, 36)
-            # 撤销/重做按钮名已一眼看懂 → 不设 tooltip，悬停无信息噪声
+            # 悬停提示：默认用按钮文本，左右键二合一按钮用专属提示
             override = _ACTION_TOOLTIP.get(key, "")
+            btn.setToolTip(tr(override or text.replace("\n", "")))
             if override:
                 btn.setToolTip(tr(override))
                 self._buttonTooltips[btn] = override
@@ -207,6 +208,9 @@ class QuickAccessBar(QWidget):
                     btn.setContextMenuPolicy(Qt.CustomContextMenu)
                     btn.customContextMenuRequested.connect(
                         lambda pos: self.commandRequested.emit("SweepSmooth"))
+                # 悬停提示：专属提示（左右键二合一等）优先，否则按钮文本
+                if not btn.toolTip():
+                    btn.setToolTip(tr(text.replace("\n", "")))
                 layout.addWidget(btn)
                 self._buttons[key] = btn
                 self._buttonTexts[btn] = text
@@ -243,8 +247,12 @@ class QuickAccessBar(QWidget):
                 continue   # 有图标不写字
             btn.setText(self._wrapText(tr(text)))
             self._applyQuickTextStyle(btn, text)
-        for btn, tip in self._buttonTooltips.items():
-            btn.setToolTip(tr(tip))
+        # 悬停提示：专属提示优先，其余用按钮文本拍平
+        for btn, text in self._buttonTexts.items():
+            if btn in self._buttonTooltips:
+                btn.setToolTip(tr(self._buttonTooltips[btn]))
+            else:
+                btn.setToolTip(tr(text.replace("\n", "")))
 
     def _connectButton(self, btn, key: str) -> None:
         """动作按钮发动作信号，其余发命令信号。"""
@@ -316,10 +324,10 @@ class QuickAccessBar(QWidget):
             pressed = QColor(color).darker(120).name()
             qss = (
                 f"QPushButton {{ background: {color}; color: white;"
-                " border: none; border-radius: 2px; padding: 0px; }"
+                " border: none; border-radius: 4px; padding: 0px; }"
                 f"QPushButton:hover {{ background: {hover}; }}"
                 f"QPushButton:pressed {{ background: {pressed}; }}"
-                "QPushButton:disabled { background: #c8c8c8; color: #888888; }"
+                "QPushButton:disabled { background: #d8d8d8; color: #999999; }"
             )
             for btn in btns:
                 btn.setStyleSheet(qss)
@@ -330,10 +338,10 @@ class QuickAccessBar(QWidget):
         color = theme.PRIMARY
         return (
             f"QPushButton {{ background: {color}; color: white;"
-            " border: none; border-radius: 2px; padding: 0px; }"
+            " border: none; border-radius: 4px; padding: 0px; }"
             f"QPushButton:hover {{ background: {theme.PRIMARY_DARK}; }}"
             f"QPushButton:pressed {{ background: {QColor(color).darker(120).name()}; }}"
-            "QPushButton:disabled { background: #c8c8c8; }"
+            "QPushButton:disabled { background: #d8d8d8; color: #999999; }"
         )
 
     def _applyQuickTextStyle(self, btn, text: str) -> None:
@@ -344,7 +352,7 @@ class QuickAccessBar(QWidget):
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
         sep.setFixedWidth(1)
-        sep.setStyleSheet("QFrame { background: #c8c8c8; border: none; }")
+        sep.setStyleSheet(f"QFrame {{ background: {theme.BORDER}; border: none; }}")
         return sep
 
     def button(self, key: str):

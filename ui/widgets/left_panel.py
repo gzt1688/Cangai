@@ -64,21 +64,7 @@ class LeftPanelWidget(QWidget):
                 tabLayout.addWidget(self._makeHLine())
             self._tabButtons.append(btn)
         tabLayout.addStretch()
-
-        # 计算器按钮（打开文件上方）：材料成本计算
-        tabLayout.addWidget(self._makeHSeparator())
-        self._calcBtn = QPushButton()
-        self._calcBtn.setIcon(QIcon(resource_path("icons/calculator.svg")))
-        self._calcBtn.setIconSize(QSize(24, 24))
-        self._calcBtn.setFixedSize(36, 36)
-        self._calcBtn.setToolTip(tr("材料成本计算器"))
-        self._calcBtn._tipText = "材料成本计算器"
-        self._calcBtn.setStyleSheet(
-            "QPushButton { border: none; border-radius: 4px; background: transparent; }"
-            "QPushButton:hover { background: #d0d0d0; }"
-        )
-        self._calcBtn.clicked.connect(self.calcRequested.emit)
-        tabLayout.addWidget(self._calcBtn)
+        # （计算器/设置按钮已移至自绘标题栏 TitleBar，此处仅保留文件按钮）
 
         self._fileButtons = []
         self._saveBtn = None
@@ -112,19 +98,7 @@ class LeftPanelWidget(QWidget):
             self._fileButtons.append(btn)
         self._applySaveBtnStyle()
 
-        tabLayout.addWidget(self._makeHSeparator())
-        self._settingsBtn = QPushButton()
-        self._settingsBtn.setIcon(QIcon(resource_path("icons/settings.svg")))
-        self._settingsBtn.setIconSize(QSize(24, 24))
-        self._settingsBtn.setFixedSize(36, 36)
-        self._settingsBtn.setToolTip(tr("设置"))
-        self._settingsBtn.setStyleSheet(
-            "QPushButton { border: none; border-radius: 4px; background: transparent; }"
-            "QPushButton:hover { background: #d0d0d0; }"
-        )
-        self._settingsBtn.clicked.connect(self.settingsRequested.emit)
-        tabLayout.addWidget(self._settingsBtn)
-
+        # （设置按钮已移至自绘标题栏 TitleBar）
         self._separator = QFrame()
         self._separator.setFrameShape(QFrame.VLine)
         self._separator.setFixedWidth(1)
@@ -158,8 +132,6 @@ class LeftPanelWidget(QWidget):
             tip = getattr(btn, "_tipText", None)
             if tip:
                 btn.setToolTip(tr(tip))
-        self._calcBtn.setToolTip(tr("材料成本计算器"))
-        self._settingsBtn.setToolTip(tr("设置"))
         self._refreshSavePage()
 
 

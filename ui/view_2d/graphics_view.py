@@ -1,4 +1,4 @@
-﻿"""2D 画布视图：鼠标交互、捕捉、命令输入转发。"""
+"""2D 画布视图：鼠标交互、捕捉、命令输入转发。"""
 from __future__ import annotations
 import math
 from typing import Optional
@@ -8,6 +8,7 @@ from PySide6.QtGui import (QMouseEvent, QWheelEvent, QKeyEvent, QPainter,
 from PySide6.QtWidgets import QGraphicsView, QGraphicsItem
 
 from core.grid_manager import GridManager
+import core.app_settings as app_settings
 from ui.styles import theme
 from ui.widgets.step_hint import StepHintOverlay
 from core.snap.snap_manager import SnapManager
@@ -15,6 +16,13 @@ from core.snap.snap_types import SnapResult, snapLabel, SnapType
 from core.vector.geometry_types import Point3D, ObjectType
 from ui.view_2d.items.dimension_item import DimensionGraphicsItem
 from ui.view_drop import droppedFilePaths, acceptIfFiles
+
+
+# "沿线行走"型吸附：候选点落在对象几何上（而非固定特征点），自身正在
+# 绘制的对象上离最后输入点很近的这类候选会把光标往回拽，由视口按距离过滤
+_WALKING_SNAPS = frozenset({SnapType.NEAREST, SnapType.MIDPOINT,
+                            SnapType.PERPENDICULAR, SnapType.TANGENT,
+                            SnapType.INTERSECTION})
 
 
 def _segIntersectsRect(p, q, r: QRectF) -> bool:
@@ -327,11 +335,19 @@ class GraphicsView(QGraphicsView):
         objs = [o for o in self._doc.visibleObjects() if o.id() not in previewIds]
         objs.extend(extraObjs)
         res = self._snap.snap(worldPos, objs, worldR, ref)
-        # 部分排除：命中自身的端点/顶点/节点类型时视为未命中，
-        # 避免新点与起点或已画线段的顶点重合，但仍保留中点/最近点/垂足等
+        # 部分排除：命中自身对象、且属于命令指定要排除的吸附类型 → 视为未命中
         if res.isValid and res.objectId in partialIds and \
                 res.type in excludedTypes:
             return SnapResult.invalid()
+        # 自身正在画的几何：刚点下的那段的中/最近点/垂足就在光标背后，
+        # 光标稍动就被拽回去（手感发黏）。只过滤"距最后输入点 2 个捕捉
+        # 半径以内"的沿线候选，稍远处的自身中点/最近点照常可吸附。
+        if res.isValid and res.objectId in partialIds and ref is not None \
+                and res.type in _WALKING_SNAPS:
+            dx = res.position.x - ref.x
+            dy = res.position.y - ref.y
+            if dx * dx + dy * dy < (2.0 * worldR) ** 2:
+                return SnapResult.invalid()
         return res
 
     def _resolvePoint(self, pos) -> Point3D:
@@ -818,6 +834,8 @@ class GraphicsView(QGraphicsView):
         if abs(angle) < 1e-6:
             event.accept()
             return
+        if app_settings.invert_wheel_zoom:
+            angle = -angle   # 设置中开启“反向滚轮缩放”
         factor = 1.2 ** angle
         anchorPt = event.position().toPoint()
         scenePt = self.mapToScene(anchorPt)

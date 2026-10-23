@@ -7,10 +7,10 @@ import time
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, QLineF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QLineF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QGuiApplication,
                            QImage, QKeyEvent, QLinearGradient, QMouseEvent,
-                           QPainter, QPainterPath, QPen, QPolygonF,
+                           QPainter, QPainterPath, QPen, QPolygonF, QRegion,
                            QSurfaceFormat, QTransform, QWheelEvent)
 from PySide6.QtOpenGL import QOpenGLFunctions_3_3_Compatibility
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -22,7 +22,7 @@ from core.vector.brep_shape import BrepShape
 from core.grid_manager import GridManager
 import core.app_settings as app_settings
 from core.snap.snap_manager import SnapManager
-from core.snap.snap_types import SnapResult
+from core.snap.snap_types import SnapResult, SnapType
 from core.relief import mesh3d, shade, paint_palette
 from core.relief.region_relief import sample_curve_points, build_inside_mask
 from core.relief.sweep import SweepParams, apply_brush_stamp
@@ -54,6 +54,11 @@ FAR = 100000.0
 DEFAULT_DIST = 260.0
 FOV_DEG = 45.0
 PICK_RADIUS = 10.0      # 对象拾取屏幕半径（像素）
+# "沿线行走"型吸附（与 2D 画布 graphics_view 定义一致）：自身正在绘制的
+# 对象上离最后输入点很近的这类候选会把光标往回拽，由 _snapAt 按距离过滤
+_WALKING_SNAPS = frozenset({SnapType.NEAREST, SnapType.MIDPOINT,
+                            SnapType.PERPENDICULAR, SnapType.TANGENT,
+                            SnapType.INTERSECTION})
 PITCH_LIMIT = math.radians(85.0)  # 俯仰限幅：避免近平顶视时 up 向量突变闪跳
 # 投影屏幕坐标钳制上限：Qt6 光栅化引擎用 QFixed(16.16)，坐标超 ±~32768
 # 会整数溢出→原生崩溃（放大时贴近相机的顶点 depth≈NEAR 会投出巨值）。
@@ -275,6 +280,18 @@ class Viewport3D(QOpenGLWidget):
         # 逐顶点缓冲（位置/法线/底色/索引）按 surfKey 缓存：旋转时不变 → 不重算
         self._glCache = None
         self._glCacheKey = None
+        # 笔画期增量同步：缓存对应的网格实例 / 已同步到的版本 key，
+        # 以及自上次同步以来累计变化的顶点 ROI（含端；None=无变化）
+        self._glMeshRef = None
+        self._glMeshKey = None
+        self._roiBoxSinceGl = None
+        self._geoDirtySinceGl = False   # 自上次 GL 同步以来出现过高度改动（兜底标记）
+        self._hnormDirty = False        # 笔画期推迟的高度归一化待补算
+        self._glBaseDirty = False       # 底色需整份刷新（笔画结束后的精确归一化）
+        self._glRoiPending = None       # 本帧需写进 GPU 的顶点块（None=整份重传）
+        self._mapColorNorm = None       # map 模式底色归一化区间（ROI 刷新沿用）
+        self._mapLutF32 = None          # 地形 LUT 的 float32 预乘缓存
+        self._reliefRefreshTimer = None
         # 三角形索引按网格拓扑 (gnx,gny) 缓存：拓扑在雕刻/磨光笔画期间不变，
         # 每次版本刷新只重算顶点/法线/底色，索引直接复用（省 ~1.5MB 重算）
         self._triIdxCache = None
@@ -973,10 +990,40 @@ class Viewport3D(QOpenGLWidget):
 
         锁定后 3D 曲面渲染以该模型为准，不再依赖瞬时选中——避免视口左键
         清空选择导致网格消失。锁定即进入 X-Ray 半透明显示，解锁恢复不透明。
+
+        目标切换必须清空**全部**浮雕渲染缓存：缓存键含 ``id(model)``/``id(mesh)``，
+        而 Python 对象 id 会被回收复用（旧模型释放后新模型可能拿到同一地址），
+        只按 id 比较会命中上一模型的陈旧网格+索引 → 画面显示旧模型或空白，
+        切换画布模式（重建对象/上下文）才恢复。同一目标重复 pin 则保留缓存。
         """
+        if model is self._reliefModel:
+            self.update()
+            return
         self._reliefModel = model
-        self._reliefMeshKey = None      # 强制下次重建网格缓存
+        self._resetReliefRenderCache()
         self.update()
+
+    def _resetReliefRenderCache(self) -> None:
+        """清空浮雕网格/GPU 缓冲/投影等全部渲染缓存（目标模型切换时调用）。"""
+        self._reliefMesh = None
+        self._reliefMeshKey = None
+        self._meshSrcGrid = None
+        self._meshSrcMeta = None
+        self._glCache = None
+        self._glCacheKey = None
+        self._glMeshRef = None
+        self._glMeshKey = None
+        self._roiBoxSinceGl = None
+        self._geoDirtySinceGl = False
+        self._hnormDirty = False
+        self._glBaseDirty = False
+        self._glRoiPending = None
+        self._triIdxCache = None
+        self._triIdxCacheKey = None
+        self._triIdxMeshRef = None
+        self._reliefProj = None
+        self._projKey = None
+        self._projCache = None
 
     def _reliefOpacity(self) -> float:
         """浮雕编辑态曲面透明度：锁定模型（浮雕模式）半透明显示。
@@ -1067,6 +1114,15 @@ class Viewport3D(QOpenGLWidget):
         if res.isValid and res.objectId in partialIds and \
                 res.type in excludedTypes:
             return SnapResult.invalid()
+        # 自身正在画的几何：刚点下的那段的中/最近点/垂足就在光标背后，
+        # 光标稍动就被拽回去（手感发黏）。只过滤"距最后输入点 2 个捕捉
+        # 半径以内"的沿线候选，稍远处的自身中点/最近点照常可吸附。
+        if res.isValid and res.objectId in partialIds and ref is not None \
+                and res.type in _WALKING_SNAPS:
+            dx = res.position.x - ref.x
+            dy = res.position.y - ref.y
+            if dx * dx + dy * dy < (2.0 * worldR) ** 2:
+                return SnapResult.invalid()
         return res
 
     def _resolvePoint(self, pos) -> Point3D | None:
@@ -1428,6 +1484,13 @@ class Viewport3D(QOpenGLWidget):
                     self._reliefMeshKey = None
                     self._glCache = None
                     self._glCacheKey = None
+                    self._glMeshRef = None
+                    self._glMeshKey = None
+                    self._roiBoxSinceGl = None
+                    self._geoDirtySinceGl = False
+                    self._hnormDirty = False
+                    self._glBaseDirty = False
+                    self._glRoiPending = None
                 self._glCtxId = qid
         if self._gl is None and qvalid and app_settings.gpu_accelerated:
             # Qt 可能晚于首次 paint 才回调 initializeGL（3D 视口动态创建/切换
@@ -1966,7 +2029,8 @@ class Viewport3D(QOpenGLWidget):
             selected = obj.isSelected()
             if rendered and not selected:
                 continue
-            top = obj.topology(self._angularFor(obj, cam, w, h))
+            top = obj.topology(self._angularFor(obj, cam, w, h),
+                               edges_only=True)
             polys = top.get("edgePolylines") or []
             segs = []
             for poly in polys:
@@ -2082,11 +2146,14 @@ class Viewport3D(QOpenGLWidget):
             mesh = self._reliefMeshFor(model, max_dim=self._gpuMeshDim())
             if mesh is None or mesh.faceCount == 0:
                 return
-            # surfKey 随 模型/显示模式/材质/颜色/色号蒙版 变化，不随相机(旋转)变化
-            # → 旋转时不重算顶点数组；填色只让底色缓存失效重建（maskStamp），几何网格缓存不动
-            surfKey = (self._reliefMeshKey, model.display3DMode(), model.material(),
-                       tuple(model.color() or ()), model.maskStamp())
-            if self._glCacheKey != surfKey:
+            # styleKey 只含**形状/外观**：网格实例、显示模式、材质、颜色、
+            # 色号蒙版、网格尺寸。高度数据变化（雕刻/磨光笔画）不再使整份
+            # 顶点法线/底色重建——旧实现每帧全场 bincount 散射（3000² 栅格
+            # ~95ms）+ 地形 LUT 全场 gather（~25ms）是拖动塑形卡死的根因。
+            styleKey = (id(mesh), model.display3DMode(), model.material(),
+                        tuple(model.color() or ()), model.maskStamp(),
+                        mesh.gnx, mesh.gny, mesh.verts.shape[0])
+            if self._glCache is None or self._glCacheKey != styleKey:
                 # 逐顶点底色（仅随模型/模式/材质变化）+ 逐顶点法线（面法线平均）
                 base = self._baseColorsVert(mesh, model)
                 vn = self._scatterWallAware(mesh, mesh.normals)
@@ -2102,24 +2169,53 @@ class Viewport3D(QOpenGLWidget):
                     np.ascontiguousarray(base, dtype=np.float32),
                     idx,
                 )
-                self._glCacheKey = surfKey
+                self._glCacheKey = styleKey
+                self._glMeshRef = mesh
+                self._glMeshKey = self._reliefMeshKey
+                self._roiBoxSinceGl = None
+                self._geoDirtySinceGl = False
+                self._glBaseDirty = False
+            elif self._glMeshRef is mesh \
+                    and self._glMeshKey != self._reliefMeshKey:
+                # 同一网格、仅高度变化：只同步变化的 z / 法线 ROI / 底色 ROI
+                self._syncGlMeshIncremental(mesh, model)
+            elif self._glBaseDirty:
+                # 笔画结束后的整份底色刷新（精确 min/max 归一化），法线不动
+                verts, vn, base, idx = self._glCache
+                self._glCache = (verts, vn,
+                                 np.ascontiguousarray(
+                                     self._baseColorsVert(mesh, model),
+                                     dtype=np.float32), idx)
+                self._glBaseDirty = False
         except Exception:
             import traceback
             traceback.print_exc()
             dbg("drawReliefSurfaceGL: rebuild failed -> keep last cache\n"
                 + traceback.format_exc())
-            if self._glCache is None or self._glCacheKey is None:
-                raise    # 从未成功渲染过：交由外层软渲染兜底
-            mesh = self._reliefMesh  # 上一份可渲染网格（数据略旧，下帧追上）
-            surfKey = self._glCacheKey
+            # 只有缓存确实属于**当前**网格才允许沿用（数据略旧，下帧追上）。
+            # 否则（从未渲染成功 / 缓存还是上一个模型的）本帧必须交外层软渲染
+            # 兜底：软路径按当前模型数据绘制，画面至少正确，不会把上一模型的
+            # 几何顶在新模型的位置上或画成空白。
+            if (self._glCache is None or self._glCacheKey is None
+                    or self._reliefMesh is None
+                    or self._glMeshRef is not self._reliefMesh):
+                raise
+            mesh = self._reliefMesh
         verts, vn, base, idx = self._glCache
         eye = cam[0]
         light = mesh3d.lightDirection(model.lightAzimuth(), model.lightAltitude())
         params = self._lightParams(model.display3DMode(), model.material())
         mvp = self._buildMVP(cam, w, h, W, H)
-        self._gl.draw(surfKey, verts, vn, base, idx, mvp, eye, light, params,
-                      W, H, self._bgFloat, getattr(self, "_curFbo", 0),
-                      opacity=self._reliefOpacity())
+        # 笔画期只有 ROI 块真正变化：交给 GL 层按行块局部 write（KB 级），
+        # 其余顶点数据原地复用；幕帘硬边复制顶点分散在尾部，整份重传更稳
+        roi = self._glRoiPending
+        self._glRoiPending = None
+        if roi is not None and getattr(mesh, "wall_dup", None) is not None:
+            roi = None
+        self._gl.draw(self._glCacheKey, verts, vn, base, idx, mvp, eye, light,
+                      params, W, H, self._bgFloat,
+                      getattr(self, "_curFbo", 0),
+                      opacity=self._reliefOpacity(), roi=roi)
         # 曲面已写入深度缓冲。QPainter 随后在同一默认 FBO 上绘制 2D 叠加层
         # （参考曲线/操作轴/捕捉标记），若沿用深度测试会被曲面深度剔除——
         # 顶视图下模型占满屏幕时尤其明显（曲线完全看不见）。这里把测试/混合关掉
@@ -2145,10 +2241,14 @@ class Viewport3D(QOpenGLWidget):
         """全场顶点投影的帧间缓存（仅供边框叠加/拾取辅助使用）。
 
         拖动笔画时鼠标移动帧的网格与相机都不变，而全场 6.5 万顶点投影
-        要 2-3ms——按（网格 key + 相机 + 视口尺寸）缓存后直接复用，
+        要 2-3ms——按（网格实例 + 相机 + 视口尺寸）缓存后直接复用，
         笔刷圈跟随显著更跟手。旋转/缩放/数据变化时自动重算。
+
+        注意：键里**不含**高度版本——笔画期 z 每帧微调，整份重投影（3000²
+        ~30ms）会把拖动拖到 20fps 以下；边框叠加容许短暂滞后，笔画停下
+        300ms 后由 :meth:`_onReliefCacheRefresh` 置空键重算到精确值。
         """
-        key = (self._reliefMeshKey,
+        key = (id(verts),
                round(self._yaw, 4), round(self._pitch, 4),
                round(self._dist, 3),
                round(self._pan[0], 3), round(self._pan[1], 3),
@@ -2208,6 +2308,8 @@ class Viewport3D(QOpenGLWidget):
             lut = shade.make_lut("terrain")                 # (256,3) uint8
             z = mesh.verts[:, 2]
             lo, hi = float(z.min()), float(z.max())
+            # 记录本次归一化区间：笔画期 ROI 底色刷新沿用（避免每帧全场 gather）
+            self._mapColorNorm = (lo, hi)
             vh = np.full(z.shape, 0.5) if hi - lo < 1e-9 else (z - lo) / (hi - lo)
             vi = np.clip((vh * 255.0).astype(np.int32), 0, 255)
             return lut[vi].astype(np.float64) / 255.0
@@ -2281,6 +2383,190 @@ class Viewport3D(QOpenGLWidget):
         面引用（得朝天法线），无需特殊角色逻辑。
         """
         return self._scatterFaceToVert(mesh, faceArr)
+
+    def _noteRoiBox(self, box) -> None:
+        """累计"自上次 GL 同步以来"受影响的顶点块（取并集，含端）。"""
+        self._geoDirtySinceGl = True
+        cur = self._roiBoxSinceGl
+        if cur is None:
+            self._roiBoxSinceGl = box
+        else:
+            self._roiBoxSinceGl = (min(cur[0], box[0]), max(cur[1], box[1]),
+                                   min(cur[2], box[2]), max(cur[3], box[3]))
+
+    def _syncGlMeshIncremental(self, mesh, model) -> None:
+        """笔画期只把**变化区域**同步到 GPU 缓存（位置 z / 顶点法线 / map 底色）。
+
+        前置：同一网格实例、拓扑不变（styleKey 命中），且自上次同步以来的
+        高度改动都用 ``_roiBoxSinceGl`` 累计记录。全场 bincount 散射与地形
+        LUT 全场 gather 都是 O(V)（3000² 栅格 ~120ms/帧），拖动因此卡死；
+        这里改成只刷 ROI 顶点块（数量级 ~1e4），帧成本降到毫秒级。
+
+        ``_roiBoxSinceGl`` 缺失（撤销、整场操作、状态不明）时回退整份重算，
+        保证显示绝不落后于数据。
+        """
+        verts, vn, base, idx = self._glCache
+        box = self._roiBoxSinceGl
+        if box is not None:
+            pr0, pr1, pc0, pc1 = box      # 受影响的顶点块（含端）
+            # XY 不受高度编辑影响；z 只刷 ROI 块（整列 3D 步长拷贝 1M 行 ~8ms）
+            gny, gnx = mesh.gny, mesh.gnx
+            ids = (np.arange(pr0, pr1 + 1)[:, None] * gnx
+                   + np.arange(pc0, pc1 + 1)[None, :]).ravel()
+            verts[ids, 2] = np.ascontiguousarray(mesh.verts[ids, 2],
+                                                 dtype=np.float32)
+            wd = getattr(mesh, "wall_dup", None)
+            if wd is not None:
+                dsrc, ddup = wd
+                verts[ddup, 2] = verts[dsrc, 2]
+            self._updateVertexNormalsRoi(mesh, vn, pr0, pr1, pc0, pc1)
+            if model.display3DMode() == "map":
+                self._updateMapColorsRoi(mesh, base, pr0, pr1, pc0, pc1)
+            self._glRoiPending = (pr0, pr1, pc0, pc1, gnx)
+            self._scheduleReliefCacheRefresh()
+        elif self._geoDirtySinceGl:
+            # 兜底：有高度改动却没记录 ROI（状态不明）→ 整份重算，宁慢勿错
+            verts[:, 2] = mesh.verts[:, 2]
+            vn_full = self._scatterWallAware(mesh, mesh.normals)
+            vn_full /= np.maximum(
+                np.linalg.norm(vn_full, axis=1, keepdims=True), 1e-12)
+            vn[:] = vn_full
+            if model.display3DMode() == "map":
+                base[:] = self._baseColorsVert(mesh, model)
+            self._glBaseDirty = False
+        else:
+            verts[:, 2] = mesh.verts[:, 2]
+        self._glMeshKey = self._reliefMeshKey
+        self._roiBoxSinceGl = None
+        self._geoDirtySinceGl = False
+
+    def _updateVertexNormalsRoi(self, mesh, vn, pr0, pr1, pc0, pc1) -> None:
+        """顶点块 ``[pr0..pr1] × [pc0..pc1]``（含端）的顶点法线增量重算。
+
+        与 :meth:`_scatterFaceToVert` 整份散射击中逐位等价（含幕帘/悬崖硬边
+        复制顶点的角色分离）：用网格里**实际的面→顶点引用**（remap 之后）
+        在局部面块上做 bincount 平均，O(ROI) 而非 O(V)。
+        """
+        gny, gnx = mesh.gny, mesh.gnx
+        wd = getattr(mesh, "wall_dup", None)
+        V0 = mesh.verts.shape[0] - (0 if wd is None else wd[1].size)
+        h, w = pr1 - pr0 + 1, pc1 - pc0 + 1
+        if h <= 0 or w <= 0:
+            return
+        blk = vn[:V0].reshape(gny, gnx, 3)[pr0:pr1 + 1, pc0:pc1 + 1]
+        if wd is None:
+            # 无幕帘：顶点(i,j) 的邻接面恒为 (i-1,j-1),(i-1,j),(i,j-1),(i,j)，
+            # 用 4 次 2D 区块加即可（比按面散射的整除/取模+bincount 快 5 倍）
+            FN = mesh.normals.reshape(gny - 1, gnx - 1, 3)
+            acc = np.zeros((h, w, 3), dtype=np.float64)
+            cnt = np.zeros((h, w, 1), dtype=np.float64)
+            for di in (-1, 0):
+                fr0 = max(0, pr0 + di)
+                fr1 = min(gny - 1, pr1 + di + 1)
+                if fr1 <= fr0:
+                    continue
+                for dj in (-1, 0):
+                    fc0 = max(0, pc0 + dj)
+                    fc1 = min(gnx - 1, pc1 + dj + 1)
+                    if fc1 <= fc0:
+                        continue
+                    acc[fr0 - di - pr0:fr1 - di - pr0,
+                        fc0 - dj - pc0:fc1 - dj - pc0] += \
+                        FN[fr0:fr1, fc0:fc1]
+                    cnt[fr0 - di - pr0:fr1 - di - pr0,
+                        fc0 - dj - pc0:fc1 - dj - pc0] += 1.0
+            blk[:] = (acc / np.maximum(
+                np.linalg.norm(acc, axis=2, keepdims=True), 1e-12)
+            ).astype(np.float32)
+            return
+        fa0, fa1 = max(0, pr0 - 1), min(gny - 2, pr1)
+        fb0, fb1 = max(0, pc0 - 1), min(gnx - 2, pc1)
+        fb = mesh.faces.reshape(gny - 1, gnx - 1, 4)[fa0:fa1 + 1, fb0:fb1 + 1]
+        fn = mesh.normals.reshape(gny - 1, gnx - 1, 3)[fa0:fa1 + 1, fb0:fb1 + 1]
+        ids = fb.reshape(-1, 4).ravel()
+        nrep = np.repeat(fn.reshape(-1, 3), 4, axis=0)
+        r = ids // gnx
+        c = ids % gnx
+        ok = (r >= pr0) & (r <= pr1) & (c >= pc0) & (c <= pc1) & (ids < V0)
+        loc = (r[ok] - pr0) * w + (c[ok] - pc0)
+        acc = np.empty((h * w, 3), dtype=np.float64)
+        for ch in range(3):
+            acc[:, ch] = np.bincount(loc, weights=nrep[ok, ch], minlength=h * w)
+        cnt = np.bincount(loc, minlength=h * w).astype(np.float64)
+        acc /= np.maximum(np.linalg.norm(acc, axis=1, keepdims=True), 1e-12)
+        sel = (cnt > 0).reshape(h, w)
+        blk[sel] = acc.astype(np.float32).reshape(h, w, 3)[sel]
+        if wd is not None:
+            # 硬边复制顶点只被壁面引用：仅壁面参与平均（数量级为周长，很便宜）
+            wfsel = np.nonzero(mesh.wall_faces)[0]
+            fw = mesh.faces[wfsel].ravel()
+            nw = mesh.normals[wfsel].repeat(4, axis=0)
+            keep = fw >= V0
+            local = fw[keep] - V0
+            m = wd[1].size
+            a2 = np.empty((m, 3), dtype=np.float64)
+            for ch in range(3):
+                a2[:, ch] = np.bincount(local, weights=nw[keep, ch],
+                                        minlength=m)
+            a2 /= np.maximum(np.linalg.norm(a2, axis=1, keepdims=True), 1e-12)
+            vn[V0:V0 + m] = a2.astype(np.float32)
+
+    def _updateMapColorsRoi(self, mesh, base, pr0, pr1, pc0, pc1) -> None:
+        """map 模式底色 ROI 刷新：沿用上一次整份归一化区间 (lo, hi)。
+
+        笔画期不重算全场 min/max：峰值可能暂时顶到 LUT 高端色（视觉无感），
+        笔画停下 300ms 后由 :meth:`_onReliefCacheRefresh` 整份重刷到精确值。
+        """
+        norm = self._mapColorNorm
+        if norm is None:
+            return
+        lut = self._mapLutF32
+        if lut is None:
+            lut = shade.make_lut("terrain").astype(np.float32) / 255.0
+            self._mapLutF32 = lut
+        lo, hi = norm
+        gny, gnx = mesh.gny, mesh.gnx
+        wd = getattr(mesh, "wall_dup", None)
+        V0 = mesh.verts.shape[0] - (0 if wd is None else wd[1].size)
+        z = mesh.verts[:V0, 2].reshape(gny, gnx)[pr0:pr1 + 1, pc0:pc1 + 1]
+        if hi - lo < 1e-9:
+            vi = np.full(z.shape, 128, dtype=np.int32)
+        else:
+            vi = np.clip(((z - lo) / (hi - lo) * 255.0).astype(np.int32),
+                         0, 255)
+        blk = base[:V0].reshape(gny, gnx, 3)[pr0:pr1 + 1, pc0:pc1 + 1]
+        blk[:] = lut[vi]
+        if wd is not None:
+            base[V0:] = base[wd[0]]
+
+    def _scheduleReliefCacheRefresh(self, delay: int = 300) -> None:
+        """笔画增量同步后重启去抖定时器：停下后整份重刷底色/投影。
+
+        拖动期间定时器不断被重启 → 不做整份重算；松手 300ms 后触发一次，
+        把 map 底色的归一化区间与边框投影刷新到精确值。
+        """
+        t = self._reliefRefreshTimer
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._onReliefCacheRefresh)
+            self._reliefRefreshTimer = t
+        t.start(delay)
+
+    def _onReliefCacheRefresh(self) -> None:
+        self._glBaseDirty = True
+        # 笔画期推迟的高度归一化在这里补算（每场 min/max 一遍）
+        m = self._reliefMesh
+        if m is not None and self._hnormDirty:
+            hz = m.centers[:, 2]
+            lo, hi = float(hz.min()), float(hz.max())
+            if hi - lo < 1e-9:
+                m.hnorm[:] = 0.5
+            else:
+                m.hnorm[:] = (hz - lo) / (hi - lo)
+            self._hnormDirty = False
+        self._projKey = None      # 边框投影下一帧整份重算（笔画期用的是旧值）
+        self.update()
 
     def _lightParams(self, mode: str, material: str) -> dict:
         """着色器光照系数（与 mesh3d.colorFaces 一一对应）：ambient + 漫反射/高光。"""
@@ -2498,6 +2784,32 @@ class Viewport3D(QOpenGLWidget):
                 return None
         return model
 
+    def _reliefScreenRect(self, model, cam, w, h):
+        """浮雕模型在当前视角下的屏幕外接矩形：用于把参考图片压到模型下方。
+
+        取模型包围盒 8 个角点的投影极值；包围盒无效/投影失败时返回 None。
+        """
+        try:
+            bb = model.getBoundingBox()
+            if bb is None or not bb.isValid():
+                return None
+            xs, ys = [], []
+            for x in (bb.min.x, bb.max.x):
+                for y in (bb.min.y, bb.max.y):
+                    for z in (bb.min.z, bb.max.z):
+                        s = self._project((x, y, z), cam, w, h)
+                        if s is None:
+                            continue
+                        xs.append(s[0])
+                        ys.append(s[1])
+            if not xs:
+                return None
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            return QRectF(x0, y0, max(x1 - x0, 1.0), max(y1 - y0, 1.0))
+        except Exception:
+            return None
+
     def _reliefMeshFor(self, model, max_dim: int = None):
         """按 (版本, 放置, 垂直夸张, 固定网格密度) 缓存 3D 面网格。
 
@@ -2536,6 +2848,7 @@ class Viewport3D(QOpenGLWidget):
         # 记录本次网格对应的降采样源场（快照副本），供下一笔做脏区域差分
         self._meshSrcGrid = small.data.copy()
         self._meshSrcMeta = (id(model), plc, zexag, dim, int(model.curtainStamp()))
+        self._hnormDirty = False     # buildMesh 已算好 hnorm
         return mesh
 
     def _tryRoiMeshUpdate(self, model, dim, key, plc, zexag) -> bool:
@@ -2556,9 +2869,11 @@ class Viewport3D(QOpenGLWidget):
         if meta != (id(model), plc, zexag, dim, cstamp):
             return False
         hf = model.heightField()
-        ny, nx = hf.ny, hf.nx
-        step = 1 if max(ny, nx) <= dim else math.ceil(max(ny, nx) / dim)
-        g = hf.data[::step, ::step]
+        # 必须与 buildMesh 的取样**完全一致**（downsample 用 linspace 均匀取样且
+        # 必含末行末列，不是 [::step]）。旧实现用 [::step] 对比，一旦模型分辨率
+        # 超过显存档（dim）采样就系统性错位、几乎每格都"变化"→ 增量判定永远
+        # 失败、每帧回退全量重建（3000² 栅格 ≈1.3s/帧），塑形拖动因此卡死。
+        g = hf.downsample(dim).data
         if g.shape != src.shape:
             return False
         changed = g != src
@@ -2568,13 +2883,21 @@ class Viewport3D(QOpenGLWidget):
             return True
         if nchg > 0.6 * changed.size:
             return False                 # 大范围改动：全量重建更划算
-        ys, xs = np.nonzero(changed)
-        r0, r1 = int(ys.min()), int(ys.max()) + 1
-        c0, c1 = int(xs.min()), int(xs.max()) + 1
+        # 包围盒用行/列 any + argmax 推导：比 nonzero（生成两个等长索引数组）
+        # 省一半以上时间；笔画期每帧都要走这里，1M 格上的开销不可忽略
+        rows_any = changed.any(axis=1)
+        cols_any = changed.any(axis=0)
+        r0 = int(np.argmax(rows_any))
+        r1 = int(len(rows_any) - np.argmax(rows_any[::-1]))
+        c0 = int(np.argmax(cols_any))
+        c1 = int(len(cols_any) - np.argmax(cols_any[::-1]))
 
-        # 顶点 z 整列重写（向量化、便宜）；XY 不变
-        zflat = (g.astype(np.float64) * float(model.zExaggeration())).ravel()
-        m.verts[:zflat.size, 2] = zflat
+        gny, gnx = src.shape
+        # 顶点 z 只重写变化块；XY 不变（整列 1M 行 float64 转换+步长写 ~12ms/帧）
+        rids = np.arange(r0, r1)[:, None] * gnx + np.arange(c0, c1)[None, :]
+        zblk = (g[r0:r1, c0:c1].astype(np.float64)
+                * float(model.zExaggeration()))
+        m.verts[rids.ravel(), 2] = zblk.ravel()
         # 幕帘硬边复制顶点（wall_dup）与原顶点 XYZ 相同，Z 同步
         wd = getattr(m, "wall_dup", None)
         if wd is not None:
@@ -2617,11 +2940,22 @@ class Viewport3D(QOpenGLWidget):
                 dt = np.zeros(len(hn2))
                 dt[okc] = (hn2[okc] * dd[okc]).sum(axis=1) / (hln[okc] * dn[okc])
                 nsub[np.nonzero(cl)[0][dt < 0]] *= -1.0
-                # 与 buildMesh 同一模糊梯度朝向（楼梯锯齿抑制，壁面平滑）
+                # 与 buildMesh 同一模糊梯度朝向（楼梯锯齿抑制，壁面平滑）。
+                # 模糊是局部的（2 遍 5 格盒模糊 ≈ 邻域 ±8 格）：只把变化区域的
+                # 局部窗口喂进去，坐标改成窗口内偏移——整场 cumsum（1024²
+                # ≈18ms/帧）曾把笔画帧拖到 40ms+。窗口边界模式同为 edge，
+                # 且读点距窗口边 ≥8 格 → 与整场结果逐格一致（除非窗口被模型
+                # 边界截断，此时边界恰好也是整场边界，仍一致）。
                 gi = np.nonzero(cl)[0]
                 r_g = fr0 + gi // (fc1 - fc0)
                 c_g = fc0 + gi % (fc1 - fc0)
-                gx_c, gy_c = mesh3d._cliffGradientNormals(g, r_g, c_g)
+                pad = 10
+                wr0 = max(0, int(r_g.min()) - pad)
+                wr1 = min(g.shape[0] - 1, int(r_g.max()) + pad)
+                wc0 = max(0, int(c_g.min()) - pad)
+                wc1 = min(g.shape[1] - 1, int(c_g.max()) + pad)
+                gx_c, gy_c = mesh3d._cliffGradientNormals(
+                    g[wr0:wr1 + 1, wc0:wc1 + 1], r_g - wr0, c_g - wc0)
                 gln = np.hypot(gx_c, gy_c)
                 okg = gln > 1e-9
                 sel = gi[okg]
@@ -2646,18 +2980,16 @@ class Viewport3D(QOpenGLWidget):
         m.centers.reshape(gnyF, gnxF, 3)[fr0:fr1, fc0:fc1] = \
             (p00 + p01 + p11 + p10) * 0.25
 
-        # 高度归一化按整场 min/max（与 buildMesh 同义；量级小，整场重算）
-        hz = m.centers[:, 2]
-        lo, hi = float(hz.min()), float(hz.max())
-        if hi - lo < 1e-9:
-            m.hnorm[:] = 0.5
-        else:
-            m.hnorm[:] = (hz - lo) / (hi - lo)
+        # 高度归一化（整场 min/max）推迟到笔画停下后：全场重算 ~8ms/帧，
+        # 笔画期 hnorm 只影响软件路径的面色 LUT（GPU 路径不读），略微饱和无感
+        self._hnormDirty = True
 
         self._meshSrcGrid = g.copy()
         self._reliefMeshKey = key
+        # 记录本次受影响的**顶点块**（含端），供 GL 缓存做局部同步
+        self._noteRoiBox((max(0, fr0), min(m.gny - 1, fr1),
+                          max(0, fc0), min(m.gnx - 1, fc1)))
         return True
-        return mesh
 
     def _gpuMeshDim(self) -> int:
         """GPU 路径显示网格密度上限（设置页可调，默认 256）。
@@ -2682,6 +3014,13 @@ class Viewport3D(QOpenGLWidget):
         self._reliefMeshKey = None
         self._glCache = None
         self._glCacheKey = None
+        self._glMeshRef = None
+        self._glMeshKey = None
+        self._roiBoxSinceGl = None
+        self._geoDirtySinceGl = False
+        self._glBaseDirty = False
+        self._mapColorNorm = None
+        self._projKey = None
         if app_settings.gpu_accelerated:
             if self._gl is None:
                 self._gl = GLSurface()   # 下一次 paintGL 的 ensure() 会在正确 FBO 下建上下文
@@ -3798,6 +4137,64 @@ class Viewport3D(QOpenGLWidget):
         painter.setBrush(red)
         painter.drawPolygon(tri)
 
+    @staticmethod
+    def _affineFrom3(src, dst):
+        """求把源三角形映射到目标三角形的仿射 QTransform（四角贴图用）。
+        退化（共线/透视不可解）返回 None。"""
+        try:
+            A = [[s[0], s[1], 1.0] for s in src]
+            bx = [d[0] for d in dst]
+            by = [d[1] for d in dst]
+            solx = np.linalg.solve(A, bx)
+            soly = np.linalg.solve(A, by)
+        except Exception:
+            return None
+        # QTransform(m11,m12,m13, m21,m22,m23, dx,dy,m33)：
+        # x' = m11*x + m21*y + dx；y' = m12*x + m22*y + dy
+        return QTransform(solx[0], soly[0], 0.0,
+                          solx[1], soly[1], 0.0,
+                          solx[2], soly[2], 1.0)
+
+    def _drawImage3D(self, painter, obj, cam, w: float, h: float) -> None:
+        """参考图片：世界四角投影到屏幕，按两个三角形仿射贴图。
+        顶视时是精确的轴对齐贴图；透视下为分片仿射近似（参考底图足够）。
+        选中时叠加主题色描边框。"""
+        pm = obj.pixmap()
+        if pm is None or pm.isNull():
+            return
+        sp = [self._project((p.x, p.y, p.z), cam, w, h)
+              for p in obj.points()]
+        if any(s is None for s in sp):
+            return
+        iw = max(float(pm.width()), 1.0)
+        ih = max(float(pm.height()), 1.0)
+        # 世界角序（Y 向上）：0=左下 1=右下 2=右上 3=左上
+        bl, br, tr, tl = sp
+        tris = [
+            ((tl, tr, bl), ((0.0, 0.0), (iw, 0.0), (0.0, ih))),
+            ((tr, br, bl), ((iw, 0.0), (iw, ih), (0.0, ih))),
+        ]
+        base = painter.transform()
+        for dst, src in tris:
+            t = self._affineFrom3(src, dst)
+            if t is None:
+                continue
+            poly = QPolygonF([QPointF(p[0], p[1]) for p in dst])
+            clip = QPainterPath()
+            clip.addPolygon(poly)
+            painter.save()
+            painter.setClipPath(clip)
+            painter.setTransform(base * t)
+            # 注意：pm 是 QPixmap，必须用 drawPixmap（drawImage 只收 QImage）
+            painter.drawPixmap(QPointF(0.0, 0.0), pm)
+            painter.restore()
+        if obj.isSelected():
+            pen = QPen(QColor(theme.selectionColorFor(obj)), 2.0)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPolygon(QPolygonF([QPointF(p[0], p[1]) for p in sp]))
+
     def _drawObjects(self, painter, cam, w: float, h: float,
                      depthBuf=None, glBrepEdges: bool = False) -> None:
         """把文档对象投影绘制到 3D 视口。
@@ -3830,7 +4227,9 @@ class Viewport3D(QOpenGLWidget):
 
         def draw_lines(lines, pen):
             painter.setPen(pen)
-            if depthBuf is not None and lines:
+            # 浮雕模式：曲线始终画在模型之上（不做深度剔除）——
+            # 2D 曲线 z=0 会被浮雕模型表面完全遮挡，导致看不见
+            if depthBuf is not None and self._canvasMode != "relief" and lines:
                 # 模型遮挡曲线：被实体挡住的段**不画**（用户要求正常
                 # 遮挡；透视开时 depthBuf=None 全部可见）
                 visible, _hidden = self._filterHiddenLines(lines, depthBuf)
@@ -3841,6 +4240,30 @@ class Viewport3D(QOpenGLWidget):
             for ln in lines:
                 painter.drawLine(QPointF(ln[0], ln[1]),
                                  QPointF(ln[2], ln[3]))
+
+        # 参考图片先画（曲线/模型之下，同 2D 画布 z=-600 的垫底语义）。
+        # 浮雕模式例外：曲面是 GL 原生绘制、先于本 QPainter 叠加层，图片若
+        # 直接画会盖在模型上面。这里把模型屏幕范围挖空后再画图片，图片才
+        # 真正位于模型下方（模型外的部分仍正常可见、可选中、可移动）。
+        under_rect = None
+        if self._canvasMode == "relief":
+            tgt = self._reliefTarget()
+            if tgt is not None and hasattr(tgt, "heightField"):
+                under_rect = self._reliefScreenRect(tgt, cam, w, h)
+        for obj in self._doc.visibleObjects():
+            if obj.type() == ObjectType.IMAGE:
+                painter.save()
+                try:
+                    if under_rect is not None:
+                        reg = QRegion(0, 0, int(w), int(h))
+                        reg -= QRegion(under_rect.toAlignedRect())
+                        painter.setClipRegion(reg)
+                    self._drawImage3D(painter, obj, cam, w, h)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    painter.restore()
 
         for obj in self._doc.visibleObjects():
             selected = obj.isSelected()
@@ -3877,9 +4300,10 @@ class Viewport3D(QOpenGLWidget):
                     zbuf, zW, zH = depthBuf
                     sc = getattr(self, "_zbScale", 1.0)
                     ix, iy = int(p[0] * sc), int(p[1] * sc)
-                    if 0 <= iy < zH and 0 <= ix < zW \
-                            and p[2] > zbuf[iy][ix] + 1.0:
-                        continue    # 点被实体遮挡
+                    if (self._canvasMode != "relief"
+                            and 0 <= iy < zH and 0 <= ix < zW \
+                            and p[2] > zbuf[iy][ix] + 1.0):
+                        continue    # 点被实体遮挡（浮雕模式置顶不剔除）
                 painter.setPen(pen)
                 painter.setBrush(QColor(Qt.GlobalColor.white))
                 painter.drawEllipse(QPointF(p[0], p[1]), 3.0, 3.0)
@@ -4959,7 +5383,8 @@ class Viewport3D(QOpenGLWidget):
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        top = obj.topology(self._angularFor(obj, cam, w, h))
+        top = obj.topology(self._angularFor(obj, cam, w, h),
+                           edges_only=True)
         polys = top["edgePolylines"]
         if not polys:
             return
@@ -5368,8 +5793,11 @@ class Viewport3D(QOpenGLWidget):
                     pass
             return
         path = inst.previewPath()
-        if path is not None:
-            pen = QPen(QColor("#15b6c9"), 1.0, Qt.DashLine)
+        ppen = inst.previewPen()
+        if path is not None and ppen is not None:
+            # 与 2D 完全同一套预览画笔：直接复用命令预览图元的 pen，
+            # 线型/颜色/线宽全部由命令决定，这里不做改写，也不回退青色虚线。
+            pen = QPen(ppen)
             pen.setCosmetic(True)
             painter.setPen(pen)
             # 拍平为折线，支持预览中的圆弧等曲线元素（arcTo）。
@@ -5456,21 +5884,23 @@ class Viewport3D(QOpenGLWidget):
             seg = self._projectSegment((last.x, last.y, last.z),
                                        (cur.x, cur.y, cur.z), cam, w, h)
             if seg is not None:
-                pen = QPen(QColor("#15b6c9"), 1.5)
-                pen.setCosmetic(True)
-                painter.setPen(pen)
-                painter.drawLine(QPointF(*seg[0]), QPointF(*seg[1]))
+                # 尾段与 2D 预览用同一支画笔（逐点命令 = 实线 + 对象色）
+                ppen = inst.previewPen()
+                if ppen is not None:
+                    pen = QPen(ppen)
+                    pen.setCosmetic(True)
+                    painter.setPen(pen)
+                    painter.drawLine(QPointF(*seg[0]), QPointF(*seg[1]))
             if self._mode not in (2, 3):
                 return
         if self._mode == 2 or self._mode == 3:
             # 侧视拖拽型命令：路径 (x,y) 即视图平面 (u,v) →
             # 世界 (X,Z)（前视，y=0 平面）/ (Y,Z)（右视，x=0 平面）
             path = inst.previewPath()
-            if path is None:
-                return
             ppen = inst.previewPen()
-            pen = QPen(ppen) if ppen is not None \
-                else QPen(QColor("#15b6c9"), 1.0, Qt.DashLine)
+            if path is None or ppen is None:
+                return
+            pen = QPen(ppen)
             pen.setCosmetic(True)
             painter.setPen(pen)
             _Z = 100.0
@@ -5493,11 +5923,10 @@ class Viewport3D(QOpenGLWidget):
         if self._mode == 0 or self._mode == 1:
             # 拖拽型命令：预览路径落在构造平面上（z = drawZ）
             path = inst.previewPath()
-            if path is None:
-                return
             ppen = inst.previewPen()
-            pen = QPen(ppen) if ppen is not None \
-                else QPen(QColor("#15b6c9"), 1.0, Qt.DashLine)
+            if path is None or ppen is None:
+                return
+            pen = QPen(ppen)
             pen.setCosmetic(True)
             painter.setPen(pen)
             _Z = 100.0
@@ -5570,9 +5999,17 @@ class Viewport3D(QOpenGLWidget):
         # 浮雕模式全局 Ctrl+左键涂抹（堆料/去料，不限命令内——磨光进行中
         # 也可快速堆料/去料）：按下先"待定"，移动超阈值才成笔画，
         # 原地点击释放时仍走点选（Ctrl=追加/反选）
-        if event.button() == Qt.LeftButton \
-                and (event.modifiers() & Qt.KeyboardModifier.ControlModifier) \
-                and self._reliefModel is not None:
+        # 例外：活动命令声明使用 Ctrl+点击（如区域塑形 Ctrl=内岛参与）时，
+        # 由命令接管，不进入涂抹待定。
+        ctrl_smear = event.button() == Qt.LeftButton \
+            and (event.modifiers() & Qt.KeyboardModifier.ControlModifier) \
+            and self._reliefModel is not None
+        if ctrl_smear and self._cm is not None and self._cm.hasActive():
+            inst = self._cm.activeInstance()
+            claim = getattr(inst, "usesCtrlClick", None)
+            if callable(claim) and claim():
+                ctrl_smear = False
+        if ctrl_smear:
             self._smearPending = QPointF(event.position())
             self._smearMods = event.modifiers()
             event.accept()
@@ -5776,6 +6213,13 @@ class Viewport3D(QOpenGLWidget):
         cam = self._camera()
         best = None
         bestD = PICK_RADIUS
+        # 浮雕模式：模型覆盖的屏幕区域按"上层"处理，图片在那里不可拾取
+        #（图片画在模型下方、视觉上也看不见）；模型外的图片区域照常可选。
+        relief_rect = None
+        if self._canvasMode == "relief":
+            tgt = self._reliefTarget()
+            if tgt is not None and hasattr(tgt, "heightField"):
+                relief_rect = self._reliefScreenRect(tgt, cam, w, h)
         for obj in self._doc.visibleObjects():
             if obj.isLocked():
                 continue
@@ -5841,6 +6285,18 @@ class Viewport3D(QOpenGLWidget):
                     d = self._screenSegDist(mx, my, s1, s2)
                     if d < bestD:
                         best, bestD = obj, d
+                continue
+            if obj.type() == ObjectType.IMAGE:
+                # 参考图片：投影四边形内部命中（含边线小距离）。
+                # 浮雕模式下被模型盖住的部分按上层处理，不拾取图片。
+                if relief_rect is not None and \
+                        relief_rect.contains(QPointF(mx, my)):
+                    continue
+                sp = [self._project((p.x, p.y, p.z), cam, w, h)
+                      for p in obj.points()]
+                if all(s is not None for s in sp) and \
+                        self._pointInPoly(mx, my, [(s[0], s[1]) for s in sp]):
+                    best, bestD = obj, 0.0
                 continue
             isSurface = obj.type() == ObjectType.SURFACE
             if not isSurface and obj.type() == ObjectType.POLYCURVE:
@@ -6083,6 +6539,24 @@ class Viewport3D(QOpenGLWidget):
                     if _segIntersectsRect(QPointF(a[0], a[1]),
                                           QPointF(b[0], b[1]), sr):
                         return True
+            return False
+        if obj.type() == ObjectType.IMAGE:
+            # 参考图片：投影四角参与包含/相交判定（与 2D 同规则）
+            sp = [self._project((p.x, p.y, p.z), cam, w, h)
+                  for p in obj.points()]
+            poly = [(s[0], s[1]) for s in sp if s is not None]
+            if not poly:
+                return False
+            if leftToRight:
+                return all(sr.contains(QPointF(x, y)) for x, y in poly)
+            if any(sr.contains(QPointF(x, y)) for x, y in poly):
+                return True
+            for i in range(len(poly)):
+                a = QPointF(poly[i][0], poly[i][1])
+                b = QPointF(poly[(i + 1) % len(poly)][0],
+                            poly[(i + 1) % len(poly)][1])
+                if _segIntersectsRect(a, b, sr):
+                    return True
             return False
         isSurface = obj.type() == ObjectType.SURFACE
         pts = self._surfacePolyline(obj) if isSurface \
@@ -6620,6 +7094,8 @@ class Viewport3D(QOpenGLWidget):
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         angle = event.angleDelta().y() / 120.0
+        if app_settings.invert_wheel_zoom:
+            angle = -angle   # 设置中开启“反向滚轮缩放”
         factor = 1.2 ** -angle
         w, h = float(self.width()), float(self.height())
         if w < 2 or h < 2:

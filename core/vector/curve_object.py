@@ -87,11 +87,11 @@ class CurveObject(BaseObject):
                 self._sampledPoints = createControlPointBSpline(
                     pts, self._curveDegree, samples=100)
             else:
-                # 与画曲线预览一致：Catmull-Rom 过点插值。编辑控制点后
-                # 曲线保持原样风格，避免全局样条拟合对少点过冲/形状跳变
-                from ..spline_utils import catmullRom
+                # 与画曲线预览一致：cadcraft 式拟合点样条（NURBS 书第 9 章
+                # 全局插值）——编辑控制点后曲线与描图预览同一形状风格
+                from ..spline_utils import nurbs_fit_samples
                 n = max(len(pts) - 1, 1)
-                self._sampledPoints = catmullRom(pts, max(20, 100 // n))
+                self._sampledPoints = nurbs_fit_samples(pts, max(20, 100 // n))
             return True
         except Exception:
             self._sampledPoints = list(pts)

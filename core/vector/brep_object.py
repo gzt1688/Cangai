@@ -174,6 +174,10 @@ class BRepObject(BaseObject):
         """渲染网格 {verts, normals, tris, faceRanges}；按角步长缓存。"""
         if self._ps is None:
             return None
+        if self.inPreviewTransform():
+            # 交互预览中：对象级缓存持有预览前网格，直接旁路走 shape
+            # （shape 侧对待施加仿射做廉价 numpy 变换，不清缓存）
+            return self._ps.triangulate()
         key = round(angular, 4)
         cache = self._meshCache
         if isinstance(cache, dict) and key in cache:
@@ -231,28 +235,36 @@ class BRepObject(BaseObject):
 
     # ---------------- 拓扑枚举（P2 子元素拾取） ----------------
 
-    def topology(self, angular: float = 0.05) -> dict:
-        """拓扑缓存：faces（面点列）、faceRanges、edgePolylines、vertices。"""
+    def topology(self, angular: float = 0.05,
+                 edges_only: bool = False) -> dict:
+        """拓扑缓存：faces（面点列）、faceRanges、edgePolylines、vertices。
+
+        edges_only=True：只要 faceRanges+edgePolylines（渲染边线路径每帧
+        调用，跳过 faces/vertices 的逐三角 Point3D 构建——大网格每帧
+        数十万对象，实测 400ms+/帧）。预览态旁路对象级缓存（变换中）。
+        """
         if self._ps is None:
             return {"faces": [], "faceRanges": [], "edgePolylines": [],
                     "vertices": []}
+        preview = self.inPreviewTransform()
         key = round(angular, 4)
         cache = self._topoCache
-        if isinstance(cache, dict) and key in cache:
+        if not preview and isinstance(cache, dict) and key in cache:
             return cache[key]
-        mesh = self.mesh(key)
+        mesh = None if edges_only else self.mesh(key)
         ranges = list(mesh["faceRanges"]) if mesh is not None else []
         data = {
-            "faces": self._ps.facePoints(),
+            "faces": [] if edges_only else self._ps.facePoints(),
             "faceRanges": ranges,
             "edgePolylines": self._ps.featureEdgePolylines(),
-            "vertices": list(self._ps.verts()),
+            "vertices": [] if edges_only else list(self._ps.verts()),
         }
-        if not isinstance(self._topoCache, dict):
-            self._topoCache = {}
-        if len(self._topoCache) >= 3:
-            self._topoCache.pop(next(iter(self._topoCache)))
-        self._topoCache[key] = data
+        if not preview:
+            if not isinstance(self._topoCache, dict):
+                self._topoCache = {}
+            if len(self._topoCache) >= 3:
+                self._topoCache.pop(next(iter(self._topoCache)))
+            self._topoCache[key] = data
         return data
 
     def snapFeatures(self) -> list:
@@ -272,29 +284,57 @@ class BRepObject(BaseObject):
 
     # ---------------- 变换 ----------------
 
+    def inPreviewTransform(self) -> bool:
+        """是否处于交互预览态（B-Rep 变换只累积仿射，未烘焙进 Part）。"""
+        return isinstance(self._ps, BrepShape) and self._ps.inPreview()
+
+    def beginPreviewTransform(self) -> None:
+        """进入交互预览态（仅 B-Rep 内核生效；其余内核变换本就廉价）。"""
+        if isinstance(self._ps, BrepShape):
+            self._ps.beginPreview()
+
+    def commitPreviewTransform(self) -> bool:
+        """提交预览仿射：一次性烘焙进 Part 并使对象级缓存失效。"""
+        if isinstance(self._ps, BrepShape) and self._ps.commitPreview():
+            self._meshCache = None
+            self._topoCache = None
+            self._snapFeatCache = None
+            self._dirty = True
+            return True
+        return False
+
+    def discardPreviewTransform(self) -> None:
+        """丢弃预览仿射（取消拖动，恢复到进入预览前的几何）。"""
+        if isinstance(self._ps, BrepShape):
+            self._ps.discardPreview()
+
     def translate(self, dx: float, dy: float, dz: float) -> None:
         if self._ps is not None:
             self._ps.translate(dx, dy, dz)
             self._dirty = True
-            self._meshCache = None
-            self._topoCache = None
-            self._snapFeatCache = None
+            if not self.inPreviewTransform():
+                # 预览态不清缓存：shape 侧基准缓存仍有效，仿射在读取时施加
+                self._meshCache = None
+                self._topoCache = None
+                self._snapFeatCache = None
 
     def rotate(self, angle: float, ax: float, ay: float, az: float) -> None:
         if self._ps is not None:
             self._ps.rotate(angle, ax, ay, az)
             self._dirty = True
-            self._meshCache = None
-            self._topoCache = None
-            self._snapFeatCache = None
+            if not self.inPreviewTransform():
+                self._meshCache = None
+                self._topoCache = None
+                self._snapFeatCache = None
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
         if self._ps is not None:
             self._ps.scale(sx, sy, sz)
             self._dirty = True
-            self._meshCache = None
-            self._topoCache = None
-            self._snapFeatCache = None
+            if not self.inPreviewTransform():
+                self._meshCache = None
+                self._topoCache = None
+                self._snapFeatCache = None
 
     def getBoundingBox(self) -> BoundingBox3D:
         if self._ps is None:

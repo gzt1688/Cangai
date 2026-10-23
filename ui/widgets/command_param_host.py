@@ -69,7 +69,7 @@ class CommandParamHost(QWidget):
         holder = QWidget()
         holder.setLayout(self._contentLayout)
         self._scroll.setWidget(holder)
-        root.addWidget(self._scroll)
+        root.addWidget(self._scroll, 1)   # stretch：恒占满剩余高度
         self._scroll.hide()
 
         self._noCommandLabel = QLabel("无活动命令")

@@ -665,17 +665,18 @@ class ThreadCommand(CommandInstance):
             try:
                 p = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL, env=env,
+                    stderr=subprocess.PIPE, env=env,
                     creationflags=0x08000000)   # CREATE_NO_WINDOW
             except Exception:
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, env=env)
+                                     stderr=subprocess.PIPE, env=env)
             try:
-                out, _ = p.communicate(timeout=240)
+                out, errout = p.communicate(timeout=240)
             except subprocess.TimeoutExpired:
                 p.kill()
                 return None, "子进程超时（240s）"
             text = out.decode("utf-8", "replace").strip()
+            errtxt = errout.decode("utf-8", "replace").strip()
             line = ""
             for ln in reversed(text.splitlines()):
                 if ln.startswith("{"):
@@ -687,10 +688,15 @@ class ThreadCommand(CommandInstance):
                     status = json.loads(line)
                 except Exception:
                     status = None
+            # stderr 尾行带上：worker 缺失/导入失败时「无有效输出」有下半句
+            # （如 [watchdog] script not found: ..._thread_bg.py）
+            tail = errtxt.splitlines()[-1][:200] if errtxt else ""
             if status is None:
-                return None, "worker 无有效输出"
+                return None, ("worker 无有效输出：%s" % tail if tail
+                              else "worker 无有效输出")
             if not status.get("ok"):
-                return None, str(status.get("err", "子进程失败"))
+                err = str(status.get("err", "子进程失败"))
+                return None, (err + " | " + tail) if tail else err
             return out_path, None
         except Exception as e:
             return None, f"{type(e).__name__}: {e}"

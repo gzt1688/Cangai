@@ -1,0 +1,8 @@
+{
+  "id": "cookie_cutter",
+  "name": "模具",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "闭合曲线生成饼干外切模实体（刀壁/加强带/裙边/顶部斜口）。私有插件：进版本库、开发运行装载，不随公共版打包发布。",
+  "entry": "main.py"
+}

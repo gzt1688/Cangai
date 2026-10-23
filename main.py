@@ -129,11 +129,19 @@ qInstallMessageHandler(_qt_msg_handler)
 from PySide6.QtWidgets import QApplication, QStyleFactory
 from PySide6.QtGui import QIcon
 from resource_path import resource_path
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer
 
 from core import app_settings
-from i18n import setLanguage
-from ui.windows.mainWindow import MainWindow
+from i18n import setLanguage, tr
+
+
+def _startup_file_arg() -> str:
+    """取命令行里要打开的工程文件（双击关联后 Windows 会传入路径）。"""
+    for a in sys.argv[1:]:
+        if a and not a.startswith("-") and os.path.isfile(a) \
+                and a.lower().endswith((".cai", ".cag")):
+            return os.path.abspath(a)
+    return ""
 
 
 def main() -> None:
@@ -145,8 +153,38 @@ def main() -> None:
     # 注意：Qt 6 / PySide6 默认已开启高 DPI 支持，不必再设置
     # AA_UseHighDpiPixmaps（该属性在 Qt 6.5+ 被标记为 deprecated，
     # 调用 setAttribute 会触发 DeprecationWarning，这里彻底跳过）。
+
+    # 启动加载页：先于主窗口显示并喂进度，所有重模块预热完成后才进入主界面
+    from ui.widgets.splash import SplashScreen
+    splash = SplashScreen()
+    splash.setLoadProgress(2, tr("正在初始化界面…"))
+    splash.show()
+    app.processEvents()
+
+    # 主窗口模块涉及较多 UI/几何导入，延后到加载页已显示之后再导入
+    from ui.windows.mainWindow import MainWindow
     win = MainWindow()
-    win.show()
+    win.startupProgress.connect(splash.setLoadProgress)
+
+    entered = {"done": False}
+
+    def _enterMainWindow() -> None:
+        if entered["done"]:
+            return
+        entered["done"] = True
+        win.show()
+        splash.finish(win)
+        # 双击 .cai（文件关联）时命令行带路径：主窗口显示后载入该工程
+        _pending = _startup_file_arg()
+        if _pending:
+            QTimer.singleShot(0, lambda: win._openFileAsDocument(_pending))
+        # 3D 内核（build123d/OCP）已在加载页内预热完毕，这里不再重复触发；
+        # 仅当加载页异常兜底提前进入时，_ensure3DKernel 才作为补位入口。
+
+    win.startupFinished.connect(_enterMainWindow)
+    # 兜底：预载线程若异常卡住，90 秒后强制进入主界面，避免永久停在加载页
+    QTimer.singleShot(90_000, _enterMainWindow)
+    win.beginStartupPreload()
     sys.exit(app.exec())
 
 

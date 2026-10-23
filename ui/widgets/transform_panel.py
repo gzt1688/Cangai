@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                 QDialog, QFormLayout, QDialogButtonBox)
 from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtGui import QMouseEvent
+import numpy as np
 import ui.styles.theme as theme
 from resource_path import resource_path
 from core.vector.geometry_types import ObjectType, Point3D
@@ -47,8 +48,10 @@ def _makeLabel(text: str, width: int = -1, style: str = "") -> QLabel:
     return lbl
 
 
-# 工具行按钮统一尺寸：镜像三键与标注三键同宽同高、行首对齐
-_BTN_W = 58
+# 工具行按钮统一尺寸：镜像三键与标注三键同宽同高、行首对齐。
+# 左右边距收紧（全局按钮 padding 较大，固定宽度下"XY标注"等 4 字会被裁）
+_BTN_PAD_QSS = "QPushButton { padding: 1px 2px; }"
+_BTN_W = 62
 _BTN_H = 26
 
 
@@ -57,6 +60,7 @@ def _makeToolButton(text: str, tip: str = "") -> QPushButton:
     btn = QPushButton(text)
     btn.setFixedHeight(_BTN_H)
     btn.setFixedWidth(_BTN_W)
+    btn.setStyleSheet(_BTN_PAD_QSS)
     if tip:
         btn.setToolTip(tip)
         btn.setAttribute(Qt.WA_AlwaysShowToolTips, True)
@@ -74,6 +78,7 @@ class LeftRightPushButton(QPushButton):
         super().__init__(text, parent)
         self.setFixedHeight(_BTN_H)
         self.setFixedWidth(_BTN_W)
+        self.setStyleSheet(_BTN_PAD_QSS)
         if tip:
             self.setToolTip(tip)
             self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
@@ -124,7 +129,7 @@ def _makeSpinBox(width: int = 80, rng: float = 99999, decimals: int = 2) -> QDou
 
 class TransformPanel(QWidget):
     mirrorRequested = Signal(str)      # "X" / "Y" / "Z"
-    zHeightCommitRequested = Signal(float)  # “模型Z”确认：目标高度值（缩放高度场）
+    zHeightCommitRequested = Signal(float)  # “模型Z”确认：目标 Z 尺寸（最高点-最低点）
     zClipRequested = Signal(float, float)   # “限高保底”：clip 高度场到 [z_min, z_max]
     dimensionRequested = Signal(str)   # 标注："xy" / "align" / "z"
     dimensionTextBiggerRequested = Signal()    # 放大选中标注的读数文字
@@ -146,6 +151,7 @@ class TransformPanel(QWidget):
         super().__init__()
         self._selectedObjectId: Optional[str] = None
         self._selectedObject = None      # 当前选中对象引用（标注绑定开关状态用）
+        self._selection: list = []       # 当前全部选中对象（尺寸输入按整体包围盒处理）
         self._doc = None                 # 写回浮雕显示参数用（notifyObjectChanged）
         self._reliefObj = None           # 当前选中的浮雕模型（非 SURFACE 为 None）
         self._pinnedRelief = None        # 浮雕模式锁定的编辑目标（与选中解耦）
@@ -283,6 +289,7 @@ class TransformPanel(QWidget):
         bindBtn = QPushButton(tr("绑定"))
         bindBtn.setFixedHeight(_BTN_H)
         bindBtn.setFixedWidth(_BTN_W)
+        bindBtn.setStyleSheet(_BTN_PAD_QSS)
         bindBtn.setCheckable(True)
         bindBtn.setAttribute(Qt.WA_AlwaysShowToolTips, True)
         bindBtn.clicked.connect(self.dimensionBindToggled.emit)
@@ -509,6 +516,9 @@ class TransformPanel(QWidget):
         # 信号连接曾丢失致“确认”变死键（2026-09-20 修复）：
         # 按钮 clicked → _onReliefZCommit → zHeightCommitRequested
         self._zCommitBtn.clicked.connect(self._onReliefZCommit)
+        # 改完数值直接回车/失去焦点即生效（用户反馈“改了数值不起作用”，
+        # 只点确认才生效不符合预期）；再次触发确认时因子为 1 自动跳过。
+        self._zHeightSpin.editingFinished.connect(self._onReliefZCommit)
         zhb.addWidget(self._zCommitBtn)
         zhb.addStretch()
         rl.addWidget(self._zHeightBox)
@@ -560,7 +570,7 @@ class TransformPanel(QWidget):
             rl.addWidget(sp)
             uc = QCheckBox(tr("等比"))
             uc.setFixedHeight(26)
-            # 勾选等比 = 该轴被动跟随其他轴，输入框变灰不可输入（参考 Rhino）
+            # 勾选等比 = 该轴为主动轴，其余两轴被动跟随（三轴互斥，输入框变灰）
             uc.stateChanged.connect(self._updateRatioLockState)
             self._uniformChecks.append(uc)
             rl.addWidget(uc)
@@ -622,10 +632,19 @@ class TransformPanel(QWidget):
         axis: 0=X, 1=Y, 2=Z
         opt: 0=最小, 1=中间, 2=最大
         例：双击 Z 最小 → 物体 Z 最小值移到 Z=0；双击 X 最大 → X 最大值移到 X=0。
+        浮雕模式下双击 Z 最小/最大 → 整体平移当前编辑模型的高度场数值。
         """
         if self._doc is None:
             return
-        sel = self._doc.selectedObjects()
+        if axis == 2 and self._canvasMode == "relief":
+            model = self._pinnedRelief
+            if model is None:
+                model = next((o for o in self._doc.selectedObjects()
+                              if o.type() == ObjectType.SURFACE), None)
+            if model is not None:
+                self._shiftReliefHeight(model, opt)
+                return
+        sel = list(self._doc.selectedObjects())
         if not sel:
             return
         bb = None
@@ -652,6 +671,29 @@ class TransformPanel(QWidget):
             for obj in sel:
                 obj.translate(dx, dy, dz)
                 self._doc.notifyObjectChanged(obj.id())
+        finally:
+            self._doc.endEdit()
+
+    def _shiftReliefHeight(self, model, opt: int) -> None:
+        """浮雕模型整体上下移动：直接给高度场每个采样点加同一个 dz。
+
+        移动是刚体平移，形状与 XY 不变；移动后高度场数值本身随之改变
+        （例如最低点 -3 的模型按 Z 最小对齐后，场最小值变为 0）。
+        opt: 0=最低点、1=中点、2=最高点 落到 Z=0。
+        """
+        data = model.heightField().data
+        if data.size == 0:
+            return
+        lo = float(data.min())
+        hi = float(data.max())
+        dz = -lo if opt == 0 else (-hi if opt == 2 else -(lo + hi) * 0.5)
+        if abs(dz) < 1e-9:
+            return
+        self._doc.beginEdit()
+        try:
+            model.heightField().setData(data.astype(np.float64) + dz)
+            model.bumpVersion()
+            self._doc.notifyObjectChanged(model.id())
         finally:
             self._doc.endEdit()
 
@@ -781,23 +823,61 @@ class TransformPanel(QWidget):
         return None
 
     def showObject(self, obj) -> None:
+        """兼容单对象调用：等价于只选中该对象。"""
+        self.showObjects([obj] if obj is not None else [])
+
+    def showObjects(self, objs) -> None:
+        """回填尺寸输入框：多选时按选中对象的**整体**包围盒显示尺寸。
+
+        尺寸输入提交时也按整体包围盒缩放，保证输入值与整体尺寸一致；
+        需要“以某个对象为准、其余同比例跟随”时，请用缩放命令参数面板的
+        对象模式。
+        """
+        self._selection = list(objs) if objs else []
+        obj = self._selection[0] if self._selection else None
         self._selectedObject = obj
         self._updateBindButtonState(obj)
         if obj is None:
             self._selectedObjectId = None
-            for sp in self._sizeSpins:
-                sp.setValue(0)
+            self._syncSizeSpins()
             self._updateRatioLockState()
             self._showReliefBox(self._reliefBoxTarget(None))
             return
         self._selectedObjectId = obj.id()
-        bb = obj.getBoundingBox()
-        if bb.isValid():
-            self._sizeSpins[0].setValue(bb.width())
-            self._sizeSpins[1].setValue(bb.height())
-            self._sizeSpins[2].setValue(bb.depth())
+        self._syncSizeSpins()
         self._updateRatioLockState()
         self._showReliefBox(self._reliefBoxTarget(obj))
+
+    def _syncSizeSpins(self) -> None:
+        self._updatingSize = True
+        try:
+            bb = self._selectionBBox()
+            if bb is None or not bb.isValid():
+                for sp in self._sizeSpins:
+                    sp.setValue(0)
+            else:
+                self._sizeSpins[0].setValue(bb.width())
+                self._sizeSpins[1].setValue(bb.height())
+                self._sizeSpins[2].setValue(bb.depth())
+        finally:
+            self._updatingSize = False
+
+    def _selectionBBox(self):
+        """当前全部选中对象的合并包围盒；无有效包围盒时返回 None。"""
+        bb = None
+        for obj in self._selection:
+            try:
+                objBB = obj.getBoundingBox()
+            except Exception:
+                continue
+            if not objBB.isValid():
+                continue
+            if bb is None:
+                bb = objBB
+            else:
+                bb.expand(objBB.min)
+                bb.expand(objBB.max)
+        return bb
 
     def _updateRatioLockState(self) -> None:
         """等比 / 锁定联动：参考 Rhino 插件 TransformUI.cs。
@@ -808,10 +888,28 @@ class TransformPanel(QWidget):
         - 浮雕模型 Z 不可经 2D 变换改（恒禁用，覆盖等比状态）；
         - 等比 checkbox 本身始终可用（方便切换）；
         - 锁定 checkbox 不影响输入框启用状态，仅在提交时控制该轴 sx=1。
+        - 三个“等比”互斥：至多一个勾选（勾选新的自动取消其它两个）。
         """
+        # 互斥：保留本次点击的那个，其余取消（blockSignals 防止递归触发）
+        src = self.sender()
+        keep = None
+        if isinstance(src, QCheckBox) and src in self._uniformChecks \
+                and src.isChecked():
+            keep = self._uniformChecks.index(src)
+        checked = [i for i, uc in enumerate(self._uniformChecks) if uc.isChecked()]
+        if len(checked) > 1:
+            if keep is None:
+                keep = checked[0]
+            for i in checked:
+                if i == keep:
+                    continue
+                uc = self._uniformChecks[i]
+                uc.blockSignals(True)
+                uc.setChecked(False)
+                uc.blockSignals(False)
         anyRatio = any(uc.isChecked() for uc in self._uniformChecks)
-        isReliefZ = (self._selectedObject is not None
-                     and self._selectedObject.type() == ObjectType.SURFACE)
+        isReliefZ = bool(self._selection) and all(
+            o.type() == ObjectType.SURFACE for o in self._selection)
         for j, sp in enumerate(self._sizeSpins):
             if j == 2 and isReliefZ:
                 sp.setEnabled(False)
@@ -853,11 +951,11 @@ class TransformPanel(QWidget):
         """
         if self._updatingSize or self._doc is None:
             return
-        obj = self._selectedObject
-        if obj is None:
+        targets = [o for o in self._selection if o is not None]
+        if not targets:
             return
-        oldBB = obj.getBoundingBox()
-        if not oldBB.isValid():
+        oldBB = self._selectionBBox()
+        if oldBB is None or not oldBB.isValid():
             return
         oldDims = [oldBB.width(), oldBB.height(), oldBB.depth()]
         newDims = [self._sizeSpins[0].value(),
@@ -893,29 +991,26 @@ class TransformPanel(QWidget):
                     sFactors[j] = (newDims[j] / oldDims[j]
                                    if oldDims[j] > 1e-9 else 1.0)
         # 浮雕模型 Z 不可经 2D 变换改
-        if obj.type() == ObjectType.SURFACE:
+        reliefOnly = all(o.type() == ObjectType.SURFACE for o in targets)
+        if reliefOnly:
             sFactors[2] = 1.0
         # 防止零或负值
         sFactors = [max(s, 1e-6) if s > 0 else 1.0 for s in sFactors]
         sx, sy, sz = sFactors
-        # 绕变换基点缩放
+        # 绕变换基点缩放（多选时整体绕合并包围盒的基点缩放）
         center = self._computeOriginCenter(oldBB)
         self._doc.beginEdit()
         try:
-            obj.scaleAround(sx, sy, sz, center)
-            self._doc.notifyObjectChanged(obj.id())
+            for obj in targets:
+                if obj.type() == ObjectType.SURFACE:
+                    obj.scaleAround(sx, sy, 1.0, center)   # 浮雕 Z 不变
+                else:
+                    obj.scaleAround(sx, sy, sz, center)
+                self._doc.notifyObjectChanged(obj.id())
         finally:
             self._doc.endEdit()
         # 回填 sizeSpins 反映缩放后真实尺寸（防止用户输入的值与等比/锁定结果不一致）
-        self._updatingSize = True
-        try:
-            newBB = obj.getBoundingBox()
-            if newBB.isValid():
-                self._sizeSpins[0].setValue(newBB.width())
-                self._sizeSpins[1].setValue(newBB.height())
-                self._sizeSpins[2].setValue(newBB.depth())
-        finally:
-            self._updatingSize = False
+        self._syncSizeSpins()
 
     def _updateBindButtonState(self, obj) -> None:
         """同步“绑定”开关：状态一目了然，不出现“无缘由的灰色”。
@@ -1001,13 +1096,14 @@ class TransformPanel(QWidget):
         self._updateReliefEnabled()
 
     def _refreshZHeightSpin(self, model) -> None:
-        """回填“模型Z”为当前最高高度（最低点在 Z=0 时即模型整体高度）。
+        """回填“模型Z”为当前最高点到最低点的 Z 尺寸（不是 Z 正方向尺寸）。
 
-        输入框始终可编辑（平面模型显示 0，用户可直接键入目标高度）；
+        输入框始终可编辑（平面模型显示 0，用户可直接键入目标尺寸）；
         确认按钮仅当模型当前确有高度（可缩放）时启用。
         """
         try:
-            cur = float(model.heightField().data.max())
+            data = model.heightField().data
+            cur = float(data.max() - data.min()) if data.size else 0.0
         except Exception:
             cur = 0.0
         if cur < 0.0:
@@ -1189,14 +1285,17 @@ class TransformPanel(QWidget):
 
     def _updateMeshHeightColorStyle(self) -> None:
         """高度色按钮样式：开=主色亮背景白字，关=暗背景灰字。"""
+        # padding 0：固定 46px 宽下"高度色"三字才能完整显示（默认内边距会裁字）
         if self._meshHeightColorBtn.isChecked():
             self._meshHeightColorBtn.setStyleSheet(
                 "QPushButton { background: #15b6c9; color: white;"
-                " border: none; border-radius: 3px; font-size: 12px; }")
+                " border: none; border-radius: 3px; font-size: 12px;"
+                " padding: 0px; }")
         else:
             self._meshHeightColorBtn.setStyleSheet(
                 "QPushButton { background: #888; color: #ddd;"
-                " border: 1px solid #999; border-radius: 3px; font-size: 12px; }")
+                " border: 1px solid #999; border-radius: 3px; font-size: 12px;"
+                " padding: 0px; }")
 
     def setMeshHeightColor(self, on: bool) -> None:
         """从外部回填高度色开关状态。"""
@@ -1208,11 +1307,13 @@ class TransformPanel(QWidget):
         if self._solidPerspectiveBtn.isChecked():
             self._solidPerspectiveBtn.setStyleSheet(
                 "QPushButton { background: #15b6c9; color: white;"
-                " border: none; border-radius: 3px; font-size: 12px; }")
+                " border: none; border-radius: 3px; font-size: 12px;"
+                " padding: 0px; }")
         else:
             self._solidPerspectiveBtn.setStyleSheet(
                 "QPushButton { background: #888; color: #ddd;"
-                " border: 1px solid #999; border-radius: 3px; font-size: 12px; }")
+                " border: 1px solid #999; border-radius: 3px; font-size: 12px;"
+                " padding: 0px; }")
 
     def setSolidPerspective(self, on: bool) -> None:
         """从外部回填透视开关状态。"""

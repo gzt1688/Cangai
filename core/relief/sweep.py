@@ -150,59 +150,61 @@ def compute_sweep_delta(hf, poly: np.ndarray, params: SweepParams,
     if total < 1e-9:
         return delta
 
-    margin = D                        # 笔刷可达范围（cutoff 最大 D/2，取整直径余量）
     ox, oy = hf.origin
     sp = hf.spacing
     xs = ox + np.arange(nx, dtype=np.float64) * sp
     ys = oy + np.arange(ny, dtype=np.float64) * sp
 
-    row_lo = max(0, int(np.floor((ay.min() - margin - oy) / sp)))
-    row_hi = min(ny - 1, int(np.ceil((ay.max() + margin - oy) / sp)))
-    col_lo = max(0, int(np.floor((ax.min() - margin - ox) / sp)))
-    col_hi = min(nx - 1, int(np.ceil((ax.max() + margin - ox) / sp)))
+    # 覆盖范围：由全部段端点（起点 ax/ay 与终点 bx/by）± 直径余量得到，逐段
+    # footprint 再裁剪到该范围内。含终点可避免开放导动线末段末端漏盖章——旧
+    # 实现仅用起点 ax/ay，漏掉了只存在于终点里的最后一个端点，导致末段末端
+    # 附近一小片区域 delta 恒 0（已修正）。
+    margin = D
+    seg_xmin = float(min(ax.min(), bx.min()))
+    seg_xmax = float(max(ax.max(), bx.max()))
+    seg_ymin = float(min(ay.min(), by.min()))
+    seg_ymax = float(max(ay.max(), by.max()))
+    row_lo = max(0, int(np.floor((seg_ymin - margin - oy) / sp)))
+    row_hi = min(ny - 1, int(np.ceil((seg_ymax + margin - oy) / sp)))
+    col_lo = max(0, int(np.floor((seg_xmin - margin - ox) / sp)))
+    col_hi = min(nx - 1, int(np.ceil((seg_xmax + margin - ox) / sp)))
 
+    # 逐段盖章：每段只在其作用可达范围（沿段两端各 ±cut）内计算最近距离，
+    # 取代“逐行 × 全列 × 附近段”的暴力扫描（后者对横跨整幅网格的导动线要
+    # 逐行扫全宽，是长导动线在大网格上的主瓶颈）。cut 取最大可能半径 D/2
+    # （w≤1，故任意沿程粗细的 cutoff 都不超过它）；段范围外的格子 d≥cut，
+    # 截面恒为 0，不影响结果。逐段按升序 + 严格 '<' 更新，与旧实现“块内
+    # argmin、跨块严格比较”的并列取最小段号语义完全一致。
+    cut = D * 0.5
     best_d2 = np.full((ny, nx), np.inf)
     best_t = np.zeros((ny, nx))
-    seg_y_min = np.minimum(ay, by)
-    seg_y_max = np.maximum(ay, by)
-    seg_x_min = np.minimum(ax, bx)
-    seg_x_max = np.maximum(ax, bx)
-
-    chunk = 64
-    for r in range(row_lo, row_hi + 1):
-        wy = ys[r]
-        # 该行附近的段：y 范围与 [wy-margin, wy+margin] 相交
-        sel = np.nonzero((seg_y_min <= wy + margin) &
-                         (seg_y_max >= wy - margin))[0]
-        if sel.size == 0:
+    axl = ax.tolist(); ayl = ay.tolist(); bxl = bx.tolist(); byl = by.tolist()
+    abxl = abx.tolist(); abyl = aby.tolist()
+    sinvl = inv_len2.tolist(); slenl = seglen.tolist(); cuml = cum.tolist()
+    for i in range(len(axl)):
+        sxi = axl[i]; syi = ayl[i]
+        exi = bxl[i]; eyi = byl[i]
+        c0 = max(col_lo, int(math.floor((min(sxi, exi) - cut - ox) / sp)))
+        c1 = min(col_hi, int(math.ceil((max(sxi, exi) + cut - ox) / sp)))
+        r0 = max(row_lo, int(math.floor((min(syi, eyi) - cut - oy) / sp)))
+        r1 = min(row_hi, int(math.ceil((max(syi, eyi) + cut - oy) / sp)))
+        if c0 > c1 or r0 > r1:
             continue
-        cols = np.arange(col_lo, col_hi + 1)
-        if cols.size == 0:
-            continue
-        px = xs[cols]
-        d2_best = np.full(cols.size, np.inf)
-        t_best = np.zeros(cols.size)
-        col_ix = np.arange(cols.size)
-        for s0 in range(0, sel.size, chunk):
-            idx = sel[s0:s0 + chunk]
-            sx = ax[idx]; sy = ay[idx]
-            sabx = abx[idx]; saby = aby[idx]
-            sinv = inv_len2[idx]; slen = seglen[idx]; scum = cum[idx]
-            apx = px[:, None] - sx[None, :]
-            apy = wy - sy[None, :]
-            t = np.clip((apx * sabx[None, :] + apy * saby[None, :]) * sinv[None, :],
-                        0.0, 1.0)
-            dx = px[:, None] - (sx[None, :] + t * sabx[None, :])
-            dy = wy - (sy[None, :] + t * saby[None, :])
-            d2 = dx * dx + dy * dy
-            tnorm = (scum[None, :] + t * slen[None, :]) / total
-            k = d2.argmin(axis=1)                  # 块内最近段
-            dmin = d2[col_ix, k]
-            improved = dmin < d2_best
-            d2_best = np.where(improved, dmin, d2_best)
-            t_best = np.where(improved, tnorm[col_ix, k], t_best)
-        best_d2[r, cols] = d2_best
-        best_t[r, cols] = t_best
+        px = xs[c0:c1 + 1]
+        wy = ys[r0:r1 + 1]
+        abxi = abxl[i]; abyi = abyl[i]
+        apx = px[None, :] - sxi
+        apy = wy[:, None] - syi
+        t = np.clip((apx * abxi + apy * abyi) * sinvl[i], 0.0, 1.0)
+        dx = px[None, :] - (sxi + t * abxi)
+        dy = wy[:, None] - (syi + t * abyi)
+        d2 = dx * dx + dy * dy
+        tnorm = (cuml[i] + t * slenl[i]) / total
+        blk_d2 = best_d2[r0:r1 + 1, c0:c1 + 1]
+        blk_t = best_t[r0:r1 + 1, c0:c1 + 1]
+        improved = d2 < blk_d2
+        best_d2[r0:r1 + 1, c0:c1 + 1] = np.where(improved, d2, blk_d2)
+        best_t[r0:r1 + 1, c0:c1 + 1] = np.where(improved, tnorm, blk_t)
 
     # 有最近距离的格子统一算截面
     near = np.isfinite(best_d2)
@@ -252,29 +254,33 @@ def compute_sweep_delta(hf, poly: np.ndarray, params: SweepParams,
     return delta
 
 
-def compute_brush_stamp(hf, cx: float, cy: float, params: SweepParams) -> np.ndarray:
-    """以 (cx, cy) 为中心的单次笔刷增量场 (ny, nx)（涂抹/雕刻一笔的印章）。
+def _brush_stamp_roi(hf, cx: float, cy: float, params: SweepParams):
+    """计算单次笔刷印章的**局部**增量（只覆盖笔刷外接矩形，不分配整场）。
 
-    截面与导动相同（高斯/锥体/半球，w=1 无沿程调制）；负高度即雕刻
-    （去除材料）。作用范围（颜色裁剪）由调用方处理。
+    返回 ``(row0, row1, col0, col1, prof)``：prof 为 float64 的
+    ``(row1-row0+1, col1-col0+1)`` 增量，直接对应
+    ``hf.data[row0:row1+1, col0:col1+1]``。无影响（高度为 0 / 完全在模型外）
+    返回 None。
+
+    塑形 drag 每帧要盖多章：旧实现每章都新建 (ny, nx) 的 float64 全零场，
+    3000² 场单章 ~54ms（颜色裁剪 ~106ms），拖动直接卡死；局部化后成本只随
+    笔刷直径与栅格间距变化，与模型图幅无关。
     """
-    ny, nx = hf.ny, hf.nx
-    delta = np.zeros((ny, nx), dtype=np.float64)
     D = max(float(params.diameter), 1e-6)
     dH = min(max(float(params.half_life_diameter), 0.0), D)
     H = abs(float(params.height))
     if H < 1e-9:
-        return delta
+        return None
     ln2 = math.log(2.0)
     r = D * 0.5
     ox, oy = hf.origin
     sp = hf.spacing
     col_lo = max(0, int(math.floor((cx - r - ox) / sp)))
-    col_hi = min(nx - 1, int(math.ceil((cx + r - ox) / sp)))
+    col_hi = min(hf.nx - 1, int(math.ceil((cx + r - ox) / sp)))
     row_lo = max(0, int(math.floor((cy - r - oy) / sp)))
-    row_hi = min(ny - 1, int(math.ceil((cy + r - oy) / sp)))
+    row_hi = min(hf.ny - 1, int(math.ceil((cy + r - oy) / sp)))
     if col_lo > col_hi or row_lo > row_hi:
-        return delta
+        return None
 
     ys = oy + np.arange(row_lo, row_hi + 1, dtype=np.float64) * sp
     xs = ox + np.arange(col_lo, col_hi + 1, dtype=np.float64) * sp
@@ -302,6 +308,20 @@ def compute_brush_stamp(hf, cx: float, cy: float, params: SweepParams) -> np.nda
         win = 0.5 * (1.0 + np.cos(np.pi * rr))
         prof = np.where(d < cutoff, H * g * win, 0.0)
 
+    return row_lo, row_hi, col_lo, col_hi, prof
+
+
+def compute_brush_stamp(hf, cx: float, cy: float, params: SweepParams) -> np.ndarray:
+    """以 (cx, cy) 为中心的单次笔刷增量场 (ny, nx)（涂抹/雕刻一笔的印章）。
+
+    截面与导动相同（高斯/锥体/半球，w=1 无沿程调制）；负高度即雕刻
+    （去除材料）。作用范围（颜色裁剪）由调用方处理。
+    """
+    delta = np.zeros((hf.ny, hf.nx), dtype=np.float64)
+    hit = _brush_stamp_roi(hf, cx, cy, params)
+    if hit is None:
+        return delta
+    row_lo, row_hi, col_lo, col_hi, prof = hit
     delta[row_lo:row_hi + 1, col_lo:col_hi + 1] = prof
     return delta
 
@@ -312,23 +332,32 @@ def apply_brush_stamp(hf, cx: float, cy: float, params: SweepParams,
     """把单次笔刷印章写进高度场（正高度=堆料累加，负高度=雕刻去除）。
 
     作用范围按当前颜色裁剪（颜色无效/颜色内/颜色外）。返回受影响格数。
+    只读写笔刷外接矩形内的格子（O(ROI)），与模型图幅无关。
     """
-    delta = compute_brush_stamp(hf, cx, cy, params)
+    hit = _brush_stamp_roi(hf, cx, cy, params)
+    if hit is None:
+        return 0
+    row_lo, row_hi, col_lo, col_hi, prof = hit
     if params.color_scope in ("inside", "outside"):
         if color_mask is not None and color_mask.shape == (hf.ny, hf.nx):
-            inside_cur = color_mask == int(color_value)
+            inside_cur = color_mask[row_lo:row_hi + 1,
+                                    col_lo:col_hi + 1] == int(color_value)
         else:
-            inside_cur = np.zeros((hf.ny, hf.nx), dtype=bool)
+            inside_cur = None
         if params.color_scope == "inside":
-            delta[~inside_cur] = 0.0
-        else:
-            delta[inside_cur] = 0.0
-    mask = delta != 0.0
-    if not mask.any():
+            if inside_cur is None:
+                return 0
+            prof = np.where(inside_cur, prof, 0.0)
+        elif inside_cur is not None:
+            prof = np.where(inside_cur, 0.0, prof)
+    mask = prof != 0.0
+    moved = int(np.count_nonzero(mask))
+    if moved == 0:
         return 0
     sign = -1.0 if params.height < 0 else 1.0
-    hf.data[mask] += sign * delta[mask]
-    return int(np.count_nonzero(mask))
+    sub = hf.data[row_lo:row_hi + 1, col_lo:col_hi + 1]
+    sub[mask] += sign * prof[mask]
+    return moved
 
 
 def apply_sweep(hf, poly: np.ndarray, params: SweepParams,

@@ -2,8 +2,9 @@
 from __future__ import annotations
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QTabBar, QStackedWidget,
                                 QPushButton)
-from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import Qt, Signal, QSize, QByteArray
+from PySide6.QtGui import QIcon, QPixmap, QPainter
+from PySide6.QtSvg import QSvgRenderer
 
 import ui.styles.theme as theme
 from .flow_layout import FlowLayout
@@ -11,6 +12,80 @@ from .quick_access_bar import QuickAccessBar
 from .text_icon import makeTextIcon
 from resource_path import resource_path
 from i18n import tr, languageChanged
+
+
+# 瓷贴图标色：原 SVG 为白色字形（旧彩色按钮底），白底瓷贴上重着色为主题色
+_TILE_ICON_COLOR = theme.PRIMARY
+_iconCache: dict = {}
+
+
+class _ToolDivider(QWidget):
+    """工具按钮分组内的竖向分割线（插件用 registerToolDivider 插入）。
+
+    FlowLayout 按 sizeHint 排布，普通 QWidget 的 sizeHint 无效（-1,-1），
+    故显式给出 1×48 的尺寸提示，与两侧按钮等高。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedWidth(1)
+        self.setStyleSheet("background:%s;" % theme.BORDER)
+
+    def sizeHint(self) -> QSize:
+        return QSize(1, 48)
+
+    minimumSizeHint = sizeHint
+
+
+def darkIcon(svgPath: str, color: str = _TILE_ICON_COLOR) -> QIcon:
+    """读取白色描边的 SVG 命令图标，替换为深色后渲染为 QIcon（带缓存）。
+    渲染失败时退回原图标路径。"""
+    key = (svgPath, color)
+    if key in _iconCache:
+        return _iconCache[key]
+    icon = QIcon()
+    try:
+        if not str(svgPath).lower().endswith(".svg"):
+            raise ValueError("not svg")
+        with open(svgPath, "r", encoding="utf-8") as f:
+            svg = f.read()
+        svg = svg.replace("#ffffff", color).replace("#FFFFFF", color)
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pm = QPixmap(96, 96)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        renderer.render(p)
+        p.end()
+        icon = QIcon(pm)
+    except Exception:
+        try:
+            icon = QIcon(svgPath)
+        except Exception:
+            pass
+    _iconCache[key] = icon
+    return icon
+
+
+# 工具按钮瓷贴样式（Win11 扁平）：白底细边 4px 圆角，悬停主题色浅底。
+# 文字/图标均用主题色（与瓷贴图标一致）；fs 为字号（无图标按钮按
+# 语言/文本长度缩放，见 _applyButtonTextStyle）。
+def _tileQss(fs: int | None = None) -> str:
+    base = f"""
+    QPushButton {{
+        background: #ffffff; color: {theme.PRIMARY};
+        border: 1px solid #e3e3e3; border-radius: 4px; padding: 1px;
+    }}
+    QPushButton:hover {{
+        background: {theme.ACCENT_TINT}; border-color: {theme.PRIMARY_LIGHT};
+    }}
+    QPushButton:pressed {{ background: #dcf0f3; }}
+    QPushButton:disabled {{
+        background: #f7f7f7; color: #a8a8a8; border-color: #ececec;
+    }}
+    """
+    if fs is not None:
+        base += f"QPushButton {{ font-size:{fs}px; }}"
+    return base
 
 
 # 绘图命令图标映射（key -> icons/<name>.svg）；无映射的命令仍显示文字
@@ -35,6 +110,7 @@ ICON_MAP = {
     "Outline": resource_path("icons/outline.svg"),
     "Align": resource_path("icons/align.svg"),
     "Bridge": resource_path("icons/bridge.svg"),
+    "Revcloud": resource_path("icons/revcloud.svg"),
     "ImageTrace": resource_path("icons/imagetrace.svg"),
     "ImageToModel": resource_path("icons/imagetomodel.svg"),
     "ReliefUndo": resource_path("icons/undo.svg"),
@@ -53,6 +129,7 @@ TOOLTIP_OVERRIDES = {
     # 曲线编辑
     "Group":  "左：新建群组\n右：取消群组",
     "Join":   "左：组合多条曲线\n右：断开组合",
+    "TransferTo3D": "把选中的 2D 曲线复制到 3D 空间并切换到 3D 模式（原曲线保留）",
     # 浮雕
     "Brush":  "左：固化（抬高）\n右：流化（压低）",
     "Smooth": "左：磨光\n右：路径磨光",
@@ -67,6 +144,8 @@ TOOLTIP_OVERRIDES = {
     "Pan":        "左：平移\n右：旋转视图",
     # 3D B-Rep（Plasticity 风格）
     "Boolean3D":  "3D 布尔：选中两个实体，并/差/交（差集=第一个减第二个）",
+    "Primitive":  "标准体：立方体/圆柱体/圆环/圆锥体；画布单击放置位置，"
+                  "调参数实时预览，右键/「创建」确认生成",
     "Thread":     "螺纹：面模式选中圆柱面生成内/外螺纹；空白点击生成独立螺柱",
 }
 
@@ -76,13 +155,13 @@ CATEGORIES = [
     ("曲线绘制", [
         ("Point", "点"), ("Line", "直线"), ("Curve", "样条"), ("Circle", "圆"),
         ("Ellipse", "椭圆"), ("Arc", "圆弧"), ("Rectangle", "矩形"),
-        ("Polygon", "多边形"), ("Text", "文字"), ("ImageTrace", "图转线"),
+        ("Polygon", "多边形"), ("Text", "文字"), ("ImageTrace", "图转线"), ("Revcloud", "修订\n云线"),
     ]),
     ("曲线编辑", [
         ("Offset", "偏移"), ("Trim", "修剪"), ("Extend", "延伸"), ("Mirror", "镜像"),
         ("Chamfer", "倒角"), ("Array", "阵列"), ("Join", "组合"), ("Group", "群组"),
         ("ClosePath", "闭合"), ("Outline", "轮廓"), ("Align", "对齐"),
-        ("Bridge", "桥接"),
+        ("Bridge", "桥接"), ("TransferTo3D", "转入\n3D"),
 
     ]),
     ("浮雕", [
@@ -105,6 +184,7 @@ CATEGORIES = [
     ]),
     ("3D", [
         ("Extrude", "挤出"),
+        ("Primitive", "标准体"),
         ("Boolean3D", "布尔"), ("Thread", "螺纹"),
     ]),
     ("CNC", [
@@ -133,6 +213,7 @@ class TopDock(QWidget):
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(0)
+        self._bottom = bottom   # detachNavBar 重算高度用
 
         self._navBar = QTabBar()
         self._navBar.setExpanding(False)
@@ -141,7 +222,8 @@ class TopDock(QWidget):
         bl.addWidget(self._navBar)
 
         self._toolStack = QStackedWidget()
-        self._toolStack.setFixedHeight(50)
+        self._toolStack.setFixedHeight(48)
+        self._toolStack.setStyleSheet(_tileQss())
         # 组名 → 该页的 FlowLayout：内置分类用 CATEGORIES 构建，插件组运行时追加
         self._groupFlows: dict = {}
         # 插件按钮登记：key → (按钮, pluginId)（插件停用时移除）
@@ -168,6 +250,20 @@ class TopDock(QWidget):
         self.setFixedHeight(bottom.sizeHint().height())
         languageChanged().connect(self.retranslateUi)
 
+    def detachNavBar(self) -> QTabBar:
+        """把分类标签栏从本组件摘出（嵌入自绘标题栏，节约一行高度）。
+
+        摘出后 TopDock 只剩工具按钮页 + 常用条，高度重新自适应。
+        标签页切换/插件加页/多语言/门禁等逻辑不变（仍由本类持有信号连接）。
+        """
+        lay = self._bottom.layout()
+        lay.removeWidget(self._navBar)
+        self._navBar.setParent(None)
+        lay.invalidate()
+        self._bottom.adjustSize()
+        self.setFixedHeight(self._bottom.sizeHint().height())
+        return self._navBar
+
     def retranslateUi(self) -> None:
         """语言切换：重设导航标签与按钮文本/提示。有图标按钮不写字。"""
         for i, name in enumerate(self._tabNames):
@@ -177,10 +273,10 @@ class TopDock(QWidget):
                 continue   # 有图标不写字
             btn.setText(tr(text))
             self._applyButtonTextStyle(btn, text, self._buttonCategory.get(btn, ""))
-        for key, tip in TOOLTIP_OVERRIDES.items():
-            btn = self._findButtonByKey(key)
-            if btn is not None:
-                btn.setToolTip(tr(tip))
+        # 悬停提示：覆盖规则优先，否则按钮文本拍平
+        for btn, text in self._buttonTexts.items():
+            override = TOOLTIP_OVERRIDES.get(getattr(btn, "_cmdKey", ""), "")
+            btn.setToolTip(tr(override or text.replace("\n", "")))
         if hasattr(self._quickBar, "retranslateUi"):
             self._quickBar.retranslateUi()
 
@@ -197,7 +293,7 @@ class TopDock(QWidget):
 
     def _buildPage(self, category: str, items, flows: dict | None = None) -> QWidget:
         page = QWidget()
-        flow = FlowLayout(page, margin=1, spacing=3)
+        flow = FlowLayout(page, margin=0, spacing=3)
         for key, text in items:
             flow.addWidget(self._makeButton(key, text, category))
         if flows is not None:
@@ -205,30 +301,47 @@ class TopDock(QWidget):
         return page
 
     def addToolButton(self, group: str, key: str, label: str, tooltip: str = "",
-                      icon: str = "", action=None, pluginId: str = "") -> None:
+                      icon: str = "", action=None, pluginId: str = "",
+                      divider: bool = False) -> None:
         """运行时追加按钮（插件 API 入口）：group 分类页不存在则自动新建标签页。
         action 为 None 时点击发 commandRequested(key)（执行同名命令/动作），
-        否则直接调用 action 回调。pluginId 记录归属（插件停用时按它移除）。"""
+        否则直接调用 action 回调。pluginId 记录归属（插件停用时按它移除）。
+        divider=True 时插入一条竖向分割线（同组内区分子功能，如 3D 模具 /
+        浮雕功能），不创建可点击按钮。"""
         group = group or "插件"
         flow = self._groupFlows.get(group)
         if flow is None:
             page = QWidget()
-            flow = FlowLayout(page, margin=1, spacing=3)
+            flow = FlowLayout(page, margin=0, spacing=3)
             self._groupFlows[group] = flow
             self._navBar.addTab(group)
             self._toolStack.addWidget(page)
+            # 标签栏嵌在自绘标题栏上：新标签页使标签总宽变化，
+            # 同步抬高主窗口最小宽度并重算标题显隐
+            p = self._navBar.parent()
+            if p is not None and hasattr(p, "_updateMinWidth"):
+                p._updateMinWidth()
+                p._relayoutTitle()
+        if divider:
+            sep = _ToolDivider()
+            flow.addWidget(sep)
+            self._pluginButtons[key] = (sep, pluginId)
+            return
         btn = QPushButton(label)
         btn.setFixedSize(48, 48)
         btn.setToolTip(tooltip or label)
         if icon:
             from PySide6.QtGui import QIcon
-            btn.setIcon(QIcon(icon))
+            btn.setIcon(darkIcon(icon))
             btn.setIconSize(QSize(44, 44))
             btn.setText("")
         elif len(label) == 4 and "\n" not in label:
             # 4 字标签分两行显示（同内置按钮"XX\nXX"样式），否则 48px 放不下
             btn.setText(label[:2] + "\n" + label[2:])
-            btn.setStyleSheet("QPushButton { font-size:11px; padding:1px; }")
+        if not icon:
+            # 无图标文字按钮：与内置文字按钮同一套字号/主题色规则
+            # （模具等插件组按大字号，与浮雕/CNC 页一致）
+            self._applyButtonTextStyle(btn, btn.text(), group, large=True)
         if action is not None:
             btn.clicked.connect(lambda _=False, cb=action: cb())
         else:
@@ -258,29 +371,37 @@ class TopDock(QWidget):
         return removed
 
     def refreshStyle(self) -> None:
-        """按全局字体大小等比放大导航标签字体与宽度（设置改字体时调用）。"""
-        size = theme.FONT_SIZE + 3
-        hpad = 28 + (theme.FONT_SIZE - 10) * 2
+        """按全局字体大小等比放大分类标签字体与宽度（设置改字体时调用）。
+
+        标签栏现嵌在自绘标题栏上：Win11 扁平样式——透明底、4px 圆角、
+        悬停浅灰、选中白底 + 主题色下划线。
+        """
+        size = theme.FONT_SIZE + 2
+        hpad = 12 + (theme.FONT_SIZE - 10) * 2   # 紧凑宽度：窄内边距
         self._navBar.setStyleSheet(
             f"""
+            QTabBar {{
+                background: transparent;
+            }}
             QTabBar::tab {{
-                background: #e0e0e0;
-                padding: 0px {hpad}px;
-                border: 1px solid {theme.BORDER};
-                margin: 0;
+                background: transparent;
+                color: {theme.TEXT_DIM};
+                padding: 2px {hpad}px;
+                border: none;
+                border-bottom: 2px solid transparent;
+                border-radius: 4px;
+                margin: 0 2px;
                 font-size: {size}pt;
             }}
-            QTabBar::tab:selected {{
-                background: {theme.PRIMARY};
-                color: {theme.TEXT_ON_PRIMARY};
-                border: none;
-                font-weight: bold;
-            }}
             QTabBar::tab:hover {{
-                background: #d8d8d8;
+                background: {theme.HOVER};
+                color: {theme.TEXT};
             }}
-            QTabBar::tab:selected:hover {{
-                background: {theme.PRIMARY_DARK};
+            QTabBar::tab:selected {{
+                background: #ffffff;
+                color: {theme.PRIMARY_DARK};
+                border-bottom: 2px solid {theme.PRIMARY};
+                font-weight: bold;
             }}
             """
         )
@@ -292,21 +413,23 @@ class TopDock(QWidget):
         btn._cmdKey = key
         # 正方形大按钮，预留空间给后续替换为正方形图标
         btn.setFixedSize(48, 48)
-        # 极简悬停规则：
-        #   - TOOLTIP_OVERRIDES 里显式定义的（通常是左右键两行提示）才显示；
-        #   - 普通按钮一律不写 tooltip → 鼠标悬停无提示，避免信息噪声。
+        # 悬停提示规则：
+        #   - TOOLTIP_OVERRIDES 里显式定义的（左右键两行提示等）优先；
+        #   - 其余按钮一律以按钮文本（拍平两行）作为提示。
         tip = TOOLTIP_OVERRIDES.get(key, "")
-        if tip:
-            btn.setToolTip(tr(tip))
+        if not tip:
+            tip = text.replace("\n", "")
+        btn.setToolTip(tr(tip))
         hasIcon = False
         iconPath = ICON_MAP.get(key)
         if iconPath is not None:
-            btn.setIcon(QIcon(iconPath))
+            btn.setIcon(darkIcon(iconPath))
             btn.setIconSize(QSize(44, 44))
             btn.setText("")
             hasIcon = True
         elif key in TEXT_ICON_KEYS:
-            btn.setIcon(makeTextIcon(TEXT_ICON_KEYS[key], 64))
+            btn.setIcon(makeTextIcon(TEXT_ICON_KEYS[key], 64,
+                                     color=_TILE_ICON_COLOR))
             btn.setIconSize(QSize(44, 44))
             btn.setText("")
             hasIcon = True
@@ -330,11 +453,15 @@ class TopDock(QWidget):
         self._buttonHasIcon[btn] = hasIcon
         return btn
 
-    def _applyButtonTextStyle(self, btn, text: str, category: str) -> None:
-        """无图标按钮字号：中文按原逻辑，英文按长度缩小显示全。"""
+    def _applyButtonTextStyle(self, btn, text: str, category: str,
+                              large: bool | None = None) -> None:
+        """无图标按钮字号：中文按行字数缩放（CNC 页与浮雕页同为文字大按钮），
+        英文按长度缩小显示全；颜色统一主题色（见 _tileQss）。
+        large=None 时按内置分类判断，插件组显式传 True。"""
         from i18n import getLanguage
         is_en = getLanguage() == "English"
-        large = category in ("浮雕", "浮雕几何")
+        if large is None:
+            large = category in ("浮雕", "浮雕几何", "CNC")
         if is_en:
             en = tr(text)
             if "\n" in en:
@@ -344,13 +471,21 @@ class TopDock(QWidget):
             else:
                 n = len(en)
                 fs = 13 if n <= 5 else (10 if n <= 7 else 8)
-            btn.setStyleSheet(f"QPushButton {{ font-size:{fs}px; padding:1px; }}")
+            btn.setStyleSheet(_tileQss(fs))
         else:
             if "\n" in text:
-                fs = 16 if large else 11
-                btn.setStyleSheet(f"QPushButton {{ font-size:{fs}px; padding:1px; }}")
+                mx = max(len(l) for l in text.split("\n"))
+                if large:
+                    # 2字行 16px；3字行（安装/几何体）缩到 14px 防裁边
+                    fs = 16 if mx <= 2 else (14 if mx == 3 else 11)
+                else:
+                    fs = 11
+                btn.setStyleSheet(_tileQss(fs))
             elif large:
-                btn.setStyleSheet("QPushButton { font-size:20px; padding:2px; }")
+                n = len(text)
+                # 2字内 20px；3字（刀具表）14px 防裁边
+                fs = 20 if n <= 2 else (14 if n == 3 else 11)
+                btn.setStyleSheet(_tileQss(fs))
 
     def setCurrentCategory(self, name: str) -> None:
         """按分类名切换顶部类目标签页（外部联动入口）。

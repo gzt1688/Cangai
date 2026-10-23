@@ -16,20 +16,21 @@ def _tabStyle(selected: bool) -> str:
     if selected:
         return (
             "QPushButton { background:%s; color:#fff; font-size:12px; font-weight:bold;"
-            " border:1px solid %s; border-radius:3px; padding:1px 8px; }"
-        ) % (theme.PRIMARY, theme.PRIMARY)
+            " border:1px solid %s; border-radius:4px; padding:1px 8px; }"
+            "QPushButton:hover { background:%s; }"
+        ) % (theme.PRIMARY, theme.PRIMARY, theme.PRIMARY_DARK)
     return (
-        "QPushButton { background:#e0e0e0; color:#333; font-size:12px; font-weight:bold;"
-        " border:1px solid #a0a0a0; border-radius:3px; padding:1px 8px; }"
-        "QPushButton:hover { background:#d0d0d0; }"
+        "QPushButton { background:#ffffff; color:#333; font-size:12px; font-weight:bold;"
+        " border:1px solid #d9d9d9; border-radius:4px; padding:1px 8px; }"
+        "QPushButton:hover { background:#f2f2f2; border-color:#c4c4c4; }"
     )
 
 
 def _plusStyle() -> str:
     return (
-        "QPushButton { background:#e0e0e0; color:#333; font-size:13px; font-weight:bold;"
-        " border:1px solid #a0a0a0; border-radius:3px; padding:0px; }"
-        "QPushButton:hover { background:#d0d0d0; }"
+        "QPushButton { background:#ffffff; color:#333; font-size:13px; font-weight:bold;"
+        " border:1px solid #d9d9d9; border-radius:4px; padding:0px; }"
+        "QPushButton:hover { background:#f2f2f2; border-color:#c4c4c4; }"
     )
 
 

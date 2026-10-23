@@ -243,6 +243,8 @@ class GizmoManager(QObject):
         self._origBbox = (1.0, 1.0, 1.0)
         # 悬停高亮
         self._hover = None
+        # 交互预览（B-Rep 拖动期变换只累积仿射，释放时一次性烘焙）
+        self._previewOn = False
         # 单击精确输入小浮层（非模态，需持有引用防止提前回收）
         self._inputDialog = None
 
@@ -594,6 +596,7 @@ class GizmoManager(QObject):
         delta = self._constrain(_sub3(cur, prev))
         if _len3(delta) < 1e-12:
             return
+        self._ensurePreview()
         self._totalDelta = (self._totalDelta[0] + delta[0],
                             self._totalDelta[1] + delta[1],
                             self._totalDelta[2] + delta[2])
@@ -701,6 +704,7 @@ class GizmoManager(QObject):
             display = round(display / 15.0) * 15.0
         ddeg = display - self._prevDisplayDeg
         if abs(ddeg) > 1e-9:
+            self._ensurePreview()
             self._rotateSelectionZ(math.radians(ddeg))
         self._prevDisplayDeg = display
         self._feedbackDeg = display
@@ -764,6 +768,7 @@ class GizmoManager(QObject):
         factor = min(SCALE_MAX, max(SCALE_MIN, factor))
         inc = factor / self._curScale if self._curScale > 1e-12 else 1.0
         if abs(inc - 1.0) > 1e-9:
+            self._ensurePreview()
             if self._uniform:
                 self._scaleSelection(inc, inc, inc)
             else:
@@ -861,6 +866,7 @@ class GizmoManager(QObject):
         self.refresh()
 
     def _cleanupDrag(self) -> None:
+        self._commitPreview()
         self._dragging = False
         self._mode = None
         self._activeAxis = -1
@@ -868,6 +874,34 @@ class GizmoManager(QObject):
         self._activeAdapter = None
         self._hover = None
         self._redrawAll()
+
+    # ---------------- 交互预览（B-Rep 拖动期绕开 OCCT） ----------------
+
+    def _ensurePreview(self) -> None:
+        """拖动产生实际位移后进入预览态（单击不进——无位移无需预览）。
+
+        B-Rep 的 translate/rotate/scale 改为只累积 4×4 仿射，读取路径
+        廉价施加；否则每帧都是「OCCT 烘焙 + 全量重三角化 + 边重采样」，
+        实测多面体/螺旋面实体 1~4 秒/帧（拖动完全卡死）。曲线编辑控制点
+        变换不走本机制（几何廉价，直接改即可）。
+        """
+        if self._previewOn or self._editTarget() is not None:
+            return
+        self._previewOn = True
+        for obj in self._transformable():
+            fn = getattr(obj, "beginPreviewTransform", None)
+            if callable(fn):
+                fn()
+
+    def _commitPreview(self) -> None:
+        """释放拖动：把累积仿射一次性烘焙进各实体（_cleanupDrag 调用）。"""
+        if not self._previewOn:
+            return
+        self._previewOn = False
+        for obj in self._transformable():
+            fn = getattr(obj, "commitPreviewTransform", None)
+            if callable(fn):
+                fn()
 
     # ---------------- 变换应用 ----------------
     def _transformable(self):

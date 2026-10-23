@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- 饼干切模顶视图：裙边环 + 刀壁环 + 曲奇内芯 -->
+  <path fill="#8d6e63" fill-rule="evenodd"
+        d="M12 1.5a10.5 10.5 0 1 0 0 21 10.5 10.5 0 1 0 0-21zm0 3a7.5 7.5 0 1 1 0 15 7.5 7.5 0 1 1 0-15z"/>
+  <path fill="#5d4037" fill-rule="evenodd"
+        d="M12 4.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 1 0 0-15zm0 1.6a5.9 5.9 0 1 1 0 11.8 5.9 5.9 0 1 1 0-11.8z"/>
+  <circle cx="9.6" cy="9.4" r="1.15" fill="#d7a86e"/>
+  <circle cx="14.2" cy="10.8" r="1.0" fill="#d7a86e"/>
+  <circle cx="11.2" cy="14.4" r="0.95" fill="#d7a86e"/>
+  <circle cx="14.8" cy="14.0" r="0.8" fill="#d7a86e"/>
+</svg>
