@@ -66,14 +66,68 @@ class EllipseObject(BaseObject):
             self._rotation += angle
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
+        """沿世界轴缩放（sx/sy 可为负 = 镜像）。
+
+        斜放椭圆沿世界轴缩放后一般不再是原倾角（镜像也一样：θ 要变成 -θ），
+        所以不能只给轴长乘系数。用二次型精确解：椭圆 = {u: uᵀ A u = 1}，
+        A = R(θ)·diag(1/a²,1/b²)·R(θ)ᵀ；缩放 S 后 A' = S⁻ᵀ·A·S⁻¹，对 A' 做
+        2x2 特征分解 → 特征值给新半轴、特征向量给新倾角。
+        （旧写法 `majorAxis *= abs(sx)` 完全不动 `_rotation`，导致“镜像一个
+        斜放椭圆”结果与自身重合，看着就是 XY 镜像没反应。）
+        """
         self._cx *= sx; self._cy *= sy; self._cz *= sz
-        self._majorAxis *= abs(sx)
-        self._minorAxis *= abs(sy)
+        a, b, th = self._normalizedAxes()
+        eps = 1e-12
+        if b <= eps or abs(sx) <= eps or abs(sy) <= eps:
+            # 退化椭圆（一轴为 0）或被压扁：只按绝对比例缩轴长，镜像时手动反倾角
+            self._majorAxis *= abs(sx)
+            self._minorAxis *= abs(sy)
+            if (sx < 0) != (sy < 0):
+                self._rotation = -self._rotation
+            return
+        c, s = math.cos(th), math.sin(th)
+        ia, ib = 1.0 / (a * a), 1.0 / (b * b)
+        m11 = (c * c * ia + s * s * ib) / (sx * sx)
+        m12 = c * s * (ia - ib) / (sx * sy)
+        m22 = (s * s * ia + c * c * ib) / (sy * sy)
+        tr = m11 + m22
+        disc = math.sqrt(max(0.0, tr * tr * 0.25 - (m11 * m22 - m12 * m12)))
+        l1, l2 = tr * 0.5 - disc, tr * 0.5 + disc        # 小特征值 ↔ 长半轴
+        if l1 <= eps:
+            return
+        if abs(m12) > eps:
+            vx, vy = m12, l1 - m11                        # 长轴方向特征向量
+        elif m11 <= m22:
+            vx, vy = 1.0, 0.0
+        else:
+            vx, vy = 0.0, 1.0
+        self._majorAxis = 1.0 / math.sqrt(l1)
+        self._minorAxis = 1.0 / math.sqrt(l2)
+        self._rotation = math.atan2(vy, vx)
+
+    def _normalizedAxes(self) -> tuple:
+        """当前椭圆的 (长半轴, 短半轴, 长轴方向角)：修正轴长写反/负值。"""
+        a = abs(self._majorAxis)
+        b = abs(self._minorAxis)
+        th = self._rotation
+        if a < b:
+            a, b, th = b, a, th + math.pi / 2.0
+        return a, b, th
 
     def getBoundingBox(self) -> BoundingBox3D:
+        """真实轴对齐包围盒（**计入倾角**）：半轴按 θ 投影到 X/Y。
+
+        不能直接用 ±major/±minor——那是“未旋转”时的范围，斜放时与图形实际
+        外框差一大截，导致 XY 标注、包围盒、镜像基准、变换面板尺寸都按原始
+        （未旋转）位置算。
+        """
+        a, b, th = self._normalizedAxes()
+        c, s = math.cos(th), math.sin(th)
+        hw = math.sqrt((a * c) ** 2 + (b * s) ** 2)
+        hh = math.sqrt((a * s) ** 2 + (b * c) ** 2)
         bb = BoundingBox3D()
-        bb.expand(Point3D(self._cx - self._majorAxis, self._cy - self._minorAxis, self._cz))
-        bb.expand(Point3D(self._cx + self._majorAxis, self._cy + self._minorAxis, self._cz))
+        bb.expand(Point3D(self._cx - hw, self._cy - hh, self._cz))
+        bb.expand(Point3D(self._cx + hw, self._cy + hh, self._cz))
         return bb
 
     def getPosition(self) -> Point3D:

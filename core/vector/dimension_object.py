@@ -75,6 +75,39 @@ def _unitSuffix() -> str:
     return getattr(app_settings, "dim_unit", "").strip()
 
 
+def shapeAspect(objs) -> float:
+    """一组对象的“固有长短轴比”（≥ 1，与摆放角度无关）。
+
+    圆标注用它作为“是否被单轴缩放压扁”的判基准：单个圆恒为 1、单个椭圆
+    = 长轴/短轴（都跟倾角无关，所以旋转不会被误判成变形）；其余图形或
+    多选只能看联合包围盒的 长边/短边。
+    """
+    if len(objs) == 1:
+        o = objs[0]
+        t = o.type()
+        if t == ObjectType.CIRCLE:
+            return 1.0
+        if t == ObjectType.ELLIPSE:
+            a = max(abs(o.majorAxis()), abs(o.minorAxis()))
+            b = min(abs(o.majorAxis()), abs(o.minorAxis()))
+            return a / b if b > 1e-12 else 1.0
+    bb = BoundingBox3D()
+    for o in objs:
+        try:
+            g = o.getBoundingBox()
+        except Exception:
+            continue
+        if g is not None and g.isValid():
+            bb.expand(g.min)
+            bb.expand(g.max)
+    if not bb.isValid():
+        return 1.0
+    w = bb.max.x - bb.min.x
+    h = bb.max.y - bb.min.y
+    lo, hi = min(w, h), max(w, h)
+    return hi / lo if lo > 1e-12 else 1.0
+
+
 class DimensionObject(BaseObject):
     def __init__(self, kind: str = "linear") -> None:
         super().__init__(ObjectType.DIMENSION)
@@ -307,10 +340,12 @@ class DimensionObject(BaseObject):
             h = bb.max.y - bb.min.y
             if h <= 1e-9:
                 return False
-            if abs(w / h - self._circleAspect) > \
+            asp = shapeAspect(targets)
+            if abs(asp - self._circleAspect) > \
                     max(self._circleAspect, 1e-6) * _CIRCLE_ASPECT_TOL:
-                # 长宽比变了 = 被单轴缩放：被测对象已不是当初那个圆，与其留一个
+                # 长短轴比变了 = 被单轴缩放：被测对象已不是当初那个圆，与其留一个
                 # “看着对其实错”的读数，不如直接作废（由文档层删除该标注）。
+                # 用固有长短轴比而不是包围盒 w/h：斜放椭圆的包围盒会随转角变。
                 self._broken = True
                 return False
             # 圆跟随：圆心取结合包围盒中心，半径取长宽均值的一半

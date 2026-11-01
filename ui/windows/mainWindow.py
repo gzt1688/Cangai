@@ -55,7 +55,7 @@ from core.api import CangaiAPI
 from core.plugin_manager import PluginManager
 from ui.commands.concrete.dimension_commands import registerAll as registerDims
 from ui.commands.concrete.dimension_commands import TEXT_TO_OBJ_GAP
-from core.vector.dimension_object import DimensionObject
+from core.vector.dimension_object import DimensionObject, shapeAspect
 from ui.gizmo.gizmo_manager import GizmoManager, View2DAdapter, View3DAdapter
 
 from ui.widgets.status_bar import StatusBarWidget
@@ -2038,21 +2038,15 @@ class MainWindow(QMainWindow):
 
         aspect = 对象的长宽比，存进标注作为“是否被单轴缩放压扁”的判定基准：
         等比缩放时不变（标注继续跟随），单轴缩放时变了（标注作废删除）。
-        优先用对象的真实圆心/半径（圆、弧——弧的包围盒不是整圆，必须走这条）；
-        椭圆取长短轴均值的等效圆；其余按联合包围盒取等效圆。
+        圆/弧用真实圆心与半径（弧的包围盒不是整圆）；椭圆与其他图形一律按
+        **包围盒**取等效圆（中心=包围盒中心、半径=长宽均值一半）：绑定的跟随
+        也走包围盒，两边算法一致才不会一转动就误判“压扁”。
         """
         if len(objs) == 1:
             o = objs[0]
-            t = o.type()
-            if t in (ObjectType.CIRCLE, ObjectType.ARC):
+            if o.type() in (ObjectType.CIRCLE, ObjectType.ARC):
                 c = o.center()
                 return (c.x, c.y, abs(o.radius()), 1.0)
-            if t == ObjectType.ELLIPSE:
-                c = o.center()
-                ma, mi = abs(o.majorAxis()), abs(o.minorAxis())
-                if ma <= 0.0 or mi <= 0.0:
-                    return None
-                return (c.x, c.y, (ma + mi) * 0.5, ma / mi)
         bb = BoundingBox3D()
         for obj in objs:
             b = obj.getBoundingBox()
@@ -2067,7 +2061,7 @@ class MainWindow(QMainWindow):
         if r < 1e-9 or h < 1e-9:
             return None
         return ((bb.min.x + bb.max.x) * 0.5, (bb.min.y + bb.max.y) * 0.5,
-                r, w / h)
+                r, shapeAspect(objs))
 
     def _onDimensionDropped(self, oid: str) -> None:
         """绑定标注被文档层自动删除（源对象单轴缩放变形）：说清为什么少了个标注。"""
