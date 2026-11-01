@@ -1,4 +1,4 @@
-﻿"""自动分色：识别全部选中曲线围成的闭合区域（平面分割）。
+"""自动分色：识别全部选中曲线围成的闭合区域（平面分割）。
 
 不再只认"闭合曲线"——任意曲线（含开放直线）相交、分割形成的所有闭合
 区域都要识别出来。例如一个圆被一条直线横穿 → 圆被分成 2 个闭合区域，
@@ -37,10 +37,15 @@ def _rasterize_barriers(hf, curves_sampled: List[np.ndarray]) -> np.ndarray:
 
 
 def _densify(obj, spacing: float) -> np.ndarray:
-    """曲线采样点按弧长加密到约 0.5 格步距（保证标记链连续）。"""
+    """曲线采样点按弧长加密到约 0.5 格步距（保证标记链连续）。
+
+    采样时保留折线顶点（``preserve_vertices``）：等弧长重采样会跳过拐点，
+    把矩形角/倒角/偏移轮廓的尖角削掉（实测 0.8mm），小偏移带宽下填色边界
+    明显走样——必须由这里的加密插值保留顶点折角。
+    """
     from core.relief.region_relief import resample_polyline, sample_curve_points
 
-    pts = sample_curve_points(obj, 64)
+    pts = sample_curve_points(obj, 64, preserve_vertices=True)
     if pts.shape[0] < 2:
         return pts
     length = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
@@ -80,6 +85,38 @@ def compute_enclosed_regions(hf, curves: list, min_area: int = 4) -> List[np.nda
         if int(mask.sum()) >= max(1, min_area):
             masks.append(mask)
     return masks
+
+
+def largest_closed_region_mask(hf, curves: list,
+                               min_area: int = 4) -> Optional[np.ndarray]:
+    """选中曲线围成的**最外圈最大闭合区域**整块掩膜（与高度场同形状）。
+
+    与 :func:`compute_enclosed_regions` 的区别：那里把内部曲线也当障碍，
+    会把大块切成很多小块；这里把"被曲线完全包围的空白"补成实体
+    （内部细节曲线随之一并算进块内），再取最大连通块——即最外层闭合
+    轮廓内部的整块区域。曲线未围成闭合区域时返回 None。
+
+    min_area: 最小块面积（格），低于此视为没围成（栅格量化伪闭合）。
+    """
+    if hf.ny < 3 or hf.nx < 3 or not curves:
+        return None
+    from scipy.ndimage import binary_fill_holes, label
+
+    sampled = [_densify(obj, hf.spacing) for obj in curves]
+    barrier = _rasterize_barriers(hf, sampled)
+    if not barrier.any():
+        return None
+    # 补洞：被曲线完全包围的空白 → 实体（内部细节线不再切块）
+    filled = binary_fill_holes(barrier)
+    labels, n = label(filled)
+    if n == 0:
+        return None
+    counts = np.bincount(labels.ravel(), minlength=n + 1)
+    counts[0] = 0                      # 0 = 背景
+    best = int(counts.argmax())
+    if counts[best] < max(1, min_area):
+        return None
+    return labels == best
 
 
 def compute_region_colors(hf, curves: list, palette_count: int,

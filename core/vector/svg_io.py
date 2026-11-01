@@ -4,7 +4,7 @@
   1. SVG 文件导入（core/export/svg_importer.py）：解析 <path>/<line>/<rect>/
      <circle>/<ellipse>/<polyline>/<polygon>，应用 g 嵌套 transform，
      输出根用户坐标系（SVG 原始方向，y 向下）的采样折线与颜色；
-  2. 图片转线稿 VTracer 引擎（image_vectorizer.py）：解析其输出的
+  2. 图片转线稿 VTracer 引擎（ai_lineart 插件的 vectorizer.py）：解析其输出的
      `<svg><path d="M..c..Z"/></svg>` 抽取轮廓。
 
 所有曲线（三次/二次贝塞尔、椭圆弧、圆角矩形）统一自适应采样为折线，

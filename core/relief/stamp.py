@@ -7,8 +7,10 @@ ExecuteStamp / ExecuteLevelAdjust（冲压页），并按本应用的交互重�
 
 - 颜色无效（ignore）：**鼠标圆圈**区域——光标跟随一个可调直径的圆
   （A 缩小 / S 放大），定冲压区域大小；
-- 颜色内（inside）：**单击处色号的整个色块区域**（全部同色号格子，
-  不受圆圈限制）。
+- 颜色内（inside）：**单击处色号的相连色块区域**（与单击格同色且
+  4 连通的那一块，不受圆圈限制）。同色但不连通的格子不参与冲压。
+  未填色的格子（色号 0 = 模型默认色/图层底色）同样算一种颜色：在未填色
+  的模型上单击，整个模型即为作用区域。
 
 - 冲压（ExecuteStamp）：
   - 绝对（absolute）：范围内所有格子高度直接 = 输入值（z = value），
@@ -83,23 +85,50 @@ def build_circle_mask(hf, center_xy, radius: float) -> np.ndarray:
     return (dx * dx + dy * dy) <= (r * r)
 
 
+from core.relief import paint_palette
+
+
 def _color_equal_mask(hf, color_mask: np.ndarray | None,
                       color_value: int) -> np.ndarray:
-    """色号 == color_value 的格子掩膜。
+    """色号 == color_value 的格子掩膜（未填色=基础色，同值处理）。
 
-    蒙版 None/形状不符视作全 0（全场未填色）：color_value=0 → 全场命中，
-    否则全不命中。
+    蒙版 None/形状不符视作全 0（全场未填色）：color_value 为基础色（未填色 0
+    或调色板基础色槽 BASE_VALUE）→ 全场命中，否则全不命中。
     """
+    v = int(color_value)
+    if v == paint_palette.EMPTY:
+        v = paint_palette.BASE_VALUE      # 未填色与基础色同一区域
     if color_mask is not None and getattr(color_mask, "shape", None) == (hf.ny, hf.nx):
-        return color_mask == int(color_value)
-    return np.full((hf.ny, hf.nx), int(color_value) == 0, dtype=bool)
+        return paint_palette.equals_value_mask(color_mask, v)
+    return np.full((hf.ny, hf.nx), v == paint_palette.BASE_VALUE, dtype=bool)
+
+
+def build_color_region_mask(hf, color_mask: np.ndarray | None,
+                            color_value: int, seed) -> np.ndarray:
+    """单击格所在同色**4 连通**区域掩膜（颜色内冲压只作用于这一块）。
+
+    seed = (row, col) 为单击处格子。同色但不与 seed 相连的格子不参与；
+    seed 越界、或该格色号与 color_value 不符时返回全 False（不冲压）。
+    """
+    same = _color_equal_mask(hf, color_mask, color_value)
+    row, col = int(seed[0]), int(seed[1])
+    if not (0 <= row < hf.ny and 0 <= col < hf.nx) or not same[row, col]:
+        return np.zeros((hf.ny, hf.nx), dtype=bool)
+    from scipy.ndimage import label
+    # 4 连通（与开放曲线分色填充一致）：斜角相接不算相连
+    labels, _ = label(same)
+    return labels == labels[row, col]
 
 
 def _stamp_mask(hf, circle_mask: np.ndarray | None, params: StampParams,
-                color_mask: np.ndarray | None, color_value: int) -> np.ndarray:
-    """冲压工作掩膜：颜色无效 = 鼠标圆圈；颜色内 = 单击处色号的整个色块。"""
+                color_mask: np.ndarray | None, color_value: int,
+                color_region_mask: np.ndarray | None = None) -> np.ndarray:
+    """冲压工作掩膜：颜色无效 = 鼠标圆圈；颜色内 = 单击处相连色块。"""
     if params.scope == "inside":
-        # 单击处色号的整个色块区域（全部同色号格子，不受圆圈限制）
+        if (color_region_mask is not None
+                and getattr(color_region_mask, "shape", None) == (hf.ny, hf.nx)):
+            return color_region_mask
+        # 未提供连通区域时（旧调用）退回全部同色号格子
         return _color_equal_mask(hf, color_mask, color_value)
     # ignore：颜色无效，鼠标圆圈区域
     if circle_mask is None or getattr(circle_mask, "shape", None) != (hf.ny, hf.nx):
@@ -109,11 +138,14 @@ def _stamp_mask(hf, circle_mask: np.ndarray | None, params: StampParams,
 
 def apply_stamp(hf, params: StampParams, circle_mask: np.ndarray | None,
                 color_mask: np.ndarray | None = None,
-                color_value: int = 0) -> int:
+                color_value: int = 0,
+                color_region_mask: np.ndarray | None = None) -> int:
     """冲压：把范围内格子的高度改为绝对值/加减相对值。
 
     hf: HeightField（就地修改 data）。circle_mask: build_circle_mask 的产物
     （仅颜色无效用）。color_value 为**单击处格子的色号**（颜色内用）。
+    color_region_mask: build_color_region_mask 的产物（颜色内用），
+    只冲与单击格相连的那一块；不给则退回全部同色号格子。
 
     - absolute 绝对：z = value（平整台面）；
     - relative 相对：z = z ± value（direction 控制正负方向）。
@@ -121,7 +153,8 @@ def apply_stamp(hf, params: StampParams, circle_mask: np.ndarray | None,
     返回实际改变取值的格子数（重复冲同一绝对值不再计入），0 表示未命中。
     """
     data = hf.data
-    mask = _stamp_mask(hf, circle_mask, params, color_mask, color_value)
+    mask = _stamp_mask(hf, circle_mask, params, color_mask, color_value,
+                       color_region_mask)
     if not mask.any():
         return 0
 

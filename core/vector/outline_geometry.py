@@ -1,4 +1,4 @@
-﻿"""外轮廓几何：把一组选中曲线生成一条包裹全部的最大外轮廓（往外偏一段距离）。
+"""外轮廓几何：把一组选中曲线生成一条包裹全部的最大外轮廓（往外偏一段距离）。
 
 完美复刻 Rhino 插件 ToolPage.ShowOuterOutline / SiliconeMoldFunctions.OffsetOutward 的算法：
 
@@ -133,8 +133,9 @@ def _toClipper(pts: List[Point3D]) -> list:
 
 
 def _arcTolerance(dist: float) -> int:
-    """圆弧离散精度：实际 0.01 单位，但不大于偏移量的 1/10（避免极小偏移退化）。"""
-    return max(int(round(min(0.01, dist / 10.0) * _SCALE)), 2)
+    """圆弧离散精度：0.002 单位（≈2µm，JT_ROUND 圆角过渡肉眼平滑；0.01 档可见棱面），
+    但不大于偏移量的 1/10（避免极小偏移退化）。"""
+    return max(int(round(min(0.002, dist / 10.0) * _SCALE)), 2)
 
 
 def _pathAreaClipper(path: list) -> float:
@@ -156,28 +157,46 @@ def _worldFromClipper(path: list, z: float) -> List[Point3D]:
 
 # ---------------------------------------------------------------- 核心步骤 ----
 
-def offsetClosedOutward(pts: List[Point3D], dist: float) -> Optional[List[Point3D]]:
-    """闭合曲线沿外侧干净偏移 dist（Clipper 自动处理凹角与自交，取面积最大环）。
+def _offsetClosedDelta(pts: List[Point3D], delta: float,
+                       miter: bool = False) -> Optional[List[Point3D]]:
+    """闭合区域整体外偏（delta>0）或内偏（delta<0），取面积最大环。
 
-    对应 Rhino 插件 SiliconeMoldFunctions.OffsetOutward。
+    内偏后面积归零/消失（区域比 2|delta| 还薄）时返回 None。
+    miter=True 用尖角连接（内偏+外偏成对使用时能保持原始尖角，不被磨圆）。
     """
-    if not _HAS_PYCLIPPER or len(pts) < 3 or dist <= 0:
+    if not _HAS_PYCLIPPER or len(pts) < 3:
         return None
     z = pts[0].z
     path = _toClipper(pts)
     if len(path) < 3:
         return None
-    # 保证逆时针（正面积），使正向 delta 一定为外扩
+    if delta == 0:
+        return _worldFromClipper(path, z)
     if pyclipper.Area(path) < 0:
-        path.reverse()
+        path.reverse()          # 统一逆时针：正 delta 外扩、负 delta 内缩
     co = pyclipper.PyclipperOffset()
-    co.ArcTolerance = _arcTolerance(dist)
-    co.AddPath(path, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
-    result = co.Execute(int(round(dist * _SCALE)))
+    co.ArcTolerance = _arcTolerance(abs(delta))
+    co.MiterLimit = 2.0
+    join = pyclipper.JT_MITER if miter else pyclipper.JT_ROUND
+    co.AddPath(path, join, pyclipper.ET_CLOSEDPOLYGON)
+    result = co.Execute(int(round(delta * _SCALE)))
     if not result:
         return None
     best = max(result, key=_pathAreaClipper)
+    if _pathAreaClipper(best) <= 0:
+        return None
     return _worldFromClipper(best, z)
+
+
+def offsetClosedOutward(pts: List[Point3D], dist: float) -> Optional[List[Point3D]]:
+    """闭合曲线沿外侧干净偏移 dist（Clipper 自动处理凹角与自交，取面积最大环）。
+
+    对应 Rhino 插件 SiliconeMoldFunctions.OffsetOutward。
+    dist == 0 时不偏移，直接返回原地闭合的原曲线（"原地生成闭合外轮廓"）。
+    """
+    if dist < 0:
+        return None
+    return _offsetClosedDelta(pts, dist)
 
 
 def offsetOpenAsBand(pts: List[Point3D], dist: float) -> Optional[List[Point3D]]:
@@ -318,6 +337,10 @@ def convexHullWrapper(curves: List[List[Point3D]],
 
 # ---------------------------------------------------------------- 主入口 ----
 
+# 距离填 0 时按此极小距离执行（等价于"偏移 0.001"），保证开放曲线也能并进轮廓。
+_ZERO_DIST = 0.001
+
+
 def computeOuterOutline(closedCurves: List[List[Point3D]],
                         openCurves: List[List[Point3D]],
                         dist: float) -> List[List[Point3D]]:
@@ -331,14 +354,17 @@ def computeOuterOutline(closedCurves: List[List[Point3D]],
     参数:
         closedCurves: 每条闭合曲线的采样点列表
         openCurves:   每条开放曲线的采样点列表
-        dist:         外偏距离（>0）
+        dist:         外偏距离（>=0）。为 0 时按 _ZERO_DIST(0.001) 执行——
+                      即"偏移 0.001"的效果：所有选中曲线（含开放线）都被包进去
     返回:
         0 或 1 条外轮廓（世界坐标、闭合、首尾重合）。
     """
-    if not _HAS_PYCLIPPER or dist <= 0:
+    if not _HAS_PYCLIPPER or dist < 0:
         return []
     if not closedCurves and not openCurves:
         return []
+    if dist <= 0.0:
+        dist = _ZERO_DIST          # 0 视作 0.001，让开放线也能成带并入
 
     regions: List[List[Point3D]] = []
     for pts in closedCurves:

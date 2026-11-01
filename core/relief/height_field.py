@@ -275,27 +275,44 @@ class HeightField:
 
     # ---------------- 预览 / 渲染边界 ----------------
 
+    def sampleIndices(self, max_dim: int):
+        """长边降到 ``max_dim`` 时的 (行, 列) 取样索引（与 :meth:`downsample` 同源）。
+
+        索引按 (轴长, step) 缓存：雕刻/磨光笔画期每帧都要按显存档重取
+        一份高度，每次都重算 ``linspace + unique`` 是纯重复开销。
+        """
+        n = max(self.nx, self.ny)
+        if n <= max_dim:
+            return np.arange(self.ny), np.arange(self.nx)
+        step = int(math.ceil(n / float(max_dim)))
+        cache = getattr(self, "_sampleIdxCache", None)
+        if cache is None:
+            cache = self._sampleIdxCache = {}
+        key = (step, self.ny, self.nx)
+        got = cache.get(key)
+        if got is None:
+            def _take(axis_len: int) -> np.ndarray:
+                return np.unique(np.linspace(
+                    0, axis_len - 1, max(2, int(math.ceil(axis_len / step))))
+                    .round().astype(np.intp))
+
+            got = (_take(self.ny), _take(self.nx))
+            cache[key] = got
+        return got
+
     def downsample(self, max_dim: int = 1024) -> "HeightField":
         """等比降采样出预览副本（长边 ≤ max_dim）；已足够小则返回自身。
 
         行/列均匀取样且必含末行末列（linspace）：[::step] 会丢掉末尾
         (step−1) 行/列，场尺寸随降采样系统性缩小、丢边界内容。
         """
-        if max(self.nx, self.ny) <= max_dim:
+        rows, cols = self.sampleIndices(max_dim)
+        if rows.size == self.ny and cols.size == self.nx:
             return self
-        step = int(math.ceil(max(self.nx, self.ny) / float(max_dim)))
-
-        def _take(n: int) -> np.ndarray:
-            return np.unique(np.linspace(
-                0, n - 1, max(2, int(math.ceil(n / step))))
-                .round().astype(np.intp))
-
-        rows = _take(self.ny)
-        cols = _take(self.nx)
         sub = self._data[np.ix_(rows, cols)]
         # 名义栅距按较长轴平均步距：末样本恰好落在原场边界上，
         # 总尺寸不再缩小（短轴误差 < 1 个粗格，预览级可忽略）
-        (n_long, c_long) = max((self.ny, len(rows)), (self.nx, len(cols)))
+        (n_long, c_long) = max((self.ny, rows.size), (self.nx, cols.size))
         sp = float(self._spacing * (n_long - 1) / max(c_long - 1, 1))
         return HeightField(sub, self._origin, sp)
 

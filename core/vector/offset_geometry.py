@@ -255,26 +255,19 @@ def _dedupeClipperPaths(paths: list) -> list:
     return kept
 
 
-def _clipperBBoxSize(p: list) -> float:
-    """路径包围盒最大边长（整数坐标），用于外轮廓判定。"""
-    xs = [q[0] for q in p]
-    ys = [q[1] for q in p]
-    return max(max(xs) - min(xs), max(ys) - min(ys))
-
-
 def clipperOffsetBothSides(pts: List[Point3D], totalWidth: float, closed: bool,
                            capStyle: str = "round",
                            keepInner: bool = False) -> Optional[List[List[Point3D]]]:
     """基于 Clipper(pyclipper) 的双侧偏移，返回闭合轮廓点列表（世界坐标）。
 
-    - totalWidth 为总宽（与 Rhino 插件一致）：每侧偏移 totalWidth/2。
-    - 开放曲线：单次偏移即得一条闭合外轮廓（双侧+端盖一体），
-      capStyle='round' 圆头盖（端部半圆），'butt' 平头盖（端部垂直切平）。
-    - 闭合曲线：分别 +d/-d 双向偏移得到外/内轮廓；
-      keepInner=False 仅返回外轮廓（包围盒最大者），True 返回全部。
-    - 自相交曲线 Clipper 自动处理（相交处断开/合并），无需走边法修剪。
-    - 返回 None 表示 pyclipper 不可用（调用方回退）；[] 表示无结果
-      （如内缩距离过大导致轮廓消失）。
+    - totalWidth 为总宽（与 Rhino 插件一致）：笔画每侧各加宽 totalWidth/2。
+    - 统一采用“笔画带状”语义（结果 = 距曲线 ≤ 半宽 的点集），而非闭合区域
+      面积偏移：自交处笔画自然合并，且被笔画围出的每个格子都成为独立内孔。
+      例：五角星 {5/2} → 1 条外轮廓 + 6 个内孔（5 个尖三角 + 1 个中心五边形）。
+    - 开放曲线：endType 按 capStyle（'round' 圆头盖 / 'butt' 平头盖）偏移成闭合带。
+    - 闭合曲线：整条闭合环以开放路径 ET_OPENROUND 偏移（首尾两点重合，圆头帽
+      自相闭合无缝）；keepInner=False 仅保留外轮廓（正面积环），True 连内孔一并保留。
+    - 返回 None 表示 pyclipper 不可用（调用方回退）；[] 表示无结果。
     """
     if not _HAS_PYCLIPPER:
         return None
@@ -292,37 +285,54 @@ def clipperOffsetBothSides(pts: List[Point3D], totalWidth: float, closed: bool,
         return []
 
     half = totalWidth / 2.0
-    # 圆弧离散精度：实际 0.01 单位，但不大于偏移量的 1/10（避免极小偏移退化）
-    arcTol = max(int(round(min(0.01, half / 10.0) * scale)), 2)
+    # 圆弧离散精度：0.002 单位（≈2µm，JT_ROUND 拐角/端盖圆弧的折线化足够细，
+    # 圆角过渡肉眼平滑；0.01 档在圆角处可见棱面），但不大于偏移量的 1/10（避免极小偏移退化）
+    arcTol = max(int(round(min(0.002, half / 10.0) * scale)), 2)
 
-    def _run(delta: float, endType: int) -> list:
+    def _simplify(p: list) -> list:
+        """非零填充简化：把（单条）可能自交的折线并成不自交简单环，用于兜底
+        清理带状偏移残余的退化/自交环（不用于输入填充，否则会把五角星实心化、
+        丢失笔画围出的内孔）。"""
+        if len(p) < 3:
+            return []
+        try:
+            return [r for r in pyclipper.SimplifyPolygon(
+                p, pyclipper.PFT_NONZERO) if len(r) >= 3]
+        except Exception:
+            return [p]
+
+    def _run(paths: list, delta: float, endType: int) -> list:
         co = pyclipper.PyclipperOffset()
         co.ArcTolerance = arcTol
-        co.AddPath(path, pyclipper.JT_ROUND, endType)
+        for pp in paths:
+            co.AddPath(pp, pyclipper.JT_ROUND, endType)
         return co.Execute(int(round(delta * scale)))
 
     result: list = []
     if closed:
-        # 闭合路径首尾需重合，保证偏移正确
+        # 带状语义：把闭合曲线当“笔画加宽”，自交处笔画自然合并，
+        # 笔画围出的每个格子成为独立内孔（如五角星 → 1 外轮廓 + 6 内孔）。
+        # 整条闭合环以开放路径 ET_OPENROUND 偏移：首尾两点重合，圆头帽自相闭合无缝。
         if path[0] != path[-1]:
             path = path + [path[0]]
-        # 双向偏移：两个独立实例分别执行 +/-delta（避免状态互相影响导致内缩失效）
-        result.extend(_run(half, pyclipper.ET_CLOSEDPOLYGON))
-        result.extend(_run(-half, pyclipper.ET_CLOSEDPOLYGON))
+        band = _run([path], half, pyclipper.ET_OPENROUND)
+        # keepInner=False 仅保留外轮廓（正面积 CCW 环）；True 连内孔一并保留
+        result.extend(band if keepInner
+                      else [r for r in band if pyclipper.Area(r) > 0])
     else:
         endType = (pyclipper.ET_OPENROUND if capStyle == "round"
                    else pyclipper.ET_OPENBUTT)
-        result.extend(_run(half, endType))
+        result.extend(_run([path], half, endType))
 
-    result = _dedupeClipperPaths(result)
+    # 兜底：清理残余退化/自交环并去重
+    cleaned: list = []
+    for r in result:
+        if len(r) < 3:
+            continue
+        cleaned.extend(_simplify(r) or [r])
+    result = _dedupeClipperPaths(cleaned)
     if not result:
         return []
-
-    # 外轮廓判定：包围盒最大边长者（与 Rhino 插件一致，不计算面积）
-    if not keepInner and len(result) > 1:
-        outerIdx = max(range(len(result)),
-                       key=lambda k: _clipperBBoxSize(result[k]))
-        result = [result[outerIdx]]
 
     # 转回世界坐标，强制首尾重合（本项目闭合轮廓约定）
     out: List[List[Point3D]] = []

@@ -35,6 +35,10 @@ class NurbsCurveObject(BaseObject):
         self._closed: bool = False
         self._sampleCache: Optional[List[Point3D]] = None   # 采样缓存（内容变更即失效）
         self._sampleCachePerSeg: int = -1
+        # 度量缓存（键=采样列表身份：几何变化 → 采样列表整体重建 → 自动失效）
+        self._bbCache = None     # (samples, bbox)
+        self._lenCache = None    # (samples, length)
+        self._areaCache = None   # (samples, area)
 
     @staticmethod
     def create(degree: int, controlPoints: List[Point3D],
@@ -122,10 +126,15 @@ class NurbsCurveObject(BaseObject):
         self._invalidateSampleCache()
 
     def getBoundingBox(self) -> BoundingBox3D:
-        bb = BoundingBox3D()
-        for p in self.getSampledPoints():
-            bb.expand(p)
-        return bb
+        pts = self.getSampledPoints()
+        c = self._bbCache
+        if c is None or c[0] is not pts:
+            bb = BoundingBox3D()
+            for p in pts:
+                bb.expand(p)
+            self._bbCache = (pts, bb)
+            return bb
+        return c[1]
 
     def getPosition(self) -> Point3D:
         if self._segments and self._segments[0].controlPoints:
@@ -148,19 +157,27 @@ class NurbsCurveObject(BaseObject):
         return types
 
     def pathLength(self) -> float:
-        return polylineLength(self.getSampledPoints())
+        pts = self.getSampledPoints()
+        c = self._lenCache
+        if c is None or c[0] is not pts:
+            c = (pts, polylineLength(pts))
+            self._lenCache = c
+        return c[1]
 
     def enclosedArea(self) -> float | None:
         """闭合 NURBS 面积；同时接受 closed flag=True 或「采样点几何首尾重合」两种闭合。"""
-        pts = self.getSampledPoints()
-        if len(pts) < 3:
+        raw = self.getSampledPoints()
+        if len(raw) < 3:
             return None
         closed = bool(self._closed)
         if not closed:
-            if pts[0].distanceTo(pts[-1]) < 1e-6:
+            if raw[0].distanceTo(raw[-1]) < 1e-6:
                 closed = True
         if not closed:
             return None
-        if pts[0].distanceTo(pts[-1]) > 1e-12:
-            pts = pts + [pts[0]]
-        return closedArea2D(pts)
+        c = self._areaCache
+        if c is None or c[0] is not raw:
+            pts = raw if raw[0].distanceTo(raw[-1]) <= 1e-12 else raw + [raw[0]]
+            c = (raw, closedArea2D(pts))
+            self._areaCache = c
+        return c[1]

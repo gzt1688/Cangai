@@ -112,8 +112,21 @@ class ArcObject(BaseObject):
             self._p1 = self._p2 = self._p3 = None
 
     def scale(self, sx: float, sy: float, sz: float) -> None:
+        if sx < 0.0 or sy < 0.0:
+            # 负比例 = 镜像（变换面板 X/Y 镜像）。必须同步重映射起止角，
+            # 否则只有圆心翻转、弧朝向不变，看起来就像整段弧被平移了。
+            span = self._endAngle - self._startAngle
+            if abs(span) < 1e-9:
+                span = 2.0 * math.pi        # 起止角重合 = 整圆
+            a0 = math.atan2(sy * math.sin(self._startAngle),
+                            sx * math.cos(self._startAngle))
+            # 反射（sx*sy<0）会反转参数方向 → 扫掠角取反；
+            # 180° 旋转（sx、sy 同为负）方向不变。
+            self._startAngle = a0
+            self._endAngle = a0 + (span if sx * sy > 0 else -span)
         self._cx *= sx; self._cy *= sy; self._cz *= sz
         self._radius *= (abs(sx) + abs(sy)) * 0.5
+        self._p1 = self._p2 = self._p3 = None
 
     def getBoundingBox(self) -> BoundingBox3D:
         bb = BoundingBox3D()

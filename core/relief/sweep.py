@@ -243,8 +243,10 @@ def compute_sweep_delta(hf, poly: np.ndarray, params: SweepParams,
 
     # 作用范围按当前颜色裁剪（颜色无效/颜色内/颜色外）
     if params.color_scope in ("inside", "outside"):
+        from core.relief import paint_palette
         if color_mask is not None and color_mask.shape == (ny, nx):
-            inside_cur = color_mask == int(color_value)
+            # 未填色（EMPTY）= 浮雕模型基础色：当前颜色为基础色时一并命中
+            inside_cur = paint_palette.equals_value_mask(color_mask, color_value)
         else:
             inside_cur = np.zeros((ny, nx), dtype=bool)
         if params.color_scope == "inside":
@@ -339,9 +341,11 @@ def apply_brush_stamp(hf, cx: float, cy: float, params: SweepParams,
         return 0
     row_lo, row_hi, col_lo, col_hi, prof = hit
     if params.color_scope in ("inside", "outside"):
+        from core.relief import paint_palette
         if color_mask is not None and color_mask.shape == (hf.ny, hf.nx):
-            inside_cur = color_mask[row_lo:row_hi + 1,
-                                    col_lo:col_hi + 1] == int(color_value)
+            # 未填色（EMPTY）= 基础色：当前颜色为基础色时一并命中（仅 ROI 切片）
+            inside_cur = paint_palette.equals_value_mask(
+                color_mask[row_lo:row_hi + 1, col_lo:col_hi + 1], color_value)
         else:
             inside_cur = None
         if params.color_scope == "inside":

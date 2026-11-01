@@ -37,11 +37,21 @@ from core.relief.sweep import (SweepParams, DEFAULT_SWEEP_DIAMETER,
                                APPLY_MODES, APPLY_LABELS,
                                PARAM_SCALE, HEIGHT_STEP, PARAM_MIN)
 from core.relief.sweep import SweepParams as _BrushSweepParams
-from core.relief.smooth import (SmoothParams, MODE_LABELS, STRENGTH_PRESETS,
+from core.relief.smooth import (SmoothParams, MODES, MODE_LABELS,
+                                STRENGTH_PRESETS,
                                 STRENGTH_MIN, STRENGTH_MAX,
                                 DEFAULT_SMOOTH_STRENGTH,
                                 DEFAULT_SMOOTH_DIAMETER,
                                 DEFAULT_SMOOTH_HALF_LIFE)
+from core.relief.height_contrast import (HeightContrastParams,
+                                        BASES, BASE_LABELS, CURVE_LABELS,
+                                        GAIN_MODE_LABELS,
+                                        DEFAULT_GAIN_PCT, GAIN_PCT_MIN,
+                                        GAIN_PCT_MAX, DEFAULT_TARGET_MM,
+                                        DEFAULT_DEADBAND)
+from core.relief.region_slope import (CURVE_PRESET_NAMES, DIRECTIONS,
+                                      DIRECTION_LABELS)
+from ui.widgets.curve_editor import CurveEditor
 
 _SPIN_RANGE = (-999999.0, 999999.0)
 _LABEL_W = 52      # 行标签统一最小宽：容纳"指定角度"4 字不截断
@@ -166,6 +176,24 @@ class ParamPanelBase(QWidget):
 
     def _label(self, text: str) -> QLabel:
         return QLabel(text)
+
+    def _hintLabel(self, text: str = "", color: str | None = None,
+                   minH: int = 18) -> QLabel:
+        """可折行的提示标签（状态行/信息行）。
+
+        只开 wordWrap 不够：wordWrap 仅压小 minimumSizeHint，sizeHint 仍按单行算，
+        而宿主固定 270px 宽 + widgetResizable，长提示会把面板撑出横向滚动条
+        （内容跑到右边看不见）。水平策略设 Ignored，宽度完全交给布局分配。
+        """
+        lab = QLabel(text)
+        lab.setWordWrap(True)
+        sp = lab.sizePolicy()
+        sp.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        lab.setSizePolicy(sp)
+        lab.setMinimumHeight(minH)
+        if color:
+            lab.setStyleSheet("color:%s; padding:1px;" % color)
+        return lab
 
     def _addRow(self, label: str, widget: QWidget) -> None:
         row = QHBoxLayout()
@@ -578,6 +606,7 @@ class LineParamPanel(ParamPanelBase):
         self._btnAngleSign.setToolTip("切换：逆时针/顺时针")
         self._btnAngleSign.clicked.connect(self._onSignToggled)
         self._spinAngle = self._spin(0.0, decimals=2)
+        self._spinAngle.setRange(0.0, 180.0)     # 偏转角范围与读数/弧预览一致
         self._spinAngle.setMinimumWidth(44)
         rowAng = QHBoxLayout()
         rowAng.setSpacing(4)
@@ -2943,12 +2972,127 @@ class LevelCalibrateParamPanel(ParamPanelBase):
         self._status.setText(text)
 
 
+# ==================== HeightContrast（高差调整） ====================
+
+class HeightContrastParamPanel(ParamPanelBase):
+    """高差调整面板：以基准面为不动点拉开高度对比度（凸的更凸、凹的更凹）。
+
+    控件一行一个概念，任一控件变动都发 paramsChanged（命令从快照重放实时预览）；
+    底部信息行由命令回填“调整前 → 调整后”高差，让效果可量化。
+    """
+
+    finished = Signal()
+    paramsChanged = Signal()
+    scopeChanged = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        # ---- 作用范围：区域（需先点选曲线/色块）或整个模型 ----
+        self._scopeGroup = QButtonGroup(self)
+        self._layout.addWidget(self._radioRow("模式",
+                                             ("区域", "整个模型"),
+                                             self._scopeGroup, 0))
+        self._scopeGroup.button(1).setChecked(True)
+        self._scopeGroup.idClicked.connect(self._onScope)
+        # ---- 基准面 ----
+        self._comboBase = QComboBox()
+        for lab in BASE_LABELS:
+            self._comboBase.addItem(lab)
+        self._comboBase.currentIndexChanged.connect(self.paramsChanged)
+        self._layout.addWidget(self._row("基准", self._comboBase))
+        # ---- 增强方式：倍率 / 目标高差 ----
+        self._modeGroup = QButtonGroup(self)
+        self._layout.addWidget(self._radioRow("增强",
+                                            GAIN_MODE_LABELS,
+                                            self._modeGroup, 0))
+        self._modeGroup.button(0).setChecked(True)
+        self._modeGroup.idClicked.connect(self._onGainMode)
+        self._spinGain = self._spin(DEFAULT_GAIN_PCT, decimals=0, step=10.0)
+        self._spinGain.setRange(GAIN_PCT_MIN, GAIN_PCT_MAX)
+        self._spinGain.setSuffix(" %")
+        self._spinGain.valueChanged.connect(self.paramsChanged)
+        self._rowGain = self._row("增益", self._spinGain)
+        self._layout.addWidget(self._rowGain)
+        self._spinTarget = self._spin(DEFAULT_TARGET_MM, decimals=2, step=0.1)
+        self._spinTarget.setRange(0.01, 999.0)
+        self._spinTarget.setSuffix(" mm")
+        self._spinTarget.valueChanged.connect(self.paramsChanged)
+        self._rowTarget = self._row("目标高差", self._spinTarget)
+        self._layout.addWidget(self._rowTarget)
+        # ---- 曲线：线性 / 柔和（增量饱和） ----
+        self._curveGroup = QButtonGroup(self)
+        self._layout.addWidget(self._radioRow("曲线",
+                                            CURVE_LABELS,
+                                            self._curveGroup, 0))
+        self._curveGroup.button(0).setChecked(True)
+        self._curveGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
+        # ---- 噪声保护死区 + 限幅 ----
+        self._spinDead = self._spin(DEFAULT_DEADBAND, decimals=3, step=0.01)
+        self._spinDead.setRange(0.0, 20.0)
+        self._spinDead.setSuffix(" mm")
+        self._spinDead.valueChanged.connect(self.paramsChanged)
+        self._layout.addWidget(self._row("噪声保护", self._spinDead))
+        self._chkClip = QCheckBox("限幅到原高度范围")
+        self._chkClip.setToolTip("拉伸后不得超出作用域原最高/最低点（保住厚度）")
+        self._chkClip.toggled.connect(self.paramsChanged)
+        self._layout.addWidget(self._chkClip)
+        # ---- 信息行（命令回填，固定两行高）----
+        self._info = self._hintLabel("高差 —", theme.TEXT_DIM, 34)
+        self._layout.addWidget(self._info)
+        self._status = self._hintLabel("", theme.PRIMARY_DARK, 40)
+        self._layout.addWidget(self._status)
+        btn = self._button("完成", primary=True)
+        btn.clicked.connect(self.finished.emit)
+        self._layout.addWidget(btn)
+        self._layout.addStretch(1)
+        self._syncRows()
+
+    # ---------- 内部 ----------
+
+    def _onScope(self, *_):
+        self.scopeChanged.emit()
+        self.paramsChanged.emit()
+
+    def _onGainMode(self, *_):
+        self._syncRows()
+        self.paramsChanged.emit()
+
+    def _syncRows(self) -> None:
+        """增益行与目标高差行按方式二选一显示（减少无效输入）。"""
+        target = self._modeGroup.checkedId() == 1
+        self._rowGain.setVisible(not target)
+        self._rowTarget.setVisible(target)
+
+    # ---------- 对外 ----------
+
+    def scope(self) -> str:
+        return "region" if self._scopeGroup.checkedId() == 0 else "model"
+
+    def params(self) -> HeightContrastParams:
+        return HeightContrastParams(
+            base=BASES[self._comboBase.currentIndex()],
+            mode="target" if self._modeGroup.checkedId() == 1 else "gain",
+            gain=self._spinGain.value() / 100.0,
+            target_mm=self._spinTarget.value(),
+            curve="soft" if self._curveGroup.checkedId() == 1 else "linear",
+            deadband=self._spinDead.value(),
+            clip_range=self._chkClip.isChecked())
+
+    def setStatus(self, text: str) -> None:
+        self._status.setText(text)
+
+    def setInfo(self, text: str) -> None:
+        self._info.setText(text)
+
+
 # ==================== RegionSlope（斜面） ====================
 
 class RegionSlopeParamPanel(ParamPanelBase):
-    """斜面面板：选区域 → 点选曲线（刀刃/最高线）→ 选侧 → 曲线为刀刃斜切，
-    减去高度。参数：总斜高度、斜面类型（直线/样条/波浪/凸面/凹面）+
-    类型细化参数（波纹数/波纹幅度、弧度）。
+    """斜面面板：选区域 → 点选曲线（刀刃/最高线）→ 选侧 → 按截面曲线斜切。
+
+    截面曲线（PS 曲线风格）控制"保留高度比例"：横轴是截面位置（法向距离 /
+    半径 / 横向 / 竖向），纵轴 1=最高不减、0=减满。可加/删/拖控制点实时预览，
+    预设涵盖直线/圆顶/碗形/波浪等常见造型。
     """
 
     finished = Signal()
@@ -2956,14 +3100,20 @@ class RegionSlopeParamPanel(ParamPanelBase):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._applyingPreset = False
+
+        self._status = self._hintLabel(
+            "① 选区域 → ② 点刀刃线（最高线）→ ③ 选一侧",
+            color=theme.PRIMARY_DARK, minH=16)
+        self._layout.addWidget(self._status)
+
         self._spinH = self._spin(2.0, decimals=2, step=0.1)
         self._spinH.setRange(0.0, 9999.0)
-        self._layout.addWidget(self._paramRow("总斜高度", self._spinH))
-        # ---- 平台距离：距曲线该距离内不减（平台），斜面从该处开始 ----
+        self._layout.addWidget(self._row("总斜高度", self._spinH))
+        # ---- 平台距离：距起点该距离内不减（平台），斜面从该处开始 ----
         self._spinPlateau = self._spin(0.0, decimals=2, step=0.1)
         self._spinPlateau.setRange(0.0, 9999.0)
-        self._platRow = self._paramRow("平台距离", self._spinPlateau)
-        self._layout.addWidget(self._platRow)
+        self._layout.addWidget(self._row("平台距离", self._spinPlateau))
         # ---- 叠加方式：切除（默认）/ 叠加 ----
         self._modeGroup = QButtonGroup(self)
         self._layout.addWidget(self._radioRow("方式",
@@ -2971,102 +3121,126 @@ class RegionSlopeParamPanel(ParamPanelBase):
                                                self._modeGroup, 0))
         self._modeGroup.button(0).setChecked(True)
         self._modeGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
-        self._typeGroup = QButtonGroup(self)
-        self._layout.addWidget(self._radioRow("类型",
-                                               ("直线", "样条"),
-                                               self._typeGroup, 0))
-        self._layout.addWidget(self._radioRow("", ("波浪", "凸面", "凹面"),
-                                               self._typeGroup, 2))
-        self._typeGroup.button(0).setChecked(True)
-        self._typeGroup.idClicked.connect(self._onTypeChanged)
 
-        # ---- 波浪细化参数（仅波浪类型显示） ----
-        self._spinWaveCount = self._ispin(2, 1, 60)
-        self._spinWaveAmp = self._ispin(30, 0, 100)
-        self._spinWaveAmp.setSuffix("%")
-        self._waveRow1 = self._paramRow("波纹数", self._spinWaveCount)
-        self._waveRow2 = self._paramRow("波纹幅度", self._spinWaveAmp)
-        self._layout.addWidget(self._waveRow1)
-        self._layout.addWidget(self._waveRow2)
-        # ---- 凸/凹细化参数（仅凸面/凹面显示） ----
-        self._spinArc = self._ispin(25, 0, 100)
-        self._spinArc.setSuffix("%")
-        self._arcRow = self._paramRow("弧度", self._spinArc)
-        self._layout.addWidget(self._arcRow)
-        self._waveRow1.setVisible(False)
-        self._waveRow2.setVisible(False)
-        self._arcRow.setVisible(False)
+        # ---- 方向：法向（沿曲线法向）/ 径向（圆形截面）/ 横向 / 竖向 ----
+        gDir, lDir = self._group("方向")
+        self._dirGroup = QButtonGroup(self)
+        lDir.addWidget(self._radioRow("", DIRECTION_LABELS[0:2],
+                                      self._dirGroup, 0))
+        lDir.addWidget(self._radioRow("", DIRECTION_LABELS[2:4],
+                                      self._dirGroup, 2))
+        self._dirGroup.button(0).setChecked(True)
+        self._dirGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
+        self._layout.addWidget(gDir)
+
+        # ---- 截面曲线（可加点 / 拖点 / 删点，实时预览）----
+        gCurve, lCurve = self._group("截面曲线")
+        lCurve.setContentsMargins(4, 2, 4, 2)   # 曲线框尽量占满分组
+        self._curve = CurveEditor()
+        lCurve.addWidget(self._curve)
+
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self._comboPreset = QComboBox()
+        self._comboPreset.addItem("预设…")
+        for name in CURVE_PRESET_NAMES:
+            self._comboPreset.addItem(name)
+        self._comboPreset.currentIndexChanged.connect(self._onPreset)
+        lay.addWidget(self._comboPreset, 1)
+        self._btnFlip = self._button2("翻转")
+        self._btnFlip.setToolTip("上下翻转曲线（最高 ↔ 最低）")
+        self._btnFlip.clicked.connect(self._onFlip)
+        lay.addWidget(self._btnFlip)
+        lCurve.addWidget(row)
+
+        hint = self._hintLabel("纵轴＝保留高度，横轴＝截面位置", minH=14)
+        hint.setStyleSheet("color:%s;" % theme.TEXT_DIM)
+        lCurve.addWidget(hint)
+        self._layout.addWidget(gCurve)
+
+        self._curve.pointsChanged.connect(self._onCurveChanged)
+        for s in (self._spinH, self._spinPlateau):
+            s.valueChanged.connect(lambda *_: self.paramsChanged.emit())
 
         btn = self._button("完成", primary=True)
         btn.clicked.connect(self.finished.emit)
         self._layout.addWidget(btn)
         self._layout.addStretch(1)
 
-    def _paramRow(self, label: str, spin: QWidget) -> QWidget:
-        """标签 + 输入框一行（可整体显示/隐藏的细化参数行）。
+    # ---------- 曲线联动 ----------
 
-        直接连接传入 spin 的 valueChanged（QDoubleSpinBox 不是 QSpinBox
-        子类，findChildren(QSpinBox) 找不到它导致平台距离等不触发预览）。
-        """
-        w = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setSpacing(6)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lab = QLabel(label)
-        lab.setMinimumWidth(_LABEL_W)
-        lay.addWidget(lab)
-        lay.addWidget(spin)
-        lay.addStretch(1)
-        if hasattr(spin, "valueChanged"):
-            spin.valueChanged.connect(lambda *_: self.paramsChanged.emit())
-        return w
-
-    def _onTypeChanged(self, tid: int) -> None:
-        self._waveRow1.setVisible(tid == 2)
-        self._waveRow2.setVisible(tid == 2)
-        self._arcRow.setVisible(tid in (3, 4))
+    def _onCurveChanged(self, _pts) -> None:
+        if not self._applyingPreset and self._comboPreset.currentIndex() != 0:
+            self._comboPreset.blockSignals(True)
+            self._comboPreset.setCurrentIndex(0)
+            self._comboPreset.blockSignals(False)
         self.paramsChanged.emit()
-        self._notifyResize()
 
-    def _radioRow(self, label: str, texts, group: QButtonGroup,
-                  start_id: int = 0) -> QWidget:
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setSpacing(6)
-        lay.setContentsMargins(0, 0, 0, 0)
-        if label:
-            lab = QLabel(label)
-            lab.setMinimumWidth(_LABEL_W)
-            lay.addWidget(lab)
-        for i, t in enumerate(texts):
-            rb = QRadioButton(t)
-            group.addButton(rb, start_id + i)
-            lay.addWidget(rb)
-        lay.addStretch(1)
-        return row
+    def _onPreset(self, index: int) -> None:
+        if index <= 0:
+            return
+        self._applyingPreset = True
+        try:
+            self._curve.setPreset(self._comboPreset.itemText(index))
+        finally:
+            self._applyingPreset = False
+
+    def _onFlip(self) -> None:
+        self._applyingPreset = True
+        try:
+            self._curve.flip()
+        finally:
+            self._applyingPreset = False
+        self._comboPreset.blockSignals(True)
+        self._comboPreset.setCurrentIndex(0)
+        self._comboPreset.blockSignals(False)
+
+    # ---------- 取值 ----------
 
     def height(self) -> float:
         return float(self._spinH.value())
 
     def profileType(self) -> str:
-        types = ("linear", "spline", "wave", "convex", "concave")
-        i = self._typeGroup.checkedId()
-        return types[i] if 0 <= i < len(types) else "linear"
+        return "curve"
+
+    def direction(self) -> str:
+        i = self._dirGroup.checkedId()
+        return DIRECTIONS[i] if 0 <= i < len(DIRECTIONS) else "normal"
 
     def profileParams(self) -> dict:
-        """收集参数：叠加方式 + 平台距离 + 当前类型细化参数。"""
-        out = {"plateau": float(self._spinPlateau.value()),
-               "mode": "add" if self._modeGroup.checkedId() == 1 else "subtract"}
-        t = self.profileType()
-        if t == "wave":
-            out["wave_count"] = int(self._spinWaveCount.value())
-            out["wave_amp"] = self._spinWaveAmp.value() / 100.0
-        elif t in ("convex", "concave"):
-            out["arc"] = self._spinArc.value() / 100.0
-        return out
+        """收集参数：叠加方式 + 平台距离 + 方向 + 截面曲线控制点。"""
+        return {"plateau": float(self._spinPlateau.value()),
+                "mode": "add" if self._modeGroup.checkedId() == 1
+                        else "subtract",
+                "direction": self.direction(),
+                "curve_points": self._curve.points()}
+
+    # ---------- 参数记忆（曲线点单独存） ----------
+
+    def _persistKey(self) -> str:
+        # v2：面板结构变了（旧版第二个按钮组是“类型”，会误恢复成方向径向）
+        return "RegionSlopeParamPanel.v2"
+
+    def _persistWidgets(self) -> list:
+        # 预设下拉只用于“应用一次”，不参与恢复（否则重开会覆盖用户曲线）
+        return [w for w in super()._persistWidgets()
+                if w is not self._comboPreset]
+
+    def _collectState(self) -> dict:
+        state = super()._collectState()
+        state["curve_points"] = self._curve.points()
+        return state
+
+    def _applyState(self, state: dict) -> None:
+        super()._applyState(state)
+        pts = state.get("curve_points")
+        if isinstance(pts, list) and len(pts) >= 2:
+            self._curve.setPoints(pts, emit=False)
 
     def setStatus(self, text: str) -> None:
-        pass
+        self._status.setText(text)
 
 
 # ==================== RegionArray（区域阵列） ====================
@@ -3102,8 +3276,12 @@ class RegionArrayParamPanel(ParamPanelBase):
         self._spinRectY = self._ispin(3, 1, 100)
         self._spinRectGapX = self._spin(5.0, decimals=2, step=0.5)
         self._spinRectGapY = self._spin(5.0, decimals=2, step=0.5)
-        lRect.addWidget(self._ctrlRow("X 数量", self._spinRectX))
-        lRect.addWidget(self._ctrlRow("Y 数量", self._spinRectY))
+        self._btnRectRevX = self._dirButton("反向", "按下后 X 方向副本向负方向排布")
+        self._btnRectRevY = self._dirButton("反向", "按下后 Y 方向副本向负方向排布")
+        lRect.addWidget(self._ctrlRow("X 数量", self._spinRectX,
+                                      self._btnRectRevX))
+        lRect.addWidget(self._ctrlRow("Y 数量", self._spinRectY,
+                                      self._btnRectRevY))
         lRect.addWidget(self._ctrlRow("X 间距", self._spinRectGapX))
         lRect.addWidget(self._ctrlRow("Y 间距", self._spinRectGapY))
         self._layout.addWidget(self._rectGroup)
@@ -3182,6 +3360,8 @@ class RegionArrayParamPanel(ParamPanelBase):
         for chk in (self._chkCircleRotate, self._chkCurveFill,
                     self._chkCurveRotate, self._chkCurveOnCurve):
             chk.toggled.connect(lambda *_: self.paramsChanged.emit())
+        self._btnRectRevX.toggled.connect(lambda *_: self.paramsChanged.emit())
+        self._btnRectRevY.toggled.connect(lambda *_: self.paramsChanged.emit())
         self._typeGroup.idClicked.connect(lambda *_: self.paramsChanged.emit())
 
         self._onModeChanged(0)
@@ -3212,6 +3392,23 @@ class RegionArrayParamPanel(ParamPanelBase):
         if extra is not None:
             lay.addWidget(extra)
         return row
+
+    def _dirButton(self, text: str, tip: str) -> QPushButton:
+        """可按下高亮的开关按钮（按下 = 生效，再按取消）。"""
+        b = self._button2(text)
+        b.setCheckable(True)
+        b.setToolTip(tip)
+        b.setMinimumWidth(44)
+        b.setStyleSheet(
+            "QPushButton { background:%s; color:%s; border:1px solid %s;"
+            " border-radius:2px; padding:3px 8px; }"
+            "QPushButton:hover { border-color:%s; color:%s; }"
+            "QPushButton:checked { background:%s; color:%s;"
+            " border-color:%s; font-weight:bold; }"
+            % (theme.BG_PANEL, theme.TEXT, theme.BORDER, theme.PRIMARY,
+               theme.PRIMARY_DARK, theme.PRIMARY, theme.TEXT_ON_PRIMARY,
+               theme.PRIMARY))
+        return b
 
     def _radioRow(self, label: str, texts, group: QButtonGroup,
                   start_id: int = 0) -> QWidget:
@@ -3267,6 +3464,12 @@ class RegionArrayParamPanel(ParamPanelBase):
 
     def rectGapY(self) -> float:
         return float(self._spinRectGapY.value())
+
+    def rectReverseX(self) -> bool:
+        return self._btnRectRevX.isChecked()
+
+    def rectReverseY(self) -> bool:
+        return self._btnRectRevY.isChecked()
 
     # 圆形
     def circleCnt(self) -> int:
@@ -3591,7 +3794,6 @@ class SmoothParamPanel(ParamPanelBase):
 
     def mode(self) -> str:
         i = self._modeGroup.checkedId()
-        from core.relief.smooth import MODES
         return MODES[i] if 0 <= i < len(MODES) else "both"
 
     def strength(self) -> float:
@@ -3641,8 +3843,9 @@ class StampParamPanel(ParamPanelBase):
     高低层次调整（作用区域 + 高/中/低三层 + 三个调整按钮）。
 
     作用范围二选一——**颜色无效**：按鼠标圆圈区域冲压（光标跟随圆圈，
-    A 缩小 / S 放大，直径输入框联动）；**颜色内**：按单击处色号的整个
-    色块区域冲压（不受圆圈限制）。高低层次调整的作用区域以底部调色板
+    A 缩小 / S 放大，直径输入框联动）；**颜色内**：按单击处色号的相连
+    色块区域冲压（只作用于与单击格同色且连通的格子，不受圆圈限制）。
+    高低层次调整的作用区域以底部调色板
     当前颜色为参照。面板只放参数，不放按钮/提示：冲压由画布单击触发，
     所有反馈显示在画布左下角信息区（CommandManager.notifyResult）。
     """
@@ -3948,6 +4151,10 @@ class ArrayParamPanel(ParamPanelBase):
         rectLay.addWidget(self._row("X 间距", self._spinRectGapX))
         rectLay.addWidget(self._row("Y 间距", self._spinRectGapY))
         rectLay.addWidget(self._chkXYEqual)
+        # 信息显示：阵列后的总体尺寸（宽 × 高），随参数/选中对象实时刷新
+        self._labRectTotal = QLabel("总尺寸：—")
+        self._labRectTotal.setStyleSheet("color:%s;" % theme.TEXT_DIM)
+        rectLay.addWidget(self._labRectTotal)
         self._layout.addWidget(self._rectGroup)
 
         # ---- 圆形阵列参数 ----
@@ -4104,6 +4311,10 @@ class ArrayParamPanel(ParamPanelBase):
     def setCenterLabel(self, text: str) -> None:
         self._labCenter.setText(text)
 
+    def setRectTotal(self, text: str) -> None:
+        """回填矩形阵列“总尺寸：宽 × 高”信息显示。"""
+        self._labRectTotal.setText(text)
+
 
 # ==================== Offset 偏移 ====================
 
@@ -4128,6 +4339,12 @@ class OffsetParamPanel(ParamPanelBase):
 
         self._chkBoth = QCheckBox("双侧偏移")
         self._chkInner = QCheckBox("保留内轮廓")
+        # “保留内轮廓”只在双侧偏移下才有意义：闭合曲线双向偏移才会得到外/内
+        # 两条轮廓，单侧偏移只有一条线，勾了也没东西可保留——所以默认置灰。
+        self._chkInner.setToolTip("仅在勾选“双侧偏移”时有意义：闭合曲线双向偏移得到"
+                                  "外/内两条轮廓，勾选后两者都保留")
+        self._chkBoth.toggled.connect(self._syncInnerEnabled)
+        self._syncInnerEnabled()
         rowBoth = QHBoxLayout()
         rowBoth.setSpacing(8)
         rowBoth.addWidget(self._chkBoth)
@@ -4168,6 +4385,10 @@ class OffsetParamPanel(ParamPanelBase):
     def distance(self) -> float:
         return self._spinDist.value()
 
+    def _syncInnerEnabled(self) -> None:
+        """“保留内轮廓”跟随“双侧偏移”置灰/启用（不丢用户已勾的选择）。"""
+        self._chkInner.setEnabled(self._chkBoth.isChecked())
+
     def bothSides(self) -> bool:
         return self._chkBoth.isChecked()
 
@@ -4175,7 +4396,8 @@ class OffsetParamPanel(ParamPanelBase):
         return self._chkCap.isChecked()
 
     def keepInner(self) -> bool:
-        return self._chkInner.isChecked()
+        """保留内轮廓：置灰（未开双侧偏移）时一律按不保留读，防面板状态残留。"""
+        return self._chkInner.isEnabled() and self._chkInner.isChecked()
 
     def capStyle(self) -> str:
         """端盖样式：'butt' 平头盖 / 'round' 圆头盖。"""
@@ -4309,6 +4531,9 @@ class OutlineParamPanel(ParamPanelBase):
         self._layout.addLayout(modeRow)
 
         self._spinDist = self._spin(2.0, decimals=3, step=0.5)
+        self._spinDist.setRange(0.0, 9999.0)
+        self._spinDist.setToolTip("外偏距离 mm；设为 0 时按 0.001 执行（等价偏移 0.001），"
+                                  "选中曲线（含开放线）全部包进轮廓")
         self._chkRebuild = QCheckBox("抽稀去密集点（保形状）")
         self._chkRebuild.setChecked(True)
         self._spinTol = self._spin(0.01, decimals=3, step=0.005)
@@ -4383,6 +4608,64 @@ class OutlineParamPanel(ParamPanelBase):
 
     def tolerance(self) -> float:
         return self._spinTol.value()
+
+    def setHint(self, text: str) -> None:
+        pass
+
+
+# ==================== BBox 包围盒 ====================
+
+class BBoxParamPanel(ParamPanelBase):
+    """包围盒面板：把选中的全部曲线合成一个轴对齐包围盒（可选四角圆角）。
+
+    信号：
+    - paramsChanged(): 包围盒距离/倒角半径变更 → 命令端刷新预览
+    - confirmed(): 点击"确定"生成矩形
+    - cancelRequested(): 点击"取消"
+    """
+
+    paramsChanged = Signal()
+    confirmed = Signal()
+    cancelRequested = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._spinDist = self._spin(0.0, decimals=3, step=1.0)
+        self._spinDist.setRange(0.0, 9999.0)
+        self._spinDist.setToolTip("包围盒向外偏移距离 mm；0 = 紧贴选中曲线的包围盒")
+        self._addRow("包围盒距离", self._spinDist)
+
+        self._spinFillet = self._spin(3.0, decimals=3, step=1.0)
+        self._spinFillet.setRange(0.0, 9999.0)
+        self._spinFillet.setToolTip("四角圆角半径 mm；0 = 直角。"
+                                    "半径自动收敛到短边的一半（再大也没用）")
+        self._addRow("倒角半径", self._spinFillet)
+
+        hint = QLabel("选中任意条曲线，生成一个包围盒矩形"
+                      "（可设向外偏移与四角圆角半径）")
+        hint.setStyleSheet("color:%s;" % theme.TEXT_DIM)
+        hint.setWordWrap(True)
+        self._layout.addWidget(hint)
+
+        btnRow = QHBoxLayout()
+        btnOk = self._button("确定", primary=True)
+        btnOk.clicked.connect(self.confirmed.emit)
+        btnCancel = self._button2("取消")
+        btnCancel.clicked.connect(self.cancelRequested.emit)
+        btnRow.addWidget(btnOk)
+        btnRow.addWidget(btnCancel)
+        self._layout.addLayout(btnRow)
+        self._layout.addStretch(1)
+
+        self._spinDist.valueChanged.connect(lambda *_: self.paramsChanged.emit())
+        self._spinFillet.valueChanged.connect(lambda *_: self.paramsChanged.emit())
+
+    def distance(self) -> float:
+        return self._spinDist.value()
+
+    def filletRadius(self) -> float:
+        """四角圆角半径（mm，0 = 直角）。"""
+        return self._spinFillet.value()
 
     def setHint(self, text: str) -> None:
         pass
@@ -5351,57 +5634,78 @@ class RevolveSlopeParamPanel(ParamPanelBase):
 class ModelScaleParamPanel(ParamPanelBase):
     """模型扩缩参数面板：上下左右四个方向扩展/收缩模型边界。
 
-    每个方向 = 开关按钮 + 数值输入框：按钮按下去（高亮）该方向才参与扩缩，
-    关闭的方向按 0 处理（数值框同步禁用）。"""
+    布局按方位摆放（上/下/左/右 各占十字网格对应格，中心放提示），一眼对应
+    模型四边。每个方向 = 动作按钮（上）+ 数值输入框（下）：**单击方向按钮即只
+    对该方向按当前数值扩缩**（就地生效、命令保持可连续点）；“应用”按四方向
+    数值一次性全部扩缩并结束命令。"""
 
-    finished = Signal()
+    finished = Signal()               # 应用：全部四方向，随后结束命令
+    applyDirection = Signal(int)      # 单击方向按钮：0=上 1=下 2=左 3=右
     paramsChanged = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._spins: list[QDoubleSpinBox] = []
-        self._toggles: list[QPushButton] = []
-        for label in ("上", "下", "左", "右"):
+
+        # 十字方位网格：上(0,1) 下(2,1) 左(1,0) 右(1,2)，中心放提示
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        for c in range(3):
+            grid.setColumnStretch(c, 1)
+        pos = {"上": (0, 1), "下": (2, 1), "左": (1, 0), "右": (1, 2)}
+        cell_w = 66
+        # 顺序固定为 上/下/左/右，与 applyDirection 索引、scaleValues() 元组一致
+        for idx, label in enumerate(("上", "下", "左", "右")):
             sp = self._spin(5.0, decimals=2, step=1.0)
             sp.setRange(-99999.0, 99999.0)
-            tg = QPushButton(label)
-            tg.setCheckable(True)
-            tg.setChecked(True)
-            tg.setMinimumWidth(30)
-            tg.setStyleSheet(self._toggleStyle())
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            row.addWidget(tg)
-            row.addWidget(sp, 1)
-            self._layout.addLayout(row)
-            self._toggles.append(tg)
+            sp.setFixedWidth(cell_w)
+            sp.setToolTip("设本方向扩缩值（正=扩大，负=收缩）；点「%s」只处理该方向" % label)
+            bt = QPushButton(label)
+            bt.setFixedWidth(cell_w)
+            bt.setStyleSheet(self._toggleStyle())
+            bt.setToolTip("立即只沿「%s」方向按当前数值扩缩" % label)
+            bt.clicked.connect(lambda checked=False, i=idx: self.applyDirection.emit(i))
+            cell = QVBoxLayout()
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.setSpacing(2)
+            cell.addWidget(bt, 0, Qt.AlignHCenter)
+            cell.addWidget(sp, 0, Qt.AlignHCenter)
+            r, c = pos[label]
+            grid.addLayout(cell, r, c)
             self._spins.append(sp)
-            tg.toggled.connect(lambda on, s=sp: s.setEnabled(on))
-            tg.toggled.connect(lambda *_: self.paramsChanged.emit())
             sp.valueChanged.connect(lambda *_: self.paramsChanged.emit())
 
+        center = QLabel("扩缩")
+        center.setAlignment(Qt.AlignCenter)
+        center.setStyleSheet("color:%s; font-weight:bold;" % theme.TEXT)
+        grid.addWidget(center, 1, 1)
+        self._layout.addLayout(grid)
+
         btn = self._button("应用", primary=True)
+        btn.setToolTip("四个方向按各自数值一次性全部扩缩，并结束命令")
         btn.clicked.connect(self.finished.emit)
         self._layout.addWidget(btn)
         self._layout.addStretch(1)
 
     def _toggleStyle(self) -> str:
-        """方向开关样式：未选中灰字描边，选中主题色高亮（与主按钮同色系）。"""
+        """方向动作按钮样式：与“应用”主按钮一致的固定背景色（点击即执行）。"""
         return (
             "QPushButton { background:%s; color:%s; border:1px solid %s;"
-            " border-radius:2px; padding:2px 4px; }"
-            "QPushButton:hover { border-color:%s; color:%s; }"
-            "QPushButton:checked { background:%s; color:%s; border-color:%s; }"
-            "QPushButton:checked:hover { background:%s; }"
-            % (theme.BG_PANEL, theme.TEXT, theme.BORDER,
-               theme.PRIMARY, theme.PRIMARY_DARK,
-               theme.PRIMARY, theme.TEXT_ON_PRIMARY, theme.PRIMARY,
-               theme.PRIMARY_DARK))
+            " border-radius:2px; padding:2px 4px; font-weight:bold; }"
+            "QPushButton:hover { background:%s; }"
+            "QPushButton:pressed { background:%s; }"
+            % (theme.PRIMARY, theme.TEXT_ON_PRIMARY, theme.PRIMARY,
+               theme.PRIMARY_DARK, theme.PRIMARY_DARK))
 
     def scaleValues(self) -> tuple[float, float, float, float]:
-        """返回 (上, 下, 左, 右) 的扩缩值（mm）；开关关闭的方向按 0 处理。"""
-        return tuple(sp.value() if tg.isChecked() else 0.0
-                     for tg, sp in zip(self._toggles, self._spins))
+        """返回 (上, 下, 左, 右) 四个方向的当前数值（mm），供“应用”全部执行。"""
+        return tuple(sp.value() for sp in self._spins)
+
+    def directionValue(self, idx: int) -> float:
+        """第 idx 方向（0=上 1=下 2=左 3=右）的当前数值（mm）。"""
+        return float(self._spins[idx].value())
 
     def setStatus(self, text: str) -> None:
         pass

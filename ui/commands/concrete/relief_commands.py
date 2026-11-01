@@ -10,7 +10,8 @@ ReconstructRelief：对选中的浮雕模型把放置变换（移动/缩放/旋�
 
 Stamp：冲压 + 高低层次调整（复刻插件“冲压页”并重设蒙版）。Rhino 插件用选中
 闭合曲线的“曲线内/外”限定冲压范围；本应用改为二选一——颜色无效按**鼠标
-圆圈**区域（A 缩小 / S 放大直径），颜色内按**按下处色号的整个色块区域**。
+圆圈**区域（A 缩小 / S 放大直径），颜色内按**按下处色号的相连色块区域**
+（同色但不连通的格子不冲压）。
 支持按住拖动连续冲压、按住不动持续冲压（150ms 一拍），一次笔画 = 一次撤销。
 
 SweepMaterial：导动堆料（复刻插件“曲面导动”页并升级）。笔刷沿单击的曲线
@@ -28,6 +29,7 @@ import gc
 import math
 import os
 import time
+import traceback
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QPointF
@@ -51,12 +53,17 @@ from core.relief.region_deform import deform_region
 from core.relief.region_slope import region_slope, split_sides
 from core.relief.revolve_slope import revolve_slope
 from core.relief.stamp import (apply_stamp, apply_level_adjust,
-                               build_circle_mask, DIAMETER_SCALE,
+                               build_circle_mask, build_color_region_mask,
+                               DIAMETER_SCALE,
                                DIAMETER_MIN, DIAMETER_MAX,
                                LEVEL_REGIONS, LEVEL_REGION_LABELS)
 from core.relief.smooth import (apply_smooth_stamp, apply_sweep_smooth,
-                                MODES, MODE_LABELS, STRENGTH_STEP)
+                                SmoothParams, MODES, MODE_LABELS,
+                                STRENGTH_STEP)
 from core.relief.textures import KIND_LABELS, apply_texture
+from core.relief.height_contrast import (HeightContrastParams,
+                                        apply_height_contrast, format_stats,
+                                        format_stats_lines)
 from core.relief.slope_analysis import (ZONE_COLORS, ZONE_NAMES,
                                         mask_contours, slope_zone_masks,
                                         field_contours)
@@ -73,6 +80,7 @@ from ..param_panels import (NewModelParamPanel, ReconstructParamPanel,
                             RegionSymmetryParamPanel,
                             RegionDeformParamPanel,
                             LevelCalibrateParamPanel,
+                            HeightContrastParamPanel,
                             RegionSlopeParamPanel,
                             RevolveSlopeParamPanel,
                             ModelScaleParamPanel,
@@ -1318,9 +1326,12 @@ class StampCommand(CommandInstance):
     交互：光标跟随一个可调直径的圆圈（预览），**A 缩小 / S 放大**直径；
     在浮雕模型上**按下开始冲压笔画**——
       - 拖动：沿路径按间距连续冲压（圆圈区域 / 颜色内整块）；
-      - 按住不动：150ms 一拍持续冲压（规律重复盖章）；
+      - 按住不动：150ms 一拍持续冲压（仅圆圈范围；颜色内一次点击一次冲压，
+        不自动重复，防相对模式高度叠加）；
       - 松开结束——一次笔画 = 一次可撤销操作。
-      - 颜色无效：整个圆圈区域；颜色内：**按下处色号的整个色块区域**。
+      - 颜色无效：整个圆圈区域；颜色内：**按下处色号的相连色块区域**
+        （同色但不与按下格连通的格子不冲压；未填色的模型默认色/图层底色
+        =色号 0 也算一种颜色，此时以该格所在的连通块为区域）。
     绝对/相对、正/负方向取面板参数（绝对模式重复冲压幂等）。高低层次
     调整仍由面板按钮触发（作用区域以底部调色板当前颜色为参照）。命令
     常驻（右键/完成按钮结束）。
@@ -1338,6 +1349,7 @@ class StampCommand(CommandInstance):
         self._stroking = False     # 冲压笔画进行中（按下→拖动/按住→松开）
         self._lastStamp = None     # 最近一次盖章的世界坐标（弧长插值起点）
         self._stampColor = 0       # 颜色内模式按下处色号（笔画期间固定）
+        self._stampRegion = None   # 颜色内模式按下处同色连通区域掩膜（笔画期间固定）
         self._totalCells = 0       # 本笔累计冲压格数（松开时反馈）
         self._lastNotify = 0.0     # 上次推进版本+通知视口的时刻（节流用）
         self._airTimer = None      # 持续冲压节拍定时器
@@ -1348,6 +1360,7 @@ class StampCommand(CommandInstance):
         self._lastWp = None
         self._stroking = False
         self._lastStamp = None
+        self._stampRegion = None
         # 清掉上一操作的吸附气泡残留，冲压不做任何画布取点
         clr = getattr(self._view, "clearSnapMarker", None)
         if callable(clr):
@@ -1460,22 +1473,29 @@ class StampCommand(CommandInstance):
         hf = model.heightField()
         r = self._radius()
         ox, oy = hf.origin
-        color = self._cellColorAt(model, wp)
+        cell = self._cellAt(model, wp)
         if self._panel.scope() == "inside":
-            # 颜色内：取按下处色号的整个色块（笔画期间目标色块固定）
-            if color is None:
-                self._notify("请点击模型上的颜色区域")
+            # 颜色内：取按下处色号的**相连**色块（同色但不连通的格子不冲压，
+            # 笔画期间目标区域固定）。未填色的模型默认色（色号 0）同样算一种
+            # 颜色——点在模型上即以该格连通区域为准；点在图幅外才拒绝。
+            if cell is None:
+                self._notify("请点击模型范围（颜色内以单击处相连色块为区域）")
                 return
-        else:
-            # 颜色无效：圆圈与模型包围盒相交才尝试（圆心可略出界，蹭边也能冲到）
-            if not (ox - r <= wp.x <= ox + (hf.nx - 1) * hf.spacing + r
-                    and oy - r <= wp.y <= oy + (hf.ny - 1) * hf.spacing + r):
-                self._notify("请点击模型范围（圆圈需覆盖模型）")
-                return
-        self._beginStampStroke(model, wp, color if color is not None else 0)
+            self._beginStampStroke(model, wp, cell[2], cell[:2])
+            return
+        # 颜色无效：圆圈与模型包围盒相交才尝试（圆心可略出界，蹭边也能冲到）
+        if not (ox - r <= wp.x <= ox + (hf.nx - 1) * hf.spacing + r
+                and oy - r <= wp.y <= oy + (hf.ny - 1) * hf.spacing + r):
+            self._notify("请点击模型范围（圆圈需覆盖模型）")
+            return
+        self._beginStampStroke(model, wp, 0, None)
 
-    def _beginStampStroke(self, model, wp, color_value: int) -> None:
-        """开始冲压笔画：开启撤销会话并立即冲第一下，同时启动持续冲压节拍。"""
+    def _beginStampStroke(self, model, wp, color_value: int, seed=None) -> None:
+        """开始冲压笔画：开启撤销会话并立即冲第一下，同时启动持续冲压节拍。
+
+        seed=(row, col) 为颜色内模式单击格；在此一次性算出同色连通区域并
+        缓存到笔画结束（冲压只改高度、不改色号蒙版，区域保持稳定）。
+        """
         if model.hasPendingTransform():
             model.bake()
         # 与雕刻笔刷同因：笔画期暂停循环 GC，防偶发长帧（模型"闪一下"）
@@ -1485,28 +1505,39 @@ class StampCommand(CommandInstance):
         self._doc.beginEdit()
         self._stroking = True
         self._stampColor = color_value
+        if seed is not None:
+            self._stampRegion = build_color_region_mask(
+                model.heightField(), model.colorMask(), color_value, seed)
+        else:
+            self._stampRegion = None
         self._totalCells = 0
         self._lastWp = wp
         self._lastStamp = (wp.x, wp.y)
         self._stampOnce(model, wp)
         self._touchModel(model, force=True)
-        self._ensureAirTimer().start()
+        # 持续冲压节拍只适用于圆圈（颜色无效）笔刷；颜色内作用于相连色块，
+        # 节拍会把手动点击自动重复成多次冲压（相对模式高度被叠加），不启动
+        if self._panel is not None and self._panel.scope() != "inside":
+            self._ensureAirTimer().start()
 
     def _stampOnce(self, model, wp) -> None:
         """按当前面板参数冲压一次（拖动盖章与气刷节拍共用）。"""
         if self._panel is None:
             return
         if self._panel.scope() == "inside":
-            circle = None                 # 颜色内：整个色块（目标色块笔画期间固定）
+            circle = None                 # 颜色内：单击处相连色块（笔画期间固定）
             color_value = self._stampColor
+            region = self._stampRegion
         else:
             hf = model.heightField()
             circle = build_circle_mask(hf, (wp.x, wp.y), self._radius())
             color_value = 0
+            region = None
         params = self._panel.stampParams()
         changed = apply_stamp(model.heightField(), params, circle,
                               color_mask=model.colorMask(),
-                              color_value=color_value)
+                              color_value=color_value,
+                              color_region_mask=region)
         self._totalCells += changed
         if changed:
             self._touchModel(model)
@@ -1530,8 +1561,14 @@ class StampCommand(CommandInstance):
         return self._airTimer
 
     def _airbrushTick(self) -> None:
-        """冲压节拍：按住不动也持续冲压（150ms 一次，规律重复盖章）。"""
+        """冲压节拍：按住不动也持续冲压（150ms 一次，规律重复盖章）。
+
+        仅圆圈（颜色无效）范围适用；颜色内 = 相连色块，一次点击一次冲压，
+        不允许自动重复（相对模式会把高度叠加多次）。
+        """
         if not self._stroking or self._lastWp is None:
+            return
+        if self._panel is not None and self._panel.scope() == "inside":
             return
         model = self.activeModel()
         if model is None or self._panel is None or self._doc is None:
@@ -1544,6 +1581,7 @@ class StampCommand(CommandInstance):
             return
         self._stroking = False
         self._lastStamp = None
+        self._stampRegion = None
         if self._airTimer is not None:
             self._airTimer.stop()
         if self._doc is not None:
@@ -1567,8 +1605,12 @@ class StampCommand(CommandInstance):
             self._notify("未命中格子：范围内取值无变化")
         self._totalCells = 0
 
-    def _cellColorAt(self, model, wp):
-        """世界点处格子的色号；模型范围外返回 None（格子在但未填色为 0）。"""
+    def _cellAt(self, model, wp):
+        """世界点处格子 (row, col, 色号)；模型范围外返回 None。
+
+        在格但未填色返回色号 0——未填色的模型默认色（图层底色）同样算一种
+        颜色，颜色内模式据此可把该格所在的相连区域作为作用块。
+        """
         hf = model.heightField()
         ox, oy = hf.origin
         col = int(round((wp.x - ox) / hf.spacing))
@@ -1577,8 +1619,8 @@ class StampCommand(CommandInstance):
             return None
         cm = model.colorMask()
         if cm is not None and cm.shape == (hf.ny, hf.nx):
-            return int(cm[row, col])
-        return 0
+            return row, col, int(cm[row, col])
+        return row, col, 0
 
     def onMouseMove(self, wp, mods) -> None:
         """圆圈跟随光标；笔画中拖动按间距连续冲压。"""
@@ -1642,8 +1684,8 @@ class StampCommand(CommandInstance):
     def prompt(self) -> str:
         if self.activeModel() is None:
             return "请先在浮雕模式选中浮雕模型"
-        return ("按住拖动连续冲压，按住不动持续冲压：颜色无效按圆圈、"
-                "颜色内按点击色块（A/S 调径，右键结束）")
+        return ("按住拖动连续冲压，按住不动持续冲压：颜色无效按圆圈（A/S 调径）、"
+                "颜色内按点击色块（未填色的默认色也算色块；右键结束）")
 
     def name(self) -> str:
         return "Stamp"
@@ -2618,6 +2660,10 @@ class SmoothCommand(CommandInstance):
     MOVE_FLOW = 0.6     # 移动盖章：相对面板力度的系数
     AIR_FLOW = 0.9      # 气刷每拍（33ms）：按住不动持续磨，粗糙区 2-3 拍即见平滑
     AIR_MS = 33
+    # 单次鼠标移动的最大盖章数：一次性跳很大距离（快拖/事件合并）时
+    # 拉开间距而不是连续堆章，保证单帧磨光计算有上界——圆圈不能因为
+    # 补章而滞后于光标（体验上“圆跟不住”比“段距略大”严重得多）
+    MAX_STAMPS_PER_MOVE = 6
 
     def __init__(self) -> None:
         super().__init__()
@@ -2628,12 +2674,15 @@ class SmoothCommand(CommandInstance):
         self._lastNotify = 0.0     # 上次推进版本+通知视口的时刻（节流用）
         self._totalChanged = 0     # 本笔累计受影响格数（松开时反馈）
         self._airTimer = None      # 气刷定时器：按住不动持续磨光
+        self._lastMoveT = 0.0      # 最近一次鼠标移动时刻（气刷避让用）
+        self._paramsByScale = {}   # 盖章参数缓存（按流量系数），面板变化时清空
 
     def start(self) -> None:
         super().start()
         self._lastWp = None
         self._stroking = False
         self._lastStamp = None
+        self._paramsByScale = {}
         clr = getattr(self._view, "clearSnapMarker", None)
         if callable(clr):
             clr()
@@ -2644,9 +2693,14 @@ class SmoothCommand(CommandInstance):
         if self._panel is None:
             self._panel = SmoothParamPanel()
             self._panel.finished.connect(self.finish)
-            # 方式/档位/颜色切换 → 笔刷圈轮廓实时重建
+            # 方式/档位/颜色切换 → 笔刷圈轮廓实时重建，并作废盖章参数缓存
             self._panel.paramsChanged.connect(self._refreshCircle)
+            self._panel.paramsChanged.connect(self._dropParamsCache)
         return self._panel
+
+    def _dropParamsCache(self) -> None:
+        """面板任一参数变化 → 盖章参数缓存作废（值没变则不发信号，不会误清）。"""
+        self._paramsByScale = {}
 
     # ---------------- 查询 ----------------
 
@@ -2731,6 +2785,19 @@ class SmoothCommand(CommandInstance):
         sp = max(self._radius() * 0.5, model.heightField().spacing)
         return max(sp, 1e-6)
 
+    def _stampParams(self, scale: float) -> SmoothParams:
+        """按流量系数取盖章用的参数（缓存到面板参数变化为止）。
+
+        一帧要盖好几章，外加 33ms 气刷：旧写法每章重读 5 个 Qt 控件 +
+        重建 dataclass + 改写 strength，都是重复开销。scale 只有
+        MOVE_FLOW / AIR_FLOW 两档，按档存住后每章就是一次字典取用。"""
+        got = self._paramsByScale.get(scale)
+        if got is None:
+            p = self._panel.params()
+            p.strength = min(100.0, p.strength * scale)
+            got = self._paramsByScale[scale] = p
+        return got
+
     def _stampAt(self, model, wp, scale: float = 1.0) -> bool:
         """在 wp 处磨一次（按当前颜色裁剪），返回是否有格子被改变。
 
@@ -2739,9 +2806,8 @@ class SmoothCommand(CommandInstance):
         """
         if self._panel is None:
             return False
-        params = self._panel.params()
-        params.strength = min(100.0, params.strength * scale)
-        changed = apply_smooth_stamp(model.heightField(), wp.x, wp.y, params,
+        changed = apply_smooth_stamp(model.heightField(), wp.x, wp.y,
+                                     self._stampParams(scale),
                                      color_mask=model.colorMask(),
                                      color_value=PaintState.instance().currentValue())
         if changed:
@@ -2759,8 +2825,13 @@ class SmoothCommand(CommandInstance):
         return self._airTimer
 
     def _airbrushTick(self) -> None:
-        """气刷节拍：按住不动也持续磨光（气刷/推料手感）。"""
+        """气刷节拍：按住不动也持续磨光（气刷/推料手感）。
+
+        刚移过鼠标就跳过这一拍：移动路径本身已按间距盖过章，再叠一手同地
+        方等于白烧一份 ROI（拖动时气刷以 33ms 一跳跑在事件链上）。"""
         if not self._stroking or self._lastWp is None:
+            return
+        if time.monotonic() - self._lastMoveT < 0.08:
             return
         model = self.activeModel()
         if model is None or self._panel is None or self._doc is None:
@@ -2794,6 +2865,7 @@ class SmoothCommand(CommandInstance):
         self._stroking = True
         self._totalChanged = 0
         self._lastWp = wp
+        self._lastMoveT = time.monotonic()
         self._lastStamp = (wp.x, wp.y)
         self._stampAt(model, wp, scale=self.MOVE_FLOW)
         self._touchModel(model, force=True)
@@ -2841,6 +2913,7 @@ class SmoothCommand(CommandInstance):
     def onMouseMove(self, wp, mods) -> None:
         """笔刷圈跟随光标；笔画中沿轨迹按弧长间距连续盖章。"""
         self._lastWp = wp
+        self._lastMoveT = time.monotonic()
         self._refreshCircle()
         if not self._stroking or self._lastStamp is None:
             return
@@ -2854,6 +2927,11 @@ class SmoothCommand(CommandInstance):
         if dist < spacing:
             return
         n = int(dist // spacing)
+        if n > self.MAX_STAMPS_PER_MOVE:
+            # 跳得太大（快拖/系统事件合并）：按上限等分这一跳，间距拉开——
+            # 单帧磨光计算有上界，圆圈不会被补章拖住
+            n = self.MAX_STAMPS_PER_MOVE
+            spacing = dist / n
         ux, uy = dx / dist, dy / dist
         stamped = False
         for i in range(1, n + 1):
@@ -3583,6 +3661,8 @@ class RegionArrayCommand(CommandInstance):
                 "count_y": self._panel.rectY(),
                 "gap_x": self._panel.rectGapX(),
                 "gap_y": self._panel.rectGapY(),
+                "reverse_x": self._panel.rectReverseX(),
+                "reverse_y": self._panel.rectReverseY(),
                 "brush_type": bt, "thin_frac": tf, "z_scale": zs,
             }
         if mode == 1:
@@ -4865,6 +4945,332 @@ class LevelCalibrateCommand(CommandInstance):
 
 
 # ============================================================================
+# HeightContrastCommand：高差调整（以基准面为不动点拉开高度对比度）
+# ============================================================================
+
+def _pickClosedCurveNear(doc, view, wp, pick_px: float = 8.0):
+    """画布上最近的闭合曲线（区域拾取用）；未命中返回 None。"""
+    if doc is None:
+        return None
+    tol = 1.0
+    try:
+        s = abs(view.transform().m11())
+        if s > 1e-9:
+            tol = pick_px / s
+    except Exception:
+        pass
+    best, best_d = None, tol
+    for o in doc.visibleObjects():
+        if o.type() == ObjectType.SURFACE or o.isLocked():
+            continue
+        pts = sample_curve_points(o, 128)
+        if pts.shape[0] < 3:
+            continue
+        closed = getattr(o, "isClosed", None)
+        if callable(closed):
+            if not closed():
+                continue
+        else:
+            d_end = float(np.linalg.norm(pts[0] - pts[-1]))
+            perim = float(np.linalg.norm(
+                np.diff(pts, axis=0), axis=1).sum())
+            if perim > 1e-9 and d_end > 1e-3 * perim:
+                continue
+        d = _pointPolylineDistance(wp.x, wp.y, pts)
+        if d < best_d:
+            best, best_d = o, d
+    return best
+
+
+def _selectReliefRegion(model, wp, curve):
+    """点击处的区域蒙版：优先闭合曲线内部，其次点击处色号的同色格子。
+
+    两者都没命中返回 None（调用端负责提示“未识别到闭合曲线或色块”）。
+    """
+    hf = model.heightField()
+    mask = None
+    if curve is not None:
+        pts = sample_curve_points(curve, 256)
+        grid = (hf.origin[0], hf.origin[1], hf.spacing, hf.nx, hf.ny)
+        mask = build_inside_mask(pts, grid)
+        if not mask.any():
+            mask = None
+    if mask is None:
+        cm = model.colorMask()
+        if cm is not None and cm.shape == (hf.ny, hf.nx):
+            col, row = hf.world_to_grid(wp.x, wp.y)
+            ri, ci = int(round(row)), int(round(col))
+            if 0 <= ri < hf.ny and 0 <= ci < hf.nx:
+                val = int(cm[ri, ci])
+                if val > 0:
+                    mask = (cm == val)
+    if mask is None or not mask.any():
+        return None
+    return mask
+
+
+def _maskOutlinePath(hf, mask) -> QPainterPath:
+    """蒙版边界轮廓线（世界坐标）：逐格取边界边，用于选区可视化。"""
+    path = QPainterPath()
+    if mask is None:
+        return path
+    m = mask
+    ox, oy = hf.origin
+    sp = hf.spacing
+    left = m & ~np.pad(m[:, :-1], ((0, 0), (1, 0)), constant_values=False)
+    right = m & ~np.pad(m[:, 1:], ((0, 0), (0, 1)), constant_values=False)
+    top = m & ~np.pad(m[:-1, :], ((1, 0), (0, 0)), constant_values=False)
+    bot = m & ~np.pad(m[1:, :], ((0, 1), (0, 0)), constant_values=False)
+    for side, dx in ((left, 0.0), (right, 1.0)):
+        rr, cc = np.nonzero(side)
+        xs = ox + (cc + dx) * sp
+        y0 = oy + rr * sp
+        for x, ya, yb in zip(xs, y0, y0 + sp):
+            path.moveTo(float(x), float(ya))
+            path.lineTo(float(x), float(yb))
+    for side, dy in ((top, 0.0), (bot, 1.0)):
+        rr, cc = np.nonzero(side)
+        ys = oy + (rr + dy) * sp
+        x0 = ox + cc * sp
+        for xa, xb, y in zip(x0, x0 + sp, ys):
+            path.moveTo(float(xa), float(y))
+            path.lineTo(float(xb), float(y))
+    return path
+
+
+class HeightContrastCommand(CommandInstance):
+    """高差调整：浮雕“凹凸不明显”（全部地形挤在很窄的 Z 区间）时，以某个
+    基准面为不动点放大“离基准的高度偏差”——凸的更凸、凹的更凹。
+
+    交互：“参数 + 可选区域”型。默认作用整个模型，激活即按当前参数预览；
+    切到“区域”需先点选闭合曲线/色块。面板任一变动都从快照重放（实时预览，
+    120ms 合并连发），右键/回车/「完成」提交为一次可撤销操作，Esc 恢复。
+    算法与参数含义见 core/relief/height_contrast.py。
+    """
+
+    _PICK_PX = 8.0
+    _REPLAY_MS = 120        # 调参连发合并窗口（4096² 一次重放约 0.2s）
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._panel: HeightContrastParamPanel | None = None
+        self._phase = "param"          # region / param
+        self._mask = None              # 区域蒙版（scope=region 时）
+        self._initialSource = None      # 命令开始时母场快照
+        self._stats = None              # 最近一次预览统计
+        self._lastNotify = 0.0
+        self._replayTimer = None
+
+    def start(self) -> None:
+        super().start()
+        self.paramPanel()   # 宿主只在命令激活瞬间挂载一次，必须在此建好
+        self._mask = None
+        self._initialSource = None
+        self._stats = None
+        self._phase = "region" if self._scope() == "region" else "param"
+        clr = getattr(self._view, "clearSnapMarker", None)
+        if callable(clr):
+            clr()
+        if self._phase == "param":
+            self._scheduleReplay()      # 激活即预览，改参数所见即所得
+        self._setStatus()
+
+    def paramPanel(self):
+        if self._panel is None:
+            self._panel = HeightContrastParamPanel()
+            self._panel.finished.connect(self.finish)
+            self._panel.scopeChanged.connect(self._onScopeChanged)
+            self._panel.paramsChanged.connect(self._scheduleReplay)
+        return self._panel
+
+    def activeModel(self):
+        return self._doc.activeReliefModel() if self._doc is not None else None
+
+    def _notify(self, text: str) -> None:
+        if self._manager is not None:
+            self._manager.notifyResult(text)
+
+    def _scope(self) -> str:
+        return self._panel.scope() if self._panel is not None else "model"
+
+    def _params(self):
+        if self._panel is not None:
+            return self._panel.params()
+        return HeightContrastParams()
+
+    def _tip(self) -> str:
+        if self.activeModel() is None:
+            return "请先在浮雕模式选中浮雕模型（高差调整作用于模型）"
+        if self._phase == "region":
+            return "点击闭合曲线或色块选定区域"
+        return "调参数实时预览：右键/回车确认，Esc 取消"
+
+    def _setStatus(self) -> None:
+        if self._panel is not None:
+            self._panel.setStatus(self._tip())
+
+    def _onScopeChanged(self) -> None:
+        self._mask = None
+        self._stats = None
+        self._phase = "region" if self._scope() == "region" else "param"
+        if self._previewItem is not None:
+            self._previewItem.setPath(QPainterPath())
+        self._setStatus()
+        self._scheduleReplay()
+
+    # ---------------- 重放预览 ----------------
+
+    def _scheduleReplay(self) -> None:
+        """合并连发的调参（拖 SpinBox / 长按箭头）为一次重放。"""
+        if self._replayTimer is None:
+            self._replayTimer = QTimer()
+            self._replayTimer.setSingleShot(True)
+            self._replayTimer.setInterval(self._REPLAY_MS)
+            self._replayTimer.timeout.connect(self._replay)
+        self._replayTimer.start()
+
+    def _flushReplay(self) -> None:
+        if self._replayTimer is not None and self._replayTimer.isActive():
+            self._replayTimer.stop()
+            self._replay()
+
+    def _replay(self) -> None:
+        """从快照恢复后重算一次（参数变/换区域都是从同一个基准重放）。"""
+        if self._doc is None or self._panel is None:
+            return
+        model = self.activeModel()
+        if model is None:
+            self._panel.setInfo("高差 —")
+            self._setStatus()
+            return
+        # 不 bake：全场写自己的母场与放置变换无关，bake 只在选区域时做
+        # （曲线是世界坐标，需对齐后才能栅格化蒙版），避免一进命令就重采样网格
+        hf = model.heightField()
+        if (self._initialSource is None
+                or self._initialSource.shape != hf.data.shape):
+            self._initialSource = hf.data.copy()
+        hf.data[:] = self._initialSource
+        if self._phase == "region":
+            self._panel.setInfo("高差 —（待选定区域）")
+            self._touchModel(model, force=True)
+            self._setStatus()
+            return
+        mask = self._mask if self._scope() == "region" else None
+        try:
+            self._stats = apply_height_contrast(hf, self._params(), mask=mask)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._notify(f"高差调整失败：{e}")
+            return
+        self._panel.setInfo(format_stats_lines(self._stats))
+        self._touchModel(model, force=True)
+        self._setStatus()
+
+    def _touchModel(self, model, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or (now - self._lastNotify) >= 0.033:
+            model.bumpVersion()
+            self._doc.notifyObjectChanged(model.id())
+            self._lastNotify = now
+
+    def _drawOutline(self, mask) -> None:
+        if self._previewItem is None:
+            return
+        self._setPreviewPath(_maskOutlinePath(
+            self.activeModel().heightField(), mask), solid=False)
+        if self._manager is not None:
+            self._manager.invalidatePreview()
+
+    # ---------------- 鼠标 ----------------
+
+    def onMousePress(self, wp, mods) -> None:
+        model = self.activeModel()
+        if model is None:
+            self._notify("请先在浮雕模式选中浮雕模型（高差调整作用于模型）")
+            return
+        if self._phase != "region":
+            return    # 参数已实时预览，不需再点击
+        if model.hasPendingTransform():
+            model.bake()        # 曲线是世界坐标：先烘焙对齐才能栅格化蒙版
+            self._initialSource = None   # 烘焙后的场才是本次命令的基准
+            self._mask = None
+        curve = _pickClosedCurveNear(self._doc, self._view, wp, self._PICK_PX)
+        mask = _selectReliefRegion(model, wp, curve)
+        if mask is None:
+            self._notify("未识别到闭合曲线或色块，请点击曲线或已填色区域")
+            return
+        self._mask = mask
+        self._phase = "param"
+        self._drawOutline(mask)
+        self._scheduleReplay()
+        self._setStatus()
+
+    def onMouseMove(self, wp, mods) -> None:
+        return
+
+    def onMouseRelease(self, mods) -> None:
+        return
+
+    def onRightClick(self, wp) -> bool:
+        self.finish()
+        return True
+
+    def onEnter(self) -> bool:
+        self.finish()
+        return True
+
+    def showSnapHints(self) -> bool:
+        return False
+
+    # ---------------- 提交 / 取消 ----------------
+
+    def _commit(self) -> None:
+        if self._doc is None:
+            return
+        self._flushReplay()       # 提交前把最后一次调参落进场里
+        model = self.activeModel()
+        if model is None:
+            return
+        st = self._stats
+        if st is not None and self._phase == "param":
+            desc = format_stats(st)
+            if st.get("cells", 0):
+                self._notify("高差调整完成：%s（Ctrl+Z 可撤销）" % desc)
+            else:
+                self._notify("没有可调整的高差：%s" % desc)
+        self._touchModel(model, force=True)
+
+    def cancel(self) -> None:
+        if self._replayTimer is not None:
+            self._replayTimer.stop()
+        if self._doc is not None and self._initialSource is not None:
+            model = self.activeModel()
+            if model is not None:
+                hf = model.heightField()
+                # 就地写回（不换数组、不动 stamp）：省下整场重新分配，
+                # 重绘/包围盒失效只靠 version 推进
+                if hf.data.shape == self._initialSource.shape:
+                    hf.data[:] = self._initialSource
+                    model.bumpVersion()
+                    self._doc.notifyObjectChanged(model.id())
+        super().cancel()
+
+    def finish(self) -> None:
+        self._commit()
+        super().finish()
+
+    def prompt(self) -> str:
+        return self._tip()
+
+    def name(self) -> str:
+        return "HeightContrast"
+
+    def commandTitle(self) -> str:
+        return "高差调整"
+
+
+# ============================================================================
 # RegionSlopeCommand：斜面（区域内以曲线为最高线向边界衰减减去高度）
 # ============================================================================
 
@@ -4872,10 +5278,11 @@ class RegionSlopeCommand(CommandInstance):
     """斜面：选区域 → 点选曲线（刀刃/最高线，可闭合/开放）→ 曲线把区域分两侧，
     点击选要做斜面的一侧 → 该侧内曲线处最高、区域边界最低，按 profile 衰减减去高度。
 
-    交互：点击区域 → 点击曲线 → 点击选侧 → 预览（调高度/类型实时）→ 右键/回车确认，Esc 取消。
+    交互：点击区域 → 点击曲线 → 点击选侧 → 预览（调高度/曲线实时）→ 右键/回车确认，Esc 取消。
     """
 
     _PICK_PX = 8.0
+    _REPLAY_MS = 80          # 曲线拖动/调参连发合并窗口
 
     def __init__(self) -> None:
         super().__init__()
@@ -4887,15 +5294,21 @@ class RegionSlopeCommand(CommandInstance):
         self._sideMask = None    # 选定做斜面的一侧
         self._initialSource = None
         self._lastNotify = 0.0
+        self._replayTimer = None
+        self._applied = False     # 是否已把当前参数写入模型（提交时兜底重算）
 
     def start(self) -> None:
         super().start()
+        self.paramPanel()   # 宿主只在命令激活瞬间挂载一次，必须在此建好
         self._phase = "region"
         self._mask = None
         self._curvePts = None
         self._sides = []
         self._sideMask = None
         self._initialSource = None
+        self._applied = False
+        if self._replayTimer is not None:
+            self._replayTimer.stop()
         clr = getattr(self._view, "clearSnapMarker", None)
         if callable(clr):
             clr()
@@ -4919,13 +5332,29 @@ class RegionSlopeCommand(CommandInstance):
         if self._panel is None:
             return
         if self._phase == "region":
-            self._panel.setStatus("点击闭合曲线或色块选定区域")
+            self._panel.setStatus("① 点击闭合曲线或色块选定区域")
         elif self._phase == "curve":
-            self._panel.setStatus("点击曲线（刀刃/最高线，可闭合/开放）")
+            if self._canSkipCurve():
+                self._panel.setStatus("② 点击刀刃线（最高线）；当前方向可右键跳过")
+            else:
+                self._panel.setStatus("② 点击刀刃线（最高线，可闭合/开放）")
         elif self._phase == "side":
-            self._panel.setStatus("点击选择要做斜面的一侧")
+            self._panel.setStatus("③ 点击选择斜面一侧（预览已按整区）；右键/回车=整区")
         else:
-            self._panel.setStatus("预览中：调高度/类型，右键/回车确认（Esc 取消）")
+            self._panel.setStatus("预览中：调高度/截面曲线；右键/回车生效（Esc 取消）")
+
+    def _canSkipCurve(self) -> bool:
+        """径向/横向/竖向不需要刀刃曲线（只用选区范围），可直接跳过。"""
+        return (self._panel is not None
+                and self._panel.direction() != "normal")
+
+    def _skipCurve(self) -> None:
+        self._curvePts = np.zeros((0, 2), dtype=np.float64)
+        self._sides = []
+        self._sideMask = None
+        self._phase = "param"
+        self._applyPreview()
+        self._setStatus()
 
     # ---------------- 拾取 ----------------
 
@@ -5060,39 +5489,21 @@ class RegionSlopeCommand(CommandInstance):
             # 先 bake 再选区：坡度计算作用于选区蒙版，蒙版必须基于新栅格
             if model.hasPendingTransform():
                 model.bake()
-            if self._selectRegion(model, wp):
-                self._initialSource = model.heightField().data.copy()
-                self._phase = "curve"
-                self._drawMaskOutline(self._mask)
-                self._setStatus()
-            else:
+            if not self._selectRegion(model, wp):
                 self._notify("未识别到闭合曲线或色块，请点击曲线或已填色区域")
+                return
+            self._initialSource = model.heightField().data.copy()
+            # 第一步只选区域；刀刃线是独立第二步，提示文字会说明
+            self._phase = "curve"
+            self._drawMaskOutline(self._mask)
+            self._setStatus()
             return
         if self._phase == "curve":
             curve = self._pickAnyCurve(wp)
             if curve is None:
-                self._notify("未识别到曲线，请点击曲线")
+                self._notify("未识别到曲线，请点击刀刃线")
                 return
-            pts = sample_curve_points(curve, 256)
-            if pts.shape[0] < 2:
-                self._notify("曲线采样点不足")
-                return
-            self._curvePts = pts
-            model = self.activeModel()
-            if model is None:
-                return
-            hf = model.heightField()
-            sides = split_sides(hf, self._mask, pts)
-            if len(sides) <= 1:
-                self._sideMask = None
-                self._phase = "param"
-                self._applyPreview()
-                self._setStatus()
-            else:
-                self._sides = sides
-                self._sideMask = None
-                self._phase = "side"
-                self._setStatus()
+            self._useCurve(curve)
             return
         if self._phase == "side":
             model = self.activeModel()
@@ -5111,6 +5522,34 @@ class RegionSlopeCommand(CommandInstance):
             self._notify("未落在任何一侧，请点击区域内曲线某一侧")
             return
 
+    def _useCurve(self, curve) -> bool:
+        """把 curve 作为刀刃线（最高线）并立即重算预览。"""
+        pts = sample_curve_points(curve, 256)
+        if pts.shape[0] < 2:
+            self._notify("曲线采样点不足")
+            return False
+        model = self.activeModel()
+        if model is None:
+            return False
+        self._curvePts = pts
+        if self._initialSource is None:
+            self._initialSource = model.heightField().data.copy()
+        hf = model.heightField()
+        sides = split_sides(hf, self._mask, pts)
+        self._sideMask = None
+        if len(sides) <= 1:
+            self._sides = []
+            self._phase = "param"
+        else:
+            # 先按整区立刻预览，再让用户点一侧细化（避免"点了没反应"）
+            self._sides = sides
+            self._phase = "side"
+        self._applyPreview()
+        self._setStatus()
+        if len(sides) > 1:
+            self._notify("已按整区预览；点击曲线某一侧可只切该侧")
+        return True
+
     def _height(self) -> float:
         return self._panel.height() if self._panel is not None else 2.0
 
@@ -5118,21 +5557,64 @@ class RegionSlopeCommand(CommandInstance):
         return self._panel.profileType() if self._panel is not None else "linear"
 
     def _applyPreview(self) -> None:
-        """从初始快照恢复并写入斜面（减去高度）。"""
+        """从初始快照恢复并写入斜面（减去高度）。异常不吞，提示并打印堆栈。"""
         model = self.activeModel()
-        if model is None or self._initialSource is None or self._curvePts is None:
+        if model is None or self._initialSource is None:
             return
-        hf = model.heightField()
-        hf.data[:] = self._initialSource
-        params = self._panel.profileParams() if self._panel is not None else {}
-        region_slope(hf, self._mask, self._curvePts,
-                     self._height(), self._profileType(),
-                     side_mask=self._sideMask,
-                     profile_params=params)
-        self._touchModel(model, force=True)
+        if self._curvePts is None:
+            self._curvePts = np.zeros((0, 2), dtype=np.float64)
+        try:
+            hf = model.heightField()
+            if hf.data.shape != self._initialSource.shape:
+                # 模型栅格变了（重采样/重建）：快照作废，重新取当前数据
+                self._initialSource = hf.data.copy()
+            hf.data[:] = self._initialSource
+            params = self._panel.profileParams() if self._panel is not None else {}
+            region_slope(hf, self._mask, self._curvePts,
+                         self._height(), self._profileType(),
+                         side_mask=self._sideMask,
+                         profile_params=params)
+            self._applied = True
+            self._touchModel(model, force=True)
+        except Exception as e:
+            traceback.print_exc()
+            self._notify("斜面预览失败：%s" % e)
 
     def _onParamsChanged(self) -> None:
-        if self._phase == "param" and self._initialSource is not None:
+        if self._initialSource is None:
+            return
+        if self._phase == "curve":
+            # 切到径向/横向/竖向（免曲线方向）时直接开始预览，不必再点曲线
+            if self._canSkipCurve():
+                self._skipCurve()
+            return
+        if self._phase in ("param", "side"):
+            if self._panel is not None and self._panel.direction() == "normal" \
+                    and (self._curvePts is None
+                         or self._curvePts.shape[0] < 2):
+                # 从径向/横向/竖向切回法向：法向必须重新选刀刃线（独立一步）
+                self._curvePts = None
+                self._sides = []
+                self._sideMask = None
+                self._phase = "curve"
+                self._applyPreview()      # 还原快照，等待点刀刃线
+                self._drawMaskOutline(self._mask)
+                self._setStatus()
+                return
+            self._scheduleReplay()
+
+    def _scheduleReplay(self) -> None:
+        """曲线拖动/调参连发合并：窗口内只重算一次，避免每像素全图重放。"""
+        if self._replayTimer is None:
+            self._replayTimer = QTimer()
+            self._replayTimer.setSingleShot(True)
+            self._replayTimer.setInterval(self._REPLAY_MS)
+            self._replayTimer.timeout.connect(self._applyPreview)
+        self._replayTimer.start()
+
+    def _flushReplay(self) -> None:
+        if self._replayTimer is not None and self._replayTimer.isActive():
+            self._replayTimer.stop()
             self._applyPreview()
 
     def onMouseMove(self, wp, mods) -> None:
@@ -5156,14 +5638,25 @@ class RegionSlopeCommand(CommandInstance):
         return
 
     def onRightClick(self, wp) -> bool:
-        if self._phase == "param":
+        if self._phase == "curve" and self._canSkipCurve():
+            self._skipCurve()
+            return True
+        if self._phase in ("side", "param"):
+            # 侧向阶段预览已按整区：右键=整区生效（避免被当成取消）
+            if self._phase == "side":
+                self._sideMask = None
             self._commit()
             self.finish()
             return True
         return False
 
     def onEnter(self) -> bool:
-        if self._phase == "param":
+        if self._phase == "curve" and self._canSkipCurve():
+            self._skipCurve()
+            return True
+        if self._phase in ("side", "param"):
+            if self._phase == "side":
+                self._sideMask = None
             self._commit()
             self.finish()
             return True
@@ -5171,11 +5664,14 @@ class RegionSlopeCommand(CommandInstance):
 
     def _commit(self) -> None:
         if self._doc is not None:
+            self._flushReplay()
             model = self.activeModel()
             if model is not None:
                 self._touchModel(model, force=True)
 
     def cancel(self) -> None:
+        if self._replayTimer is not None:
+            self._replayTimer.stop()
         if self._doc is not None and self._initialSource is not None:
             model = self.activeModel()
             if model is not None:
@@ -5195,12 +5691,14 @@ class RegionSlopeCommand(CommandInstance):
         if self.activeModel() is None:
             return "请先在浮雕模式选中浮雕模型"
         if self._phase == "region":
-            return "点击闭合曲线或色块选定区域"
+            return "① 点击闭合曲线或色块选定区域"
         if self._phase == "curve":
-            return "点击曲线（刀刃/最高线，可闭合/开放）"
+            if self._canSkipCurve():
+                return "② 点击刀刃线（最高线）；当前方向可右键跳过"
+            return "② 点击刀刃线（最高线，可闭合/开放）"
         if self._phase == "side":
-            return "点击选择要做斜面的一侧"
-        return "预览中：调高度/类型，右键/回车确认（Esc 取消）"
+            return "③ 点击选择要做斜面的一侧（右键/回车=整区）"
+        return "预览中：调高度/截面曲线，右键/回车确认（Esc 取消）"
 
     def name(self) -> str:
         return "RegionSlope"
@@ -5446,6 +5944,7 @@ class ModelScaleCommand(CommandInstance):
         if self._panel is None:
             self._panel = ModelScaleParamPanel()
             self._panel.finished.connect(self._apply)
+            self._panel.applyDirection.connect(self._applyOne)
         return self._panel
 
     def start(self) -> None:
@@ -5475,46 +5974,71 @@ class ModelScaleCommand(CommandInstance):
         return self._doc.activeReliefModel()
 
     def _apply(self) -> None:
+        """应用：四方向按各自数值一次性全部扩缩，随后结束命令。"""
+        if not self._doScale(self._panel.scaleValues()):
+            self._notify("四个方向数值均为 0，未扩缩")
+        self.finish()
+
+    def _applyOne(self, idx: int) -> None:
+        """单击方向按钮：只沿该方向按当前数值扩缩，命令保持（可连续点）。"""
+        names = ("上", "下", "左", "右")
+        vals = [0.0, 0.0, 0.0, 0.0]
+        vals[idx] = self._panel.directionValue(idx)
+        if abs(vals[idx]) < 1e-9:
+            self._notify(f"「{names[idx]}」方向数值为 0，未扩缩")
+            return
+        if self._doScale(tuple(vals)):
+            self._notify(f"已沿「{names[idx]}」扩缩 {vals[idx]:g} mm")
+
+    def _doScale(self, values) -> bool:
+        """把 (上,下,左,右) 扩缩值作用于目标模型（保持原高度场内容，外扩补 0、
+        内缩裁剪）。实际执行返回 True，无目标/全 0 返回 False。"""
         obj = self._getTarget()
         if obj is None:
             self._notify("请先选中一个浮雕模型，或在浮雕模式下编辑")
-            return
+            return False
         hf = obj.heightField()
         if hf is None:
-            return
-        top, bottom, left, right = self._panel.scaleValues()
+            return False
+        top, bottom, left, right = values
         if all(abs(v) < 1e-9 for v in (top, bottom, left, right)):
-            self.finish()
-            return
-        # 模型若带未烘焙放置变换，先烘焙对齐（与消除锯齿等命令一致）
-        if obj.hasPendingTransform():
-            obj.bake()
-            hf = obj.heightField()
-        # 计算新边界
-        x0, y0, x1, y1 = hf.bbox()
-        nx, ny = hf.nx, hf.ny
-        sp = hf.spacing
-        # 扩缩后的世界边界
-        new_x0 = x0 - left
-        new_y0 = y0 - bottom
-        new_x1 = x1 + right
-        new_y1 = y1 + top
-        # 新栅格尺寸
-        new_nx = max(2, int(math.ceil((new_x1 - new_x0) / sp)) + 1)
-        new_ny = max(2, int(math.ceil((new_y1 - new_y0) / sp)) + 1)
-        # 创建新数据数组，填充0
-        new_data = np.zeros((new_ny, new_nx), dtype=np.float32)
-        # 计算原数据在新数组中的偏移
-        ox = int(round((x0 - new_x0) / sp))
-        oy = int(round((y0 - new_y0) / sp))
-        # 复制原数据到新位置（统一偏移粘贴：外扩补 0、内缩裁剪）
-        _paste_aligned(new_data, hf.data, ox, oy)
-        # 更新高度场
-        new_hf = HeightField(new_data, (new_x0, new_y0), sp)
-        obj.setHeightField(new_hf)
-        if self._doc is not None:
-            self._doc.notifyObjectChanged(obj.id())
-        self.finish()
+            return False
+        doc = self._doc
+        if doc is not None:
+            doc.beginEdit()
+        try:
+            # 模型若带未烘焙放置变换，先烘焙对齐（与消除锯齿等命令一致）
+            if obj.hasPendingTransform():
+                obj.bake()
+                hf = obj.heightField()
+            # 计算新边界
+            x0, y0, x1, y1 = hf.bbox()
+            nx, ny = hf.nx, hf.ny
+            sp = hf.spacing
+            # 扩缩后的世界边界
+            new_x0 = x0 - left
+            new_y0 = y0 - bottom
+            new_x1 = x1 + right
+            new_y1 = y1 + top
+            # 新栅格尺寸
+            new_nx = max(2, int(math.ceil((new_x1 - new_x0) / sp)) + 1)
+            new_ny = max(2, int(math.ceil((new_y1 - new_y0) / sp)) + 1)
+            # 创建新数据数组，填充0
+            new_data = np.zeros((new_ny, new_nx), dtype=np.float32)
+            # 计算原数据在新数组中的偏移
+            ox = int(round((x0 - new_x0) / sp))
+            oy = int(round((y0 - new_y0) / sp))
+            # 复制原数据到新位置（统一偏移粘贴：外扩补 0、内缩裁剪）
+            _paste_aligned(new_data, hf.data, ox, oy)
+            # 更新高度场
+            new_hf = HeightField(new_data, (new_x0, new_y0), sp)
+            obj.setHeightField(new_hf)
+            if doc is not None:
+                doc.notifyObjectChanged(obj.id())
+        finally:
+            if doc is not None:
+                doc.endEdit()
+        return True
 
     def _notify(self, text: str) -> None:
         if self._manager is not None:
@@ -5546,6 +6070,7 @@ def registerAll(manager) -> None:
     manager.register("RegionSymmetry", RegionSymmetryCommand)
     manager.register("RegionDeform", RegionDeformCommand)
     manager.register("LevelCalibrate", LevelCalibrateCommand)
+    manager.register("HeightContrast", HeightContrastCommand)
     manager.register("RegionSlope", RegionSlopeCommand)
     manager.register("RevolveSlope", RevolveSlopeCommand)
     manager.register("ImageToModel", ImageToModelCommand)

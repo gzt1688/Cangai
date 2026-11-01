@@ -6,6 +6,7 @@ __pycache__/
 # 运行期产物
 *.log
 crash.log
+caibak/
 
 # 调试/临时脚本与截图（下划线开头的本地试验产物）
 _*.png
@@ -39,3 +40,14 @@ _bg_tmp/
 # Private plugins (not published)
 plugins_private/
 _weave_fix/
+
+# AI line-art model bundle (built by _pack_models.py, ~229MB, ship separately)
+ai_models.zip
+ai_models.zip.part
+
+# Test HDRI envmaps (too large, not shipped; keep only studio_default.hdr)
+resources/envmaps/monochrome_studio_02_4k.exr
+resources/envmaps/golden_gate_hills_4k.hdr
+resources/envmaps/brown_photostudio_06_4k.hdr
+resources/envmaps/christmas_photo_studio_04_4k.hdr
+resources/envmaps/blue_photo_studio_4k.exr

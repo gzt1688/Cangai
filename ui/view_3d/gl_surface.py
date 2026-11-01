@@ -48,9 +48,83 @@ uniform float u_add_amb;
 uniform float u_spec_gain;
 uniform float u_spec_pow;
 uniform float u_opacity;
+// 参数驱动 PBR（u_mode==8）：与 mesh3d._pbrShade 严格一致
+uniform float u_metallic;
+uniform float u_f0d;
+uniform float u_rough;
+uniform float u_sss;
+uniform float u_trans;
+uniform vec3 u_emis;
+uniform int u_quality;        // 0=粗糙(basic) 1=精致(fine, IBL+GGX+ACES)
+uniform int u_tex_id;         // 纹理图案（0 clay/1 wood/2 plastic/3 stone/4 metal）
+uniform float u_tex_scale;    // 纹理尺度 mm
+uniform float u_tex_amount;   // 纹理强度（兼 bump 幅度）
+// HDRI 环境贴图 IBL（u_env_on=1 时取代程序化环境）：等距柱状、带 mipmap
+uniform sampler2D u_env;
+uniform int u_env_on;
+uniform float u_env_mips;     // 最大 mip 层（= log2(min(W,H))）
 out vec4 frag;
+// 程序化摄影棚环境（与 mesh3d._envSample 严格一致）：渐变天空/地面 + 4 耚 HDR 柔光箱
+vec3 envSample(vec3 d){
+  vec3 zen = vec3(0.36, 0.40, 0.48), hor = vec3(0.60, 0.60, 0.62), grd = vec3(0.10, 0.09, 0.08);
+  float t = pow(clamp(d.z, 0.0, 1.0), 0.6);
+  float gt = pow(clamp(-d.z, 0.0, 1.0), 0.5);
+  vec3 base = mix(mix(hor, zen, t), grd, gt);
+  vec3 v1 = d - normalize(vec3(0.45, 0.30, 0.84));
+  vec3 vs = d - normalize(vec3(0.50, -0.35, 0.72));
+  vec3 v2 = d - normalize(vec3(-0.72, 0.20, 0.62));
+  vec3 v3 = d - normalize(vec3(0.10, -0.85, 0.40));
+  base += vec3(3.00, 2.95, 2.85) * exp(-dot(v1, v1) / (2.0 * 0.28 * 0.28));
+  base += vec3(7.00, 6.80, 6.30) * exp(-dot(vs, vs) / (2.0 * 0.07 * 0.07));
+  base += vec3(0.45, 0.65, 1.05) * exp(-dot(v2, v2) / (2.0 * 0.55 * 0.55));
+  base += vec3(1.30, 1.00, 0.68) * exp(-dot(v3, v3) / (2.0 * 0.45 * 0.45));
+  return base;
+}
+// 按方向采样 HDRI 环境（等距柱状 uv）；lod 选 mip 层→粗糙模糊（IBL 预过滤近似）
+vec3 envTex(vec3 d, float lod){
+  float u = atan(d.y, d.x) * 0.15915494 + 0.5;        // 1/(2π)
+  float v = acos(clamp(d.z, -1.0, 1.0)) * 0.31830989; // 1/π
+  return textureLod(u_env, vec2(u, v), lod).rgb;
+}
+// ACES 近似色调映射（与 mesh3d._acesFilmic 一致）
+vec3 aces(vec3 x){
+  float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+// 值噪声 + fBm（有机、不重复）；GPU 逐像素 bump 用（高频细节）
+float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), u.x),
+             mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float fbm(vec2 p){
+  float t = 0.0, a = 0.5, n = 0.0;
+  for (int k = 0; k < 4; k++){ t += a * vnoise(p); n += a; p *= 2.0; a *= 0.5; }
+  return t / n;
+}
+// 程序化表面纹理高度 h≈[-1,1]（fBm 有机噪声，取代规则正弦）；q 已按 tex_scale 归一
+float matHeight(int id, vec2 q){
+  if (id == 1) return clamp(sin(q.x * 6.2831853 + 3.0 * fbm(q * 0.6)), -1.0, 1.0); // wood 不规则年轮
+  if (id == 2) return (fbm(q * 3.0) - 0.5) * 1.4;                                   // plastic 橘皮
+  if (id == 3) return (fbm(q * 2.2) - 0.5) * 2.0;                                   // stone 颗粒
+  if (id == 4) return (fbm(vec2(q.x * 0.8, q.y * 9.0)) - 0.5) * 2.0;                // metal 拉丝
+  return (fbm(q * 2.0) - 0.5) * 2.0;                                                // clay 斑驳
+}
+// 有限差分求高度场梯度，扰动法线（浅浮雕切平面≈XY，直接用世界 xy 梯度）
+vec3 bumpNormal(vec3 N, vec3 wp){
+  vec2 uv = wp.xy / max(u_tex_scale, 0.5);
+  float e = 0.02;
+  float h0 = matHeight(u_tex_id, uv);
+  vec2 g = vec2(matHeight(u_tex_id, uv + vec2(e, 0.0)) - h0,
+                matHeight(u_tex_id, uv + vec2(0.0, e)) - h0) / e;
+  g = clamp(g, vec2(-8.0), vec2(8.0));
+  return normalize(N - u_tex_amount * 0.06 * vec3(g.x, g.y, 0.0));
+}
 void main() {
   vec3 N = normalize(v_normal);
+  if (u_mode == 8 && u_tex_amount > 0.0) N = bumpNormal(N, v_world);   // 表面纹理凹凸
   vec3 L = normalize(u_light);
   vec3 V = normalize(u_eye - v_world);
   vec3 Hh = normalize(L + V);
@@ -64,7 +138,53 @@ void main() {
   float soft = 0.45 + 0.45 * d + 0.20 * diff2;
   vec3 base = v_base;
   vec3 col;
-  if (u_mode == 5) {                       // plastic: 显式环境 + 漫反射
+  if (u_mode == 8) {                         // PBR 材质：环境IBL(按反射向量) + GGX + ACES
+    float metallic = u_metallic;
+    float rough = clamp(u_rough, 0.03, 1.0);
+    float f0d = min(u_f0d, 1.0);
+    vec3 F0 = mix(vec3(f0d), base, metallic);
+    vec3 diffAlb = base * (1.0 - metallic) * (1.0 - u_trans);
+    vec3 keyC = vec3(1.00, 0.98, 0.95) * 1.70;
+    float nl = max(dot(N, L), 0.0);
+    float nv = clamp(dot(N, V), 0.0001, 1.0);
+    vec3 fr = F0 + (1.0 - F0) * pow(1.0 - nv, 5.0);
+    if (u_quality == 1) {                     // 精致：环境 IBL(按反射向量) + GGX + ACES
+      vec3 envN, envR;
+      vec3 R = reflect(-V, N);
+      if (u_env_on == 1) {                     // 真实 HDRI：漫反射取最模糊 mip、镜面按粗糙选 mip
+        envN = envTex(N, u_env_mips);
+        envR = envTex(R, rough * u_env_mips);
+      } else {                                 // 内置程序化摄影棚环境
+        envN = envSample(N);
+        envR = mix(envSample(R), envN, rough);
+      }
+      float a = rough * rough; float a2 = a * a;
+      float NoH = max(sp, 0.0);
+      float den = NoH * NoH * (a2 - 1.0) + 1.0;
+      float D = a2 / (3.14159265 * den * den + 1e-7);
+      float k = a * 0.5;
+      float G = (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));
+      float VoH = max(dot(V, Hh), 0.0);
+      vec3 Fdir = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
+      float ggx = (D * G) / (4.0 * nv * nl + 1e-5);
+      vec3 specDir = Fdir * ggx * keyC * nl;
+      vec3 diff = diffAlb * (keyC * (nl * 0.5) + envN * 0.20);
+      vec3 specIbl = fr * envR * (1.0 - rough) * 1.35;
+      col = diff + specDir + specIbl;
+      col += base * envN * (u_sss * 0.4);
+      col += u_emis;
+      col = aces(col * 1.05);
+    } else {                                  // 粗糙：半球环境光 + Blinn 高光（无逐像素采样/ACES）
+      float hemi = 0.5 + 0.5 * N.z;
+      vec3 zen = vec3(0.36, 0.40, 0.48), grd = vec3(0.10, 0.09, 0.08);
+      vec3 ambient = mix(grd, zen, hemi) * 0.55;
+      float shin = clamp(2.0 / (rough * rough) - 2.0, 2.0, 1200.0);
+      vec3 keySpec = fr * pow(sp, shin) * keyC * (0.3 + 0.7 * (1.0 - rough)) * nl;
+      col = diffAlb * (keyC * nl + ambient) + keySpec + fr * ambient * 0.6;
+      col += base * ambient * (u_sss * 0.4);
+      col += u_emis;
+    }
+  } else if (u_mode == 5) {                       // plastic: 显式环境 + 漫反射
     col = base * (u_add_amb + u_kd * soft) + vec3(spec);
   } else if (u_mode == 6) {                // metal: + 边缘菲涅尔
     float fres = pow(1.0 - clamp(N.z, 0.0, 1.0), 2.0);
@@ -119,6 +239,25 @@ in vec4 v_color;
 out vec4 frag;
 void main() {
   frag = v_color;
+}
+"""
+
+# 屏幕空间线段（浮雕模式密集曲线攒批）：顶点只有 2f 坐标，颜色走 uniform。
+# 相比逐顶点 3f+4f 的 PATH_VERT，每顶点上传字节从 28 降到 8（18 万点的
+# 描图曲线从 12MB/帧降到 3.4MB/帧），且同色曲线合成单次 draw call。
+LINE_VERT = """#version 330 core
+in vec2 a_pos;
+uniform mat4 u_mvp;
+void main() {
+  gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);
+}
+"""
+
+LINE_FRAG = """#version 330 core
+uniform vec4 u_color;
+out vec4 frag;
+void main() {
+  frag = u_color;
 }
 """
 
@@ -334,12 +473,18 @@ class GLSurface:
         self.vao: moderngl.VertexArray | None = None
         self._pos = self._nrm = self._base = self._idx = None
         self._idxSrc = None
+        # 上次上传的源数组身份（纯相机帧跳过整份重传的判定，见 draw）
+        self._posSrc = self._nrmSrc = self._baseSrc = None
         self._roiPartial = False
         self._key = None
         # B-Rep 边线着色器（GL_LINES）
         self._edgeProg = None
         # 路径折线（GL_LINES，逐顶点颜色）——key -> (vao, buffer, 顶点数, lines 引用)
         self._pathProg = None
+        # 屏幕空间线段（浮雕密集曲线攒批，2f 坐标 + uniform 颜色）
+        self._lineProg = None
+        # 常驻 VBO（跨帧复用，容量不足才重建；VAO 每帧新建，见 draw_screen_lines）
+        self._lineBuf = None
         self._path_cache = {}
         self._stockProg = None
         self._stockTexs = {}
@@ -348,6 +493,38 @@ class GLSurface:
         self._bzFbo = None
         self._bzDepth = None
         self._bzW = self._bzH = 0
+        # HDRI 环境纹理（IBL）：_envData 为待上传 float32 (H,W,3) 或 None（程序化环境）
+        self._envTex: moderngl.Texture | None = None
+        self._envData = None
+        self._envDirty = False
+        self._envMips = 0.0
+
+    def set_env(self, rgb) -> None:
+        """设置/清除 HDRI 环境纹理（(H,W,3) float32 或 None）。延到 draw 时重建。"""
+        self._envData = rgb
+        self._envDirty = True
+
+    def _rebuild_env(self) -> None:
+        ctx = self.ctx
+        if self._envTex is not None:
+            self._envTex.release()
+            self._envTex = None
+            self._envMips = 0.0
+        rgb = self._envData
+        if rgb is None:
+            return
+        h, w = int(rgb.shape[0]), int(rgb.shape[1])
+        tex = ctx.texture((w, h), 3, np.ascontiguousarray(rgb, dtype="f4").tobytes(),
+                          dtype="f4")
+        try:
+            tex.build_mipmaps(base=0)
+        except Exception:
+            pass
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR_MIPMAP_LINEAR)
+        tex.repeat_x = True            # 经度环绕（接缝）
+        tex.repeat_y = False           # 纬度夹紧（不环绕极点）
+        self._envTex = tex
+        self._envMips = float(max(1, int(math.floor(math.log2(min(w, h))))))
 
     def _asUpload(self, arr: np.ndarray, dtype) -> np.ndarray:
         """转成可上传的连续 dtype 数组。
@@ -392,17 +569,25 @@ class GLSurface:
 
     def draw(self, key, pos, nrm, base, idx, mvp, eye, light, params,
              W: int, H: int, bg, fbo: int = 0, opacity: float = 1.0,
-             roi=None) -> None:
+             roi=None, force_upload: bool = False) -> None:
         """绘制浮雕曲面。
 
         ``opacity < 1`` 时开启混合（半透明 X-Ray：浮雕编辑态下让参考曲线透过
         模型清晰可见），否则按不透明渲染。
         ``roi`` 为 ``(r0, r1, c0, c1, gnx)`` 顶点块（含端）：笔画期只把这一块
         的 XYZ/法线/底色写进**已存在**的 GPU 缓冲，其余数据原地复用。
+        ``force_upload``：调用方**就地改过**上次传进来的数组（缓存层原地刷新）
+        时必须置真，强制整份重传，避免显示落后于数据。
+        纯相机变化（缩放/旋转/平移）时数组对象与上次完全相同且没有 ROI——
+        此时**跳过上传**：1024 显示网格整份 pos/nrm/base = 36MB/帧，PCIe
+        拷贝是缩放卡顿的主要开销之一，而几何一个字节都没变。
         ``fbo`` 仅为兼容调用方签名保留：渲染目标是 Qt 当前绑定的 FBO，
         本方法不做绑定。
         """
         self.ensure()
+        if self._envDirty:
+            self._rebuild_env()
+            self._envDirty = False
         ctx = self.ctx
         ctx.viewport = (0, 0, W, H)
         ctx.clear(color=bg, depth=1.0)
@@ -433,6 +618,12 @@ class GLSurface:
             self._pos = ctx.buffer(self._asUpload(pos, "f4"))
             self._nrm = ctx.buffer(self._asUpload(nrm, "f4"))
             self._base = ctx.buffer(self._asUpload(base, "f4"))
+        # 源数组身份：缓存层（viewport._glCache）跨帧持有同一批数组，纯相机帧
+        # 三者身份都不变；模型数据变化时要么换新数组、要么由调用方置
+        # force_upload / 给 ROI。故"身份相同 + 无 ROI + 未强制"= 无需上传。
+        same_src = (reuse and self._posSrc is pos and self._nrmSrc is nrm
+                    and self._baseSrc is base)
+        self._posSrc, self._nrmSrc, self._baseSrc = pos, nrm, base
         idx_new = (self._idx is None or self._idxSrc is not idx
                    or self._idx.size != idx.nbytes)
         if idx_new:
@@ -447,7 +638,7 @@ class GLSurface:
                 self._writeRoi(self._pos, pos, r0, r1, c0, c1, gnx)
                 self._writeRoi(self._nrm, nrm, r0, r1, c0, c1, gnx)
                 self._writeRoi(self._base, base, r0, r1, c0, c1, gnx)
-            else:
+            elif force_upload or idx_new or not same_src:
                 self._pos.write(self._asUpload(pos, "f4"))
                 self._nrm.write(self._asUpload(nrm, "f4"))
                 self._base.write(self._asUpload(base, "f4"))
@@ -476,6 +667,26 @@ class GLSurface:
         p["u_spec_gain"].value = float(params["spec_gain"])
         p["u_spec_pow"].value = float(params["spec_pow"])
         p["u_opacity"].value = float(opacity)
+        # 参数驱动 PBR（mode==8）：其余 mode 不引用这些 uniform，设默认无害
+        p["u_metallic"].value = float(params.get("metallic", 0.0))
+        p["u_f0d"].value = float(params.get("f0d", 0.04))
+        p["u_rough"].value = float(params.get("rough", 0.4))
+        p["u_sss"].value = float(params.get("sss", 0.0))
+        p["u_trans"].value = float(params.get("trans", 0.0))
+        em = params.get("emis", (0.0, 0.0, 0.0))
+        p["u_emis"].value = (float(em[0]), float(em[1]), float(em[2]))
+        p["u_quality"].value = 1 if str(params.get("quality", "fine")) == "fine" else 0
+        p["u_tex_id"].value = int(params.get("tex_id", 0))
+        p["u_tex_scale"].value = float(params.get("tex_scale", 6.0))
+        p["u_tex_amount"].value = float(params.get("tex_amount", 0.0))
+        # HDRI 环境（仅 mode==8 精致档引用）：绑到单元 0；无图时走程序化环境
+        if self._envTex is not None:
+            self._envTex.use(0)
+            p["u_env"].value = 0
+            p["u_env_on"].value = 1
+            p["u_env_mips"].value = float(self._envMips)
+        else:
+            p["u_env_on"].value = 0
         self.vao.render(moderngl.TRIANGLES)
 
     def draw_brep_edges(self, groups, mvp, W: int, H: int) -> None:
@@ -908,7 +1119,158 @@ class GLSurface:
             pb.release()
         ctx.disable(ctx.BLEND)
 
+    def draw_screen_polyline(self, pts, mvp, W: int, H: int,
+                             color=(1.0, 0.6, 0.0, 1.0),
+                             width: float = 1.0,
+                             z=None, depth_test: bool = False) -> None:
+        """屏幕空间闭合折线（浮雕外轮廓），点已是像素坐标，逐帧重建顶点。
+
+        为什么不用 QPainter：Qt 光栅引擎画**抗锯齿宽折线**是"按路径包围盒
+        离屏光栅化再合成"，一条满屏边框就要 6~9ms（2560×1600 实测 6.4ms，
+        4K 更高），是浮雕模式帧成本第一大项；GL 画线走 MSAA，同样宽度
+        实测 <0.2ms。顶点只有几千个（269KB），每帧重建上传可忽略。
+
+        ``pts``: (N,2) 逻辑像素坐标（与视口 w/h 同一坐标系，自动闭合）；
+        ``mvp``: 行主序 4×4，把像素坐标直接映射到 NDC（见调用方）。
+        ``z``: (N,) 逐点 NDC 深度（``mvp`` 第三行须透传 z）；缺省 0。
+        ``depth_test``: 真时与已渲染曲面做深度测试（外轮廓被模型自身遮挡，
+        侧视时背面边框不再"穿模"）；假时无条件置顶（叠加层语义）。
+        """
+        p = np.asarray(pts, dtype=np.float32)
+        if p.ndim != 2 or p.shape[0] < 3:
+            return
+        n = p.shape[0]
+        verts = np.empty((2 * n, 7), dtype="f4")
+        verts[0::2, :2] = p
+        verts[1::2, :2] = np.roll(p, -1, axis=0)   # 闭合：末点 → 首点
+        if z is None:
+            verts[:, 2] = 0.0
+        else:
+            zv = np.asarray(z, dtype=np.float32).reshape(-1)
+            if zv.size != n:
+                return
+            verts[0::2, 2] = zv
+            verts[1::2, 2] = np.roll(zv, -1)
+        verts[:, 3:] = np.asarray(color, dtype=np.float32)
+        self.ensure()
+        ctx = self.ctx
+        ctx.viewport = (0, 0, W, H)
+        if self._pathProg is None:
+            self._pathProg = ctx.program(vertex_shader=PATH_VERT,
+                                         fragment_shader=PATH_FRAG)
+        prog = self._pathProg
+        prog["u_mvp"].write(
+            np.ascontiguousarray(np.asarray(mvp, dtype=np.float64).T,
+                                 dtype="f4"))
+        # 状态硬化（同 draw_paths/draw_brep）：QPainter 可能遗留 scissor /
+        # 面剔除 / 深度测试，不清会把线裁掉或挡在曲面后面。
+        ctx.disable(0x0C11)   # GL_SCISSOR_TEST
+        ctx.disable(ctx.CULL_FACE)
+        if depth_test:
+            # 与曲面同一深度比较函数（曲面写入用 "<="）：边框落在模型边界上，
+            # 只有更近或等深才可见——背面边框被模型自身遮住。
+            ctx.enable(ctx.DEPTH_TEST)
+            ctx.depth_func = "<="
+            ctx.depth_mask = False
+        else:
+            ctx.disable(ctx.DEPTH_TEST)
+        ctx.enable(ctx.BLEND)
+        ctx.blend_func = (ctx.SRC_ALPHA, ctx.ONE_MINUS_SRC_ALPHA)
+        try:
+            ctx.line_width = float(width)
+        except Exception:
+            pass          # 驱动只支持 1px：退回细线，不影响正确性
+        pb = ctx.buffer(verts.tobytes())
+        vao = ctx.vertex_array(prog, [(pb, "3f 4f", "a_pos", "a_color")])
+        try:
+            vao.render(moderngl.LINES)
+        finally:
+            vao.release()
+            pb.release()
+            ctx.disable(ctx.BLEND)
+
+    def draw_screen_lines(self, pts, mvp, W: int, H: int,
+                          color=(1.0, 1.0, 1.0, 1.0),
+                          width: float = 1.0) -> None:
+        """屏幕空间线段批量绘制（浮雕模式下密集曲线折线的攒批通道）。
+
+        ``pts``: (K,2) float32 像素坐标（与视口 w/h 同一坐标系），相邻两点是
+        一段线（GL_LINES）；``color`` 为整批统一的着色（调用方按颜色分组）。
+
+        为什么单独开这个入口：QPainter 画折线要逐点构造 QPointF/QPolygonF
+        再抗锯齿光栅化，实测 6 万点 275ms/帧、18 万点 823ms/帧，描图曲线多
+        时整帧被它独占；GL 一次 draw call 画完整批，量级降到 0.06µs/点。
+
+        顶点格式刻意只放坐标（2f）+ uniform 颜色：描图曲线的颜色按对象
+        分组，逐顶点存 4 个颜色浮点纯属浪费带宽（28→8 字节/顶点）。
+        """
+        # ascontiguousarray：下面走 ``p.data``（buffer protocol）直接上传，
+        # 非连续视图（切片/转置）在 buffer protocol 下会直接抛 BufferError。
+        p = np.ascontiguousarray(pts, dtype=np.float32)
+        if p.ndim != 2 or p.shape[1] != 2 or p.shape[0] < 2:
+            return
+        self.ensure()
+        ctx = self.ctx
+        ctx.viewport = (0, 0, W, H)
+        if self._lineProg is None:
+            self._lineProg = ctx.program(vertex_shader=LINE_VERT,
+                                         fragment_shader=LINE_FRAG)
+        prog = self._lineProg
+        prog["u_mvp"].write(
+            np.ascontiguousarray(np.asarray(mvp, dtype=np.float64).T,
+                                 dtype="f4"))
+        prog["u_color"].write(
+            np.asarray(color, dtype="f4").tobytes())
+        # 状态硬化（同 draw_screen_polyline）：QPainter 可能遗留 scissor /
+        # 面剔除 / 深度测试，不清会把线裁掉或挡在曲面后面。
+        ctx.disable(0x0C11)   # GL_SCISSOR_TEST
+        ctx.disable(ctx.CULL_FACE)
+        ctx.disable(ctx.DEPTH_TEST)
+        ctx.enable(ctx.BLEND)
+        ctx.blend_func = (ctx.SRC_ALPHA, ctx.ONE_MINUS_SRC_ALPHA)
+        try:
+            ctx.line_width = float(width)
+        except Exception:
+            pass          # 驱动只支持 1px：退回细线，不影响正确性
+        # 常驻 VBO（跨帧复用，只在容量不足时重建）+ **每帧新建 VAO**：
+        # 本机 Qt(QOpenGLWidget)+ModernGL+MSAA 组合下，VAO 跨帧复用会让
+        # render() 访问违例/静默不画（同一教训见 draw() 里的注释），故 VAO
+        # 每次调用新建、渲染后立即释放；缓冲本身跨帧复用以省分配。
+        nbytes = p.nbytes
+        if self._lineBuf is None or self._lineBuf.size < nbytes:
+            if self._lineBuf is not None:
+                try:
+                    self._lineBuf.release()
+                except Exception:
+                    pass
+            self._lineBuf = ctx.buffer(reserve=max(nbytes, 1 << 16))
+        try:
+            # numpy → GL 走 buffer protocol，不经 bytes 中转（省一次全量拷贝）
+            self._lineBuf.write(p.data)
+        except TypeError:
+            self._lineBuf.write(p.tobytes())
+        vao = ctx.vertex_array(prog, [(self._lineBuf, "2f", "a_pos")])
+        try:
+            vao.render(moderngl.LINES, vertices=p.shape[0])
+        finally:
+            vao.release()
+            ctx.disable(ctx.BLEND)
+
     def release(self) -> None:
+        for _attr in ("_lineBuf",):
+            _o = getattr(self, _attr, None)
+            if _o is not None:
+                try:
+                    _o.release()
+                except Exception:
+                    pass
+            setattr(self, _attr, None)
+        if self._lineProg is not None:
+            try:
+                self._lineProg.release()
+            except Exception:
+                pass
+            self._lineProg = None
         if self._pathProg is not None:
             try:
                 self._pathProg.release()
@@ -944,6 +1306,7 @@ class GLSurface:
                 _b.release()
         self._pos = self._nrm = self._base = self._idx = None
         self._idxSrc = None
+        self._posSrc = self._nrmSrc = self._baseSrc = None
         self._roiPartial = False
         self._key = None
         if self._bzFbo is not None:

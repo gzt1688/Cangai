@@ -1,6 +1,6 @@
 """尺寸标注对象（DIMENSION）：独立的 2D 工程标注，归入“标注”固定层。
 
-两种样式：
+样式：
 - kind="xy"  ：对一块世界 AABB 区域直接标注 X 宽 / Y 高。默认 X 宽尺寸线在
   被测区域下方、Y 高尺寸线在左侧，两个子标注可自由穿过被测区域翻越到对侧
   （X 宽可到上方、Y 高可到右侧）；读数文字始终自动摆到远离被测区域的方位
@@ -8,6 +8,14 @@
   区域通常来自被选中对象的联合包围盒。
 - kind="linear"：标注两个点之间的对齐尺寸（任意方向，尺寸线平行于连线并
   沿法向偏移，自动带延伸线/箭头/距离读数）。
+- kind="circle"：圆标注，标注一个圆的直径。不穿圆：箭头尖端贴在圆周上（单独放大，
+  比尺寸线箭头更显眼），指引线引到圆外后折成一段**水平横线**，读数**水平**居中
+  挂在横线上方，写成 “Ø50.00”。指引线方向沿 _diaAng（默认 45°），可拖读数绕圆转动。
+  被测圆来自选中的圆/弧/椭圆（长短轴均值等效）/包围盒等效圆。绑定的源对象被
+  **单轴缩放**（长宽比变了 → 已不是那个圆）时，直径读数不再描述任何东西，
+  由文档层直接删除该标注（见 isBroken）。
+- kind="z"    ：Z 高度标注（3D 视口专用）：它的按钮入口已被“圆标注”取代，
+  该类型只为旧文档保留加载与绘制能力，不再提供创建入口。
 
 标注文字以 QPainter 矢量字形渲染（由 2D 图元负责绘制），对象本身只保存
 “世界坐标 + 样式”纯数据：被测区域（矩形或两点）、字高（世界单位）、文字
@@ -34,6 +42,22 @@ _T_ARROW_LEN = 0.55  # 箭头长度
 _T_ARROW_HW = 0.18   # 箭头半宽
 _T_CHAR_W = 0.62     # 数字字形平均宽高比（估算 bbox 用）
 _TEXT_TO_OBJ_GAP = 0.9   # 读数文字与对象轮廓净空系数（相对 fs，创建时 gap=fs*此系数）
+# 直径读数前缀：Ø（U+00D8）中西文字体都有字形；⌀（U+2300）很多字体缺字会
+# 成方块。要改成严格 CAD 符号只改这一处。
+_DIAMETER_PREFIX = "Ø"
+# 圆标注允许的长宽比变化（相对建立时的值）：超过 = 源对象被单轴缩放压扁了，
+# 直径标注失去意义。取 2% 是为了吃掉等比缩放/浮点误差，不当真变形。
+_CIRCLE_ASPECT_TOL = 0.02
+# 圆标注的指引箭头（相对字高 fs）：单独给一套尺寸，比尺寸线两端的常规箭头
+# （0.55/0.18）明显大一档——圆外只剩这一个箭头，太小就看不出指向哪里。
+_C_ARROW_LEN = 1.0
+_C_ARROW_HW = 0.32
+# 指引线外端接一段**水平横线**，读数居中压在横线上（两端各比字多让出 0.3fs）：
+# 字跟着箭头另一端走会偏里偏外，有横线才能“对准”。
+_C_TEXT_PAD = 0.6
+# 能与源物体绑定的标注类型（对齐标注是手点的两点，无绑定概念）：
+# UI / 文档层统一用这个集合判，不各自写死元组。
+BINDABLE_KINDS = ("xy", "z", "circle")
 
 
 def formatLength(v: float) -> str:
@@ -54,7 +78,7 @@ def _unitSuffix() -> str:
 class DimensionObject(BaseObject):
     def __init__(self, kind: str = "linear") -> None:
         super().__init__(ObjectType.DIMENSION)
-        self._kind = kind if kind in ("xy", "linear", "z") else "linear"
+        self._kind = kind if kind in ("xy", "linear", "z", "circle") else "linear"
         # xy：被测世界 AABB（已标准化 x0<=x1, y0<=y1）
         self._rect = (0.0, 0.0, 0.0, 0.0)
         self._hasRect = False
@@ -66,6 +90,14 @@ class DimensionObject(BaseObject):
         self._zBox = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         self._hasZBox = False
         self._zOff = 0.0           # 尺寸线沿 X 离对象右侧的偏移（可拖动调位置）
+        # circle：被测圆 (cx, cy, r) 与直径线方向角（度，0..180）
+        self._circle = (0.0, 0.0, 1.0)
+        self._hasCircle = False
+        self._diaAng = 45.0
+        # 建立标注时被测对象的长宽比（真圆=1，椭圆=major/minor）：用它区分
+        # “等比缩放（继续跟随）”与“单轴缩放（已不是圆 → 作废删除）”
+        self._circleAspect = 1.0
+        self._broken = False
         self._fontH = 1.0      # 文字世界高度
         self._gap = 0.9        # 标注与被测轮廓净空（世界单位）
         # xy 两个子标注的自由摆放量（世界单位，可正可负，无钳制）：
@@ -121,6 +153,48 @@ class DimensionObject(BaseObject):
 
     def fontHeight(self) -> float:
         return self._fontH
+
+    def setCircle(self, cx: float, cy: float, r: float, fontH: float, gap: float,
+                  angle: float = 45.0, aspect: float = 1.0) -> None:
+        """以被测圆建立圆标注（直径）：指引线沿 angle 方向从圆周引向圆外。
+
+        aspect = 被测对象的长宽比（真圆/弧传 1，椭圆传 major/minor，按包围盒
+        等效的就传 w/h）：之后绑定跟随靠它判断源对象是否被单轴缩放压扁。
+        """
+        self._kind = "circle"
+        self._fontH = max(float(fontH), 1e-3)
+        self._gap = max(float(gap), 0.0)
+        self._circle = (float(cx), float(cy), max(float(r), 1e-6))
+        self._hasCircle = True
+        self._hasRect = False
+        self._hasPoints = False
+        self._hasZBox = False
+        self._diaAng = float(angle) % 180.0
+        self._circleAspect = max(float(aspect), 1e-6)
+        self._broken = False
+
+    def circle(self):
+        """被测圆 (cx, cy, r)；未建立时 None。"""
+        return self._circle if self._hasCircle else None
+
+    def diameterAngle(self) -> float:
+        """直径线的世界方向角（度，0..180）。"""
+        return self._diaAng if self._kind == "circle" else 0.0
+
+    def setDiameterAngle(self, deg: float) -> None:
+        """旋转直径线方向（读数与箭头随之绕圆转）。"""
+        if self._kind != "circle":
+            return
+        self._diaAng = float(deg) % 180.0
+
+    def circleAspect(self) -> float:
+        """建立标注时被测对象的长宽比（判定后续是否被压扁的基准）。"""
+        return self._circleAspect if self._kind == "circle" else 1.0
+
+    def isBroken(self) -> bool:
+        """圆标注是否已作废：绑定的源对象被单轴缩放（长宽比变了，不再是
+        那个圆）后，直径读数不再描述任何东西，由文档层直接删除它。"""
+        return self._broken
 
     def gap(self) -> float:
         return self._gap
@@ -179,18 +253,22 @@ class DimensionObject(BaseObject):
             return
         self._zOff = float(off)
 
-    # ---------------- 物体绑定（仅 XY 标注） ----------------
+    # ---------------- 物体绑定（XY/Z/圆标注） ----------------
+
+    def bindable(self) -> bool:
+        """该标注是否支持与被测物体绑定（linear 恒为 False）。"""
+        return self._kind in BINDABLE_KINDS
 
     def boundTargetIds(self) -> list:
         """当前绑定的源对象 id 列表（空 = 已解除绑定/从未绑定）。
-        XY/Z 标注创建时自动记录被测对象；linear 标注恒为空。"""
-        if self._kind not in ("xy", "z"):
+        XY/Z/圆标注创建时自动记录被测对象；linear 标注恒为空。"""
+        if not self.bindable():
             return []
         return list(self._boundIds)
 
     def bindTo(self, ids) -> None:
-        """记录绑定的源对象 id 列表（仅 XY/Z；去重、按给定顺序）。"""
-        if self._kind not in ("xy", "z"):
+        """记录绑定的源对象 id 列表（仅 XY/Z/圆；去重、按给定顺序）。"""
+        if not self.bindable():
             return
         seen = []
         for i in ids:
@@ -211,7 +289,7 @@ class DimensionObject(BaseObject):
         不会被“吞”进物体内部。返回是否实际发生变化。所有源对象均无
         有效包围盒时不改动（标注原地保留）。
         """
-        if self._kind not in ("xy", "z"):
+        if not self.bindable():
             return False
         bb = BoundingBox3D()
         for t in targets:
@@ -224,6 +302,25 @@ class DimensionObject(BaseObject):
                 bb.expand(b.max)
         if not bb.isValid():
             return False
+        if self._kind == "circle":
+            w = bb.max.x - bb.min.x
+            h = bb.max.y - bb.min.y
+            if h <= 1e-9:
+                return False
+            if abs(w / h - self._circleAspect) > \
+                    max(self._circleAspect, 1e-6) * _CIRCLE_ASPECT_TOL:
+                # 长宽比变了 = 被单轴缩放：被测对象已不是当初那个圆，与其留一个
+                # “看着对其实错”的读数，不如直接作废（由文档层删除该标注）。
+                self._broken = True
+                return False
+            # 圆跟随：圆心取结合包围盒中心，半径取长宽均值的一半
+            # （真圆 w≈h 就是实际半径，椭圆则是等效圆）
+            nc = ((bb.min.x + bb.max.x) * 0.5, (bb.min.y + bb.max.y) * 0.5,
+                  (w + h) * 0.25)
+            if all(abs(a - b) < 1e-9 for a, b in zip(self._circle, nc)):
+                return False
+            self._circle = nc
+            return True
         if self._kind == "z":
             nz = (bb.min.x, bb.min.y, bb.max.x, bb.max.y, bb.min.z, bb.max.z)
             if all(abs(a - b) < 1e-9 for a, b in zip(self._zBox, nz)):
@@ -265,6 +362,8 @@ class DimensionObject(BaseObject):
             return max(abs(x1 - x0), abs(y1 - y0))
         if self._kind == "z" and self._hasZBox:
             return abs(self._zBox[5] - self._zBox[4])
+        if self._kind == "circle" and self._hasCircle:
+            return abs(self._circle[2]) * 2.0
         if self._kind == "linear" and self._hasPoints:
             return math.hypot(self._p2.x - self._p1.x, self._p2.y - self._p1.y)
         return None
@@ -274,6 +373,8 @@ class DimensionObject(BaseObject):
             return self._hasRect
         if self._kind == "z":
             return self._hasZBox
+        if self._kind == "circle":
+            return self._hasCircle
         return self._hasPoints
 
     # ---------------- 几何生成 ----------------
@@ -307,6 +408,8 @@ class DimensionObject(BaseObject):
             self._layoutXY(out, st, gap)
         elif self._kind == "z":
             self._layoutZ(out, st, gap)
+        elif self._kind == "circle":
+            self._layoutCircle(out, st, gap)
         else:
             fs = st["fs"]
             # 尺寸线整体离被测轮廓的距离 = 文字净空 + 一行文字 + 文字与线净空
@@ -370,6 +473,45 @@ class DimensionObject(BaseObject):
             cy = (y0 + y1) * 0.5
             # 竖排：读数沿 Y 轴方向，逆时针 90° 使顶部朝上（顺着高度方向读）
             self._addText(out, cx, cy, self._fmt(h), 90.0)
+
+    def circleText(self) -> str:
+        """圆标注读数文本（前缀 Ø + 直径 + 单位后缀）。"""
+        return _DIAMETER_PREFIX + self._fmt(2.0 * self._circle[2])
+
+    def _layoutCircle(self, out: dict, st: dict, gap: float) -> None:
+        """圆标注：不画穿圆的直径线。箭头尖端贴在圆周上，指引线引到圆外后折成
+        一段**水平横线**，读数**水平**居中写在横线上方（CAD 直径标注的标准画法）。
+
+        为什么不直接把字放在箭头斜方向上：那样字会随角度偏里偏外、看起来没对准；
+        有了横线，字永远居中挂在线上且水平，什么角度都一样读。
+        箭头用 `_C_ARROW_*` 单独放大；指引线方向 `_diaAng`（只能 0..180，即总是
+        向上引）可由用户拖读数绕圆转动。"""
+        cx, cy, r = self._circle
+        if r < 1e-6:
+            return
+        a = math.radians(self._diaAng)
+        ux, uy = math.cos(a), math.sin(a)
+        fs = st["fs"]
+        ah, awh = fs * _C_ARROW_LEN, fs * _C_ARROW_HW
+        text = self.circleText()
+        tw = max(len(text) * fs * _T_CHAR_W, fs)   # 估算文本宽（与 _textExtent 一致）
+        tipx, tipy = cx + ux * r, cy + uy * r      # 箭头尖端：贴在圆周上
+        lead = r + ah + gap + fs * 0.3             # 折点离圆心的距离
+        ex, ey = cx + ux * lead, cy + uy * lead
+        sx = 1.0 if ux >= 0 else -1.0              # 横线往远离圆的一侧走
+        shLen = tw + fs * _C_TEXT_PAD              # 横线比字略长，字才能居中在线上
+        hx = ex + sx * shLen
+        # 两段线：指引线（圆周到折点）+ 水平横线
+        out["lines"].append((tipx, tipy, ex, ey))
+        out["lines"].append((ex, ey, hx, ey))
+        # 箭头：尖端在圆周，底边在指引线方向上距尖端 ah，两侧撑开 awh
+        bx, by = cx + ux * (r + ah), cy + uy * (r + ah)
+        out["fills"].append([(tipx, tipy),
+                             (bx - uy * awh, by + ux * awh),
+                             (bx + uy * awh, by - ux * awh)])
+        # 读数水平居中挂在横线上方（基线与横线留 lineGap 净空）
+        out["texts"].append({"cx": (ex + hx) * 0.5, "cy": ey + st["lineGap"] + fs * 0.5,
+                             "text": text, "angle": 0.0})
 
     def _layoutZ(self, out: dict, st: dict, gap: float) -> None:
         """Z 标注：3D 竖直尺寸线标注被测对象 Z 高度。
@@ -517,6 +659,11 @@ class DimensionObject(BaseObject):
             x0, y0, x1, y1, z0, z1 = self._zBox
             self._zBox = (x0 + dx, y0 + dy, x1 + dx, y1 + dy,
                           z0 + dz, z1 + dz)
+        elif self._kind == "circle" and self._hasCircle:
+            if self._boundIds:
+                return   # 绑定圆标注：被测圆由绑定源物体决定，禁止单独平移
+            cx, cy, r = self._circle
+            self._circle = (cx + dx, cy + dy, r)
         elif self._hasPoints:
             self._p1 = Point3D(self._p1.x + dx, self._p1.y + dy, self._p1.z + dz)
             self._p2 = Point3D(self._p2.x + dx, self._p2.y + dy, self._p2.z + dz)
@@ -531,6 +678,8 @@ class DimensionObject(BaseObject):
         if self._kind == "xy" and self._boundIds:
             return
         if self._kind == "z" and self._boundIds:
+            return
+        if self._kind == "circle" and self._boundIds:
             return
         c, s = math.cos(angle), math.sin(angle)
         if self._kind == "xy" and self._hasRect:
@@ -548,6 +697,12 @@ class DimensionObject(BaseObject):
             xs = [p.x for p in pts]
             ys = [p.y for p in pts]
             self._zBox = (min(xs), min(ys), max(xs), max(ys), z0, z1)
+        elif self._kind == "circle" and self._hasCircle:
+            # 圆标注：圆心绕原点旋转，直径线方向角跟着转（保持相对圆的摆放）
+            cx, cy, r = self._circle
+            p = self._rotPt(Point3D(cx, cy, 0.0), c, s)
+            self._circle = (p.x, p.y, r)
+            self._diaAng = (self._diaAng + math.degrees(angle)) % 180.0
         elif self._hasPoints:
             self._p1 = self._rotPt(self._p1, c, s)
             self._p2 = self._rotPt(self._p2, c, s)
@@ -558,6 +713,8 @@ class DimensionObject(BaseObject):
         if self._kind == "xy" and self._boundIds:
             return
         if self._kind == "z" and self._boundIds:
+            return
+        if self._kind == "circle" and self._boundIds:
             return
         if self._kind == "xy" and self._hasRect:
             x0, y0, x1, y1 = self._rect
@@ -570,6 +727,11 @@ class DimensionObject(BaseObject):
             ys = sorted((y0 * sy, y1 * sy))
             zs = sorted((z0 * sz, z1 * sz))
             self._zBox = (xs[0], ys[0], xs[1], ys[1], zs[0], zs[1])
+        elif self._kind == "circle" and self._hasCircle:
+            # 圆标注：非均匀缩放时半径取几何均值（保持“圆”而不是变成椭圆）
+            cx, cy, r = self._circle
+            k = math.sqrt(abs(sx * sy))
+            self._circle = (cx * sx, cy * sy, max(r * k, 1e-6))
         elif self._hasPoints:
             self._p1 = Point3D(self._p1.x * sx, self._p1.y * sy, self._p1.z * sz)
             self._p2 = Point3D(self._p2.x * sx, self._p2.y * sy, self._p2.z * sz)
@@ -595,6 +757,11 @@ class DimensionObject(BaseObject):
             d["zBox"] = list(self._zBox)
             d["zOff"] = self._zOff
             d["bind"] = list(self._boundIds)
+        elif self._kind == "circle" and self._hasCircle:
+            d["circle"] = list(self._circle)
+            d["dia"] = self._diaAng
+            d["asp"] = self._circleAspect
+            d["bind"] = list(self._boundIds)
         elif self._kind == "linear" and self._hasPoints:
             d["p1"] = [self._p1.x, self._p1.y, self._p1.z]
             d["p2"] = [self._p2.x, self._p2.y, self._p2.z]
@@ -603,7 +770,7 @@ class DimensionObject(BaseObject):
     def deserialize(self, data: dict) -> None:
         super().deserialize(data)
         kind = data.get("kind", self._kind)
-        self._kind = kind if kind in ("xy", "linear", "z") else "linear"
+        self._kind = kind if kind in ("xy", "linear", "z", "circle") else "linear"
         self._fontH = max(float(data.get("fontH", self._fontH)), 1e-3)
         self._gap = max(float(data.get("gap", self._gap)), 0.0)
         if self._kind == "xy":
@@ -623,9 +790,19 @@ class DimensionObject(BaseObject):
                 self._zOff = float(data.get("zOff", 0.0))
                 b = data.get("bind")
                 self._boundIds = [str(x) for x in b] if isinstance(b, list) else []
-        else:
-            p1 = data.get("p1")
-            p2 = data.get("p2")
+        elif self._kind == "circle":
+            c = data.get("circle")
+            if c and len(c) >= 3:
+                self._circle = (float(c[0]), float(c[1]),
+                                max(float(c[2]), 1e-6))
+                self._hasCircle = True
+                self._diaAng = float(data.get("dia", 45.0)) % 180.0
+                self._circleAspect = max(float(data.get("asp", 1.0)), 1e-6)
+                self._broken = False
+                b = data.get("bind")
+                self._boundIds = [str(x) for x in b] if isinstance(b, list) else []
+        elif self._kind == "linear":
+            p1, p2 = data.get("p1"), data.get("p2")
             if p1 and p2:
                 self._p1 = Point3D(float(p1[0]), float(p1[1]),
                                    float(p1[2]) if len(p1) > 2 else 0.0)
@@ -644,6 +821,9 @@ class DimensionObject(BaseObject):
         elif self._kind == "z":
             z0, z1 = self._zBox[4], self._zBox[5]
             d["Z"] = self._fmt(z1 - z0)
+            d["字高"] = f"{self._fontH:.3f}"
+        elif self._kind == "circle":
+            d["直径"] = self._fmt(self.measureValue() or 0.0)
             d["字高"] = f"{self._fontH:.3f}"
         else:
             d["距离"] = self._fmt(self.measureValue() or 0.0)

@@ -27,6 +27,26 @@ def enable(on: bool = True) -> None:
     _enabled = bool(on)
 
 
+# 逐事件级流水账（每个 objectChanged / 每次操作轴刷新都一行）默认不写：
+# dbg() 是 flush 到磁盘的同步写，浮雕笔刷期每秒 30–120 个事件会把
+# 几十次阻塞写盘塞进鼠标事件链里（防病毒软件下更贵），表现为拖动
+# 明显滞后。需抓这类流水时调 verbose(True) 再复现。
+_verbose = False
+
+
+def verbose(on: bool = True) -> None:
+    """打开/关闭逐事件级日志（不影响异常/回退等诊断行）。"""
+    global _verbose
+    _verbose = bool(on)
+
+
+def vdbg(msg: str) -> None:
+    """逐事件级日志：仅在 verbose 打开时写（默认空操作，零开销）。"""
+    if not _enabled or not _verbose:
+        return
+    dbg(msg)
+
+
 def dbg(msg: str) -> None:
     """写一行调试日志并立即 flush（异常静默吞掉，绝不影响渲染）。"""
     global _file

@@ -108,10 +108,10 @@ ICON_MAP = {
     "Group": resource_path("icons/group.svg"),
     "ClosePath": resource_path("icons/closepath.svg"),
     "Outline": resource_path("icons/outline.svg"),
+    "BBox": resource_path("icons/bbox.svg"),
     "Align": resource_path("icons/align.svg"),
     "Bridge": resource_path("icons/bridge.svg"),
     "Revcloud": resource_path("icons/revcloud.svg"),
-    "ImageTrace": resource_path("icons/imagetrace.svg"),
     "ImageToModel": resource_path("icons/imagetomodel.svg"),
     "ReliefUndo": resource_path("icons/undo.svg"),
     "ReliefRedo": resource_path("icons/redo.svg"),
@@ -128,7 +128,7 @@ TEXT_ICON_KEYS = {"Text": "字"}
 TOOLTIP_OVERRIDES = {
     # 曲线编辑
     "Group":  "左：新建群组\n右：取消群组",
-    "Join":   "左：组合多条曲线\n右：断开组合",
+    "Join":   "左：组合多条曲线\n右：炸开组合",
     "TransferTo3D": "把选中的 2D 曲线复制到 3D 空间并切换到 3D 模式（原曲线保留）",
     # 浮雕
     "Brush":  "左：固化（抬高）\n右：流化（压低）",
@@ -155,12 +155,13 @@ CATEGORIES = [
     ("曲线绘制", [
         ("Point", "点"), ("Line", "直线"), ("Curve", "样条"), ("Circle", "圆"),
         ("Ellipse", "椭圆"), ("Arc", "圆弧"), ("Rectangle", "矩形"),
-        ("Polygon", "多边形"), ("Text", "文字"), ("ImageTrace", "图转线"), ("Revcloud", "修订\n云线"),
+        ("Polygon", "多边形"), ("Text", "文字"), ("Revcloud", "修订\n云线"),
     ]),
     ("曲线编辑", [
         ("Offset", "偏移"), ("Trim", "修剪"), ("Extend", "延伸"), ("Mirror", "镜像"),
         ("Chamfer", "倒角"), ("Array", "阵列"), ("Join", "组合"), ("Group", "群组"),
-        ("ClosePath", "闭合"), ("Outline", "轮廓"), ("Align", "对齐"),
+        ("ClosePath", "闭合"), ("Outline", "轮廓"), ("BBox", "包围盒"),
+        ("Align", "对齐"),
         ("Bridge", "桥接"), ("TransferTo3D", "转入\n3D"),
 
     ]),
@@ -177,6 +178,7 @@ CATEGORIES = [
         ("RegionSymmetry", "区域\n对称"),
         ("RegionDeform", "区域\n变形"),
         ("LevelCalibrate", "水平\n校准"),
+        ("HeightContrast", "高差\n调整"),
         ("RegionSlope", "斜面"),
         ("RevolveSlope", "旋转\n面"),
         ("TextureFill", "纹理\n填充"),
@@ -442,6 +444,11 @@ class TopDock(QWidget):
             btn.setContextMenuPolicy(Qt.CustomContextMenu)
             btn.customContextMenuRequested.connect(
                 lambda _pos: self.commandRequested.emit("Ungroup"))
+        if key == "Join":
+            # 组合按钮：右键=炸开（拆回独立曲线，组合的逆操作）
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda _pos: self.commandRequested.emit("Explode"))
         if key == "Smooth":
             # 磨光按钮：右键=路径磨光（沿曲线磨光，复用磨光笔刷参数）
             btn.setContextMenuPolicy(Qt.CustomContextMenu)

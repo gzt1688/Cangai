@@ -135,6 +135,10 @@ class SnapManager:
         # 解析对象（圆/弧/椭圆/直线）→ 采样折线缓存：键为几何签名（内容变化即换键），
         # 超上限按 LRU 淘汰最早项；非解析对象不走此缓存（显示点列由对象自身缓存）
         self._sampleCache: "OrderedDict" = OrderedDict()
+        # (u,v) 包围盒缓存：键为采样列表身份（对象几何变化 → 采样列表整体
+        # 重建 → 身份变化自然失效）。每个鼠标事件的包围盒粗筛都要过全部
+        # 对象，逐次全表扫描采样点是画线/移动时卡顿的主因。
+        self._uvBBoxCache: dict = {}
         # 当前捕捉平面轴（snap() 入口设置；主线程串行调用，无重入）
         self._ax: Tuple[int, int] = _AXES_XY
 
@@ -895,7 +899,25 @@ class SnapManager:
             if not us:
                 return None
             return (min(us), min(vs), max(us), max(vs))
-        return _bboxOf(self._cachedSamples(obj), self._ax)
+        return self._uvBBoxOf(obj)
+
+    def _uvBBoxOf(self, obj):
+        """对象在捕捉平面上的 (u,v) 包围盒，按采样列表身份缓存。
+
+        采样列表由各对象按脏标记整体重建（从不原地修改）：列表对象不变
+        即几何未变，直接复用上次扫描结果；坐标轴一并比对，2D/3D 捕捉
+        平面切换时自然失效。缓存条目持有列表强引用，身份判定不受
+        id 复用影响。"""
+        samples = self._cachedSamples(obj)
+        entry = self._uvBBoxCache.get(id(samples))
+        if entry is not None and entry[0] is samples \
+                and entry[1] == self._ax:
+            return entry[2]
+        bb = _bboxOf(samples, self._ax)
+        self._uvBBoxCache[id(samples)] = (samples, self._ax, bb)
+        if len(self._uvBBoxCache) > 8192:
+            self._uvBBoxCache.clear()
+        return bb
 
     def _samplePointsOf(self, obj) -> List[Point3D]:
         """对象的显示采样折线（交点/最近点等通用求交的数据源）。

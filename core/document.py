@@ -68,12 +68,12 @@ LAYER_3D_MODEL_ID = 4
 LAYER_CNC_ID = 5        # 加工模具：固定层，专放 CNC 加工模型
 LAYER_FIXED_COUNT = 6   # 固定层数量；id ≥ LAYER_FIXED_COUNT 的层全部为子图层
 
-# (id, 默认名, 默认颜色)：曲线层沿用描边主色，模型层取芥黄 #c9c909，
+# (id, 默认名, 默认颜色)：曲线层沿用描边主色，模型层取芥黄 #e8ec13，
 # 图片层取中性紫（仅作图层标识色，图片本身按原始像素显示），标注层取红色，
 # 3D模型层取青绿（3D 模式挤出实体默认归此层，与曲线/浮雕模型区分）
 _FIXED_LAYERS = (
     (LAYER_CURVES_ID, "曲线", (255, 100, 0)),
-    (LAYER_MODEL_ID, "浮雕模型", (201, 201, 9)),
+    (LAYER_MODEL_ID, "浮雕模型", (232, 236, 19)),
     (LAYER_IMAGE_ID, "图片", (155, 89, 182)),
     (LAYER_ANNOTATION_ID, "标注", (231, 76, 60)),
     (LAYER_3D_MODEL_ID, "3D模型", (0, 200, 200)),
@@ -115,12 +115,15 @@ def _layerIdForObject(obj) -> int:
 
 # 撤销/重做按“对象域”拆成相互独立的多套历史：
 #   curve   → 2D/浮雕空间中非浮雕模型对象（曲线/点/文字…）的编辑；
-#   relief  → 浮雕模型(SURFACE)对象（新建/区域浮雕/填色/雕刻/移动/删除…）的编辑；
+#   relief  → 浮雕模型(SURFACE)对象的**高度场内容**编辑（新建/区域浮雕/填色/雕刻…）；
+#   relief_basic → 浮雕模型的**纯变换**编辑（移动/旋转/缩放，只存放置阵，不含场数据），
+#                  与曲线一起归入 2D 的“基础操作”撤销；2D 模式不碰高度场内容；
 #   curve3d → 3D 空间独立曲线的编辑（3D 模式单独绘制的曲线，与 2D/浮雕互不可见）。
 # 各套历史各自记录、各自撤销/重做，互不混入、互不清空；
-# curve3d 归入“曲线”撤销按钮（undoCurve/redoCurve 取 curve/curve3d 中较新者）。
-_HISTORY_DOMAINS = ("curve", "relief", "curve3d")
+# curve3d、relief_basic 归入“曲线”撤销按钮（undoCurve/redoCurve 取较新者）。
+_HISTORY_DOMAINS = ("curve", "relief", "curve3d", "relief_basic")
 _DOMAIN_CURVE3D = "curve3d"
+_DOMAIN_RELIEF_BASIC = "relief_basic"
 
 # 文档活动空间：2D/浮雕模式共用 "2d" 空间（曲线与浮雕模型互相可见）；
 # 3D 模式使用独立的 "3d" 空间（只包含 3D 模式里单独绘制的曲线，可带任意 Z），
@@ -227,6 +230,8 @@ class Document(QObject):
     reliefRedoChanged = Signal(bool)
     # 多文件系统：未保存状态变化（标签栏圆点提示）
     dirtyChanged = Signal(bool)
+    # 绑定标注因源对象变形而自动删除（参数：被删除的标注 id）
+    dimensionDropped = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -370,6 +375,36 @@ class Document(QObject):
             self.objectRemoved.emit(oid)
         return obj
 
+    def replaceObject(self, oid: str, newObj: BaseObject) -> Optional[BaseObject]:
+        """同 id 就地换实现（如圆非等比缩放后换成椭圆）。
+
+        只发 objectChanged（不发 removed/added）：选择态由 id 保持，2D 场景
+        按 objectChanged 重建图元；图层/样式/显示锁随旧对象保留。
+        返回被替换的旧对象（不在文档中时返回 None）。
+        """
+        store = None
+        for s in (self._objects, self._objects3d, self._objectsCnc):
+            if oid in s:
+                store = s
+                break
+        old = store.get(oid) if store is not None else None
+        if old is None:
+            return None
+        newObj._id = oid
+        newObj.setLayerId(old.layerId())
+        newObj.setLayerLocked(old._layerLocked)
+        newObj.setLocked(old.isEditLocked())
+        newObj.setVisible(old.isVisible())
+        newObj.setColor(old.color())
+        newObj.setLineWidth(old.lineWidth())
+        newObj.setGroup(old.group())
+        if old.isSelected():
+            newObj.setSelected(True)
+            newObj._selectionSeq = old.selectionSeq()
+        store[oid] = newObj
+        self.notifyObjectChanged(oid)
+        return old
+
     def object(self, oid: str) -> Optional[BaseObject]:
         obj = self._objects.get(oid)
         if obj is None:
@@ -400,24 +435,30 @@ class Document(QObject):
         return out
 
     def notifyObjectChanged(self, oid: str) -> None:
-        # 绑定跟随：对象几何变化时同步刷新绑定它的 XY 标注（先发标注更新，
+        # 绑定跟随：对象几何变化时同步刷新绑定它的 XY/圆标注（先发标注更新，
         # 后发对象自身变化，避免监听方先刷对象后刷标注造成的中间态闪烁）
         self._syncBoundDimensions(oid)
         self.objectChanged.emit(oid)
 
     def _syncBoundDimensions(self, changedOid: Optional[str] = None) -> None:
-        """绑定标注跟随：把绑定到受影响对象的 XY/Z 标注被测区域同步为其
-        现存绑定源对象的联合包围盒（保留字号/净空/子标注外拉距离）。
+        """绑定标注跟随：把绑定到受影响对象的 XY/Z/圆标注被测区域同步为其
+        现存绑定源对象的联合包围盒（保留字号/净空/子标注外拉距离；圆标注
+        取包围盒中心与等效半径）。
 
         changedOid 为 None 时全量同步（撤销/重做恢复后使用）。仅对仍绑定
         源对象的标注生效；源对象被删除后该标注不再跟随（保持最后区域），
         用户解绑后（目标列表清空）也自然不再参与。
+
+        圆标注额外一条：源对象被单轴缩放（长宽比变了）后，直径读数已无从
+        描述任何东西，直接删除该标注（跟随 followTargetBounds 的作废标记）。
+        删除发生在调用者的编辑会话内，所以与缩放操作合成一步撤销。
         """
         touched = []
+        doomed = []
         for obj in list(self.allObjects()):
             if obj.type() != ObjectType.DIMENSION:
                 continue
-            if obj.kind() not in ("xy", "z"):
+            if not obj.bindable():
                 continue
             if changedOid is not None and changedOid not in obj.boundTargetIds():
                 continue
@@ -427,8 +468,13 @@ class Document(QObject):
                 continue
             if obj.followTargetBounds(srcs):
                 touched.append(obj.id())
+            elif obj.isBroken():
+                doomed.append(obj)
         for oid in touched:
             self.objectChanged.emit(oid)
+        for d in doomed:
+            if self.removeObject(d.id()) is not None:
+                self.dimensionDropped.emit(d.id())
 
     def reliefModels(self) -> List[BaseObject]:
         """文档内全部浮雕模型对象（ObjectType.SURFACE）。"""
@@ -758,7 +804,18 @@ class Document(QObject):
         走对象级 snapshot() 协议（默认=serialize；浮雕网格/位图为免压缩的
         原始字节快照），每项同时记录对象级内存计费供预算淘汰。
         curve3d 域取 3D 空间对象表（全部为曲线类对象）。
+        relief_basic 域只记录浮雕模型的放置阵（移动/旋转/缩放），不复制高度场。
         """
+        if kind == _DOMAIN_RELIEF_BASIC:
+            objs = sorted((o for o in self._objects.values()
+                           if o.type() == ObjectType.SURFACE),
+                          key=lambda o: o.id())
+            return {
+                "objects": [{"id": o.id(),
+                             "place": o.placement().tolist(),
+                             "size": 64} for o in objs],
+                "selected": [o.id() for o in objs if o.isSelected()],
+            }
         src = (self._objects3d.values() if kind == _DOMAIN_CURVE3D
                else self._objects.values())
         objs = sorted((o for o in src
@@ -796,7 +853,14 @@ class Document(QObject):
             return
         before = self._editBefore
         changedKinds = []
+        # 浮雕模型分两条线：只移动/旋转/缩放（放置阵变了、场内容没变）→
+        # relief_basic（2D 可撤的基础操作）；改了高度场内容 → relief（2D 不撤）。
+        relief_changed = self._domainChanged("relief", before["relief"])
+        relief_basic_only = relief_changed and \
+            self._reliefChangeIsBasicOnly(before["relief"])
         for kind in _HISTORY_DOMAINS:
+            if kind in ("relief", _DOMAIN_RELIEF_BASIC):
+                continue        # 下面单独处理（要先判定是纯变换还是内容变更）
             # O(1) 预检：先用对象级 matchesSnapshot 签名判断该域是否有变，
             # 无变即跳过 after 全量物化——浮雕场 snapshot 是 64MB 级
             # memcpy + 字典全等 memcmp，未涉及该域的编辑（画线/改曲线）
@@ -813,12 +877,75 @@ class Document(QObject):
                     self._undoHistory[kind].pop(0)
                 self._redoHistory[kind].clear()
                 changedKinds.append(kind)
+        if relief_changed:
+            kind = _DOMAIN_RELIEF_BASIC if relief_basic_only else "relief"
+            after = self._snapshotDomain(kind)
+            if kind == "relief":
+                # 标记“未碰高度场内容”（仅新建/删除网格）：这类条目 2D 也能撤销
+                ok = self._reliefChangeIsStructuralOnly(before[kind])
+                before[kind]["basicOk"] = ok
+                after["basicOk"] = ok
+            if after != before[kind]:
+                size = (self._historyEntrySize(before[kind]) +
+                        self._historyEntrySize(after))
+                self._undoHistory[kind].append(
+                    (before[kind], after, self._nextSeq(), size))
+                if len(self._undoHistory[kind]) > self._undoDepth:
+                    self._undoHistory[kind].pop(0)
+                self._redoHistory[kind].clear()
+                changedKinds.append(kind)
         self._editBefore = None
         if changedKinds:
             for kind in changedKinds:
                 self._enforceHistoryBudget(kind)
             self._setDirty(True)   # 多文件系统：内容有变即标记未保存
             self._emitHistoryState()
+
+    def _reliefChangeIsBasicOnly(self, beforeSnap: dict) -> bool:
+        """浮雕模型的这次改动是否只是“基础变换”（放置阵），未碰高度场内容。
+
+        判据：对象集合不变，且每个模型的内容签名（场 stamp/version/蒙版/幕帘）
+        与快照一致——只有 place 变。这样的操作归 2D 的基础撤销（移动网格等）。
+        """
+        objs = [o for o in self._objects.values()
+                if o.type() == ObjectType.SURFACE]
+        beforeById = {e["id"]: e for e in beforeSnap.get("objects", [])}
+        if len(objs) != len(beforeById):
+            return False        # 有新增/删除模型 → 属内容类历史
+        for o in objs:
+            entry = beforeById.get(o.id())
+            if entry is None:
+                return False
+            fn = getattr(o, "matchesContent", None)
+            try:
+                same = fn(entry["snap"]) if fn else False
+            except Exception:
+                same = False
+            if not same:
+                return False
+        return True
+
+    def _reliefChangeIsStructuralOnly(self, beforeSnap: dict) -> bool:
+        """浮雕改动是否**没有碰高度场内容**（只增删模型或改放置阵）。
+
+        与 _reliefChangeIsBasicOnly 的区别：允许对象集合变化（新建/删除网格）。
+        这类条目 2D 也可撤销（删除网格要能撤回），内容类（区域浮雕/雕刻/填色）仍隔离。
+        """
+        objs = [o for o in self._objects.values()
+                if o.type() == ObjectType.SURFACE]
+        beforeById = {e["id"]: e for e in beforeSnap.get("objects", [])}
+        for o in objs:
+            entry = beforeById.get(o.id())
+            if entry is None:
+                continue        # 新增模型：不算内容修改
+            fn = getattr(o, "matchesContent", None)
+            try:
+                same = fn(entry["snap"]) if fn else False
+            except Exception:
+                same = False
+            if not same:
+                return False
+        return True
 
     def _domainChanged(self, kind: str, beforeSnap: dict) -> bool:
         """该域自 beforeSnap 之后是否有任何变化（对象集/内容/选中集）。
@@ -867,31 +994,65 @@ class Document(QObject):
             _, _, _, sz = st.pop(0)
             total -= sz
 
+    @staticmethod
+    def _tdbg(msg: str) -> None:
+        """撤销/重做排查面包屑（写 render_debug.log，异常静默）。"""
+        try:
+            from ui.view_3d._renderdbg import dbg
+            dbg("undo " + msg)
+        except Exception:
+            pass
+
     def _restoreDomain(self, kind: str, snap: dict) -> None:
         """把 kind 域的对象恢复为快照状态；另一域对象与图层等文档状态保持不变。"""
+        if kind == _DOMAIN_RELIEF_BASIC:
+            self._restoreReliefBasic(snap)
+            return
         store = self._objects3d if kind == _DOMAIN_CURVE3D else self._objects
         target = {e["id"]: e for e in snap["objects"]}
         snap_sel = set(snap.get("selected", []))
+        self._tdbg(f"restore {kind} start objects={len(store)} target={len(target)}")
         # 1) 移除快照中已不存在的该域对象
         for oid in [oid for oid, o in store.items()
                     if kind == _DOMAIN_CURVE3D or self._domainOf(o) == kind]:
             if oid not in target:
+                self._tdbg(f"  remove {oid}")
                 store.pop(oid)
                 self.objectRemoved.emit(oid)
-        # 2) 与快照有差异的对象按快照重建（同 id 先移除再添加，驱动场景/视口刷新）；
-        #    matchesSnapshot 未变（浮雕按 stamp/version O(1) 签名、其余按快照全等）
-        #    的对象保留原实例，避免无谓重建（尤其浮雕模型网格缓存）。
+        # 2) 与快照有差异的对象按快照恢复：浮雕模型就地复用实例（只发
+        #    objectChanged，不销毁/重建）；其余类型同 id 先移除再添加，驱动
+        #    场景/视口刷新。matchesSnapshot 未变的对象保留原实例。
         for oid, entry in target.items():
             cur = store.get(oid)
+            snap = entry["snap"]
+            # 类型可能变过（圆非等比缩放→椭圆）：类型不同不能就地 deserialize，
+            # 否则椭圆按圆字段恢复（半径丢失），必须走重建
+            snapType = (snap.get("type") if isinstance(snap, dict)
+                        else snap.type().name)
+            sameType = cur is not None and cur.type().name == snapType
             if cur is not None:
                 try:
-                    same = cur.matchesSnapshot(entry["snap"])
+                    same = cur.matchesSnapshot(snap) if sameType else False
                 except Exception:
                     same = False
                 if same:
                     continue
+                # 同 id 就地恢复（不删除+重建）：删除会先发 objectRemoved，
+                # 若该对象正处于选中态（如 2D 移动后的浮雕网格），QGraphicsScene
+                # 在 removeItem 内部发 selectionChanged，选择同步会在 Qt 的选中
+                # 迭代中重入改写选择集 → 原生崩溃（移动网格后 Ctrl+Z 闪退即此）。
+                # 就地恢复只发 objectChanged，图元/视口缓存/浮雕编辑锁全部保留。
+                if sameType and isinstance(snap, dict):
+                    try:
+                        self._tdbg(f"  inplace {cur.type().name} {oid}")
+                        cur.restoreSnapshot(snap)
+                        self.notifyObjectChanged(oid)
+                        continue
+                    except Exception:
+                        pass        # 就地恢复失败则退回重建路径
                 store.pop(oid)
                 self.objectRemoved.emit(oid)
+            self._tdbg(f"  rebuild {oid}")
             obj = self._objectFromSnapshot(entry["snap"])
             if obj is None:
                 continue
@@ -912,6 +1073,35 @@ class Document(QObject):
         self._syncLayerLocks()
         # 撤销/重做重建后对齐绑定标注：源对象几何回到快照状态，标注跟随刷新
         self._syncBoundDimensions()
+        self._tdbg(f"restore {kind} end objects={len(store)}")
+
+    def _restoreReliefBasic(self, snap: dict) -> None:
+        """恢复浮雕模型的基础变换（放置阵），不动高度场数据。
+
+        就地改放置阵 + objectChanged，不删不重建对象（避免图元/缓存悬空）。
+        """
+        changed = False
+        entries = snap.get("objects", [])
+        for e in entries:
+            obj = self._objects.get(e["id"])
+            if obj is None or obj.type() != ObjectType.SURFACE:
+                continue
+            self._tdbg(f"  basic place {e['id']}")
+            obj.setPlacement(e.get("place"))
+            self.notifyObjectChanged(e["id"])
+        sel = set(snap.get("selected", []))
+        for e in entries:
+            obj = self._objects.get(e["id"])
+            if obj is None:
+                continue
+            want = e["id"] in sel
+            if obj.isSelected() != want:
+                obj.setSelected(want)
+                changed = True
+        if changed:
+            self.selectionChanged.emit()
+        self._syncLayerLocks()
+        self._tdbg(f"restore {_DOMAIN_RELIEF_BASIC} end")
 
     def _objectFromSnapshot(self, snap) -> Optional[BaseObject]:
         """由撤销快照重建对象：快照可能是对象实例（BRepObject 内存克隆）
@@ -956,25 +1146,47 @@ class Document(QObject):
         self._emitHistoryState()
 
     def undoCurve(self) -> None:
-        """撤销曲线历史：只恢复曲线/点/文字等对象（含 3D 空间曲线），
-        浮雕模型与其历史不受影响。"""
-        kind = self._newestKind({"curve": self._undoHistory["curve"],
-                                 _DOMAIN_CURVE3D: self._undoHistory[_DOMAIN_CURVE3D]})
+        """撤销“基础操作”历史：曲线/点/文字（含 3D 空间曲线）、浮雕模型的
+        移动/旋转/缩放、以及浮雕模型的新建/删除；**不含浮雕高度场内容**
+        （区域浮雕/雕刻/填色等只在 undoRelief/通用 undo 里）。"""
+        hist = {"curve": self._undoHistory["curve"],
+                _DOMAIN_CURVE3D: self._undoHistory[_DOMAIN_CURVE3D],
+                _DOMAIN_RELIEF_BASIC: self._undoHistory[_DOMAIN_RELIEF_BASIC]}
+        if self._reliefTopAllowsBasic(self._undoHistory["relief"][-1:]):
+            hist["relief"] = self._undoHistory["relief"]
+        kind = self._newestKind(hist)
         if kind is not None:
             self._undoOne(kind)
 
     def redoCurve(self) -> None:
-        kind = self._newestKind({"curve": self._redoHistory["curve"],
-                                 _DOMAIN_CURVE3D: self._redoHistory[_DOMAIN_CURVE3D]})
+        hist = {"curve": self._redoHistory["curve"],
+                _DOMAIN_CURVE3D: self._redoHistory[_DOMAIN_CURVE3D],
+                _DOMAIN_RELIEF_BASIC: self._redoHistory[_DOMAIN_RELIEF_BASIC]}
+        if self._reliefTopAllowsBasic(self._redoHistory["relief"][-1:]):
+            hist["relief"] = self._redoHistory["relief"]
+        kind = self._newestKind(hist)
         if kind is not None:
             self._redoOne(kind)
 
+    @staticmethod
+    def _reliefTopAllowsBasic(top: list) -> bool:
+        """浮雕历史栈顶是否为“无高度场内容”条目（新建/删除网格），2D 可撤。"""
+        return bool(top) and bool(top[-1][0].get("basicOk"))
+
     def undoRelief(self) -> None:
-        """撤销浮雕历史：只恢复浮雕模型(SURFACE)对象，曲线与其历史不受影响。"""
-        self._undoOne("relief")
+        """撤销浮雕历史：浮雕模型的改动（内容或移动），曲线历史不受影响。"""
+        kind = self._newestKind({"relief": self._undoHistory["relief"],
+                                 _DOMAIN_RELIEF_BASIC:
+                                 self._undoHistory[_DOMAIN_RELIEF_BASIC]})
+        if kind is not None:
+            self._undoOne(kind)
 
     def redoRelief(self) -> None:
-        self._redoOne("relief")
+        kind = self._newestKind({"relief": self._redoHistory["relief"],
+                                 _DOMAIN_RELIEF_BASIC:
+                                 self._redoHistory[_DOMAIN_RELIEF_BASIC]})
+        if kind is not None:
+            self._redoOne(kind)
 
     @staticmethod
     def _newestKind(history: Dict[str, list]) -> Optional[str]:
@@ -999,17 +1211,23 @@ class Document(QObject):
 
     def canCurveUndo(self) -> bool:
         return bool(self._undoHistory["curve"]) or \
-            bool(self._undoHistory[_DOMAIN_CURVE3D])
+            bool(self._undoHistory[_DOMAIN_CURVE3D]) or \
+            bool(self._undoHistory[_DOMAIN_RELIEF_BASIC]) or \
+            self._reliefTopAllowsBasic(self._undoHistory["relief"][-1:])
 
     def canCurveRedo(self) -> bool:
         return bool(self._redoHistory["curve"]) or \
-            bool(self._redoHistory[_DOMAIN_CURVE3D])
+            bool(self._redoHistory[_DOMAIN_CURVE3D]) or \
+            bool(self._redoHistory[_DOMAIN_RELIEF_BASIC]) or \
+            self._reliefTopAllowsBasic(self._redoHistory["relief"][-1:])
 
     def canReliefUndo(self) -> bool:
-        return bool(self._undoHistory["relief"])
+        return bool(self._undoHistory["relief"]) or \
+            bool(self._undoHistory[_DOMAIN_RELIEF_BASIC])
 
     def canReliefRedo(self) -> bool:
-        return bool(self._redoHistory["relief"])
+        return bool(self._redoHistory["relief"]) or \
+            bool(self._redoHistory[_DOMAIN_RELIEF_BASIC])
 
     def canUndo(self) -> bool:
         return self.canCurveUndo() or self.canReliefUndo()

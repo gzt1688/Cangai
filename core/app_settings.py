@@ -47,6 +47,7 @@ shortcuts = [
     ["浮雕", "磨光", "Shift+E", "磨光（精雕 Shift+E）；右键路径磨光（精雕 Shift+J）"],
     ["浮雕", "固化", "Shift+G", "整体固化（精雕 Shift+G）"],
     ["浮雕", "显示/隐藏曲线", "E", "浮雕模式下切换曲线图层显示"],
+    ["浮雕", "切换颜色", "W", "循环切换当前填色颜色（底部调色板高亮随之刷新）"],
     ["浮雕", "新建模型", "", ""],
     ["浮雕", "图转模型", "", ""],
     ["浮雕", "模型扩缩", "", ""],
@@ -60,6 +61,7 @@ shortcuts = [
     ["浮雕几何", "区域对称", "", ""],
     ["浮雕几何", "区域变形", "", ""],
     ["浮雕几何", "水平校准", "", ""],
+    ["浮雕几何", "高差调整", "", ""],
     ["浮雕几何", "斜面", "", ""],
     ["浮雕几何", "旋转面", "", ""],
     ["浮雕几何", "纹理填充", "", ""],
@@ -89,11 +91,31 @@ shortcut_commands = {
     "区域对称": "RegionSymmetry",
     "区域变形": "RegionDeform",
     "水平校准": "LevelCalibrate",
+    "高差调整": "HeightContrast",
     "斜面": "RegionSlope",
     "旋转面": "RevolveSlope",
     "纹理填充": "TextureFill",
     "构造曲线": "SlopeZone",
 }
+
+
+def shortcut_key_for(func: str, default: str = "") -> str:
+    """查设置页登记的某功能当前快捷键字符串（无则返回 default）。
+
+    供非命令类交互（如浮雕“切换颜色”由视口直接处理）读取可自定义的绑定。
+    命中行但用户清空快捷键 → 返回空串（= 禁用）；行不存在（旧配置）才返回 default。
+    兼容 4 段 [分组,功能,键,说明] 与旧 3 段 [功能,键,说明]。
+    """
+    for row in shortcuts:
+        if len(row) >= 4:
+            name, key = row[1], row[2]
+        elif len(row) == 3:
+            name, key = row[0], row[1]
+        else:
+            continue
+        if name == func:
+            return (key or "").strip().replace(" ", "")
+    return default
 
 # ==================== 标注样式设置（设置 → 通用 → 标注）====================
 # 标注读数文字使用的字体；创建新标注时读数文字的屏幕高度（px，按创建时
@@ -135,6 +157,15 @@ UNDO_MEMORY_BUDGET_RANGE = (32, 4096)
 # 是否启用 GPU(ModernGL) 加速浮雕曲面渲染；关闭则走 CPU 软件光栅化兜底。
 gpu_accelerated = True
 
+# ---- 环境光照（HDRI IBL）----
+# 等距柱状全景环境图路径（.hdr/.exr/.png/.jpg）；空=用内置程序化摄影棚环境。
+# 默认不加载环境（空）；用户可在材质面板“环境”行手动加载 HDRI
+# （可选 resources/envmaps/studio_default.hdr 等）。env_intensity 为 IBL 总增益。
+env_map_path = ""
+# 环境强度（IBL 总增益，1.0=原图曝光）。
+env_intensity = 1.0
+ENV_INTENSITY_RANGE = (0.0, 4.0)
+
 # GPU 路径 3D 曲面每边最大网格数（面数≈N²，单次 draw call）。默认 1024：
 # 显示网格按整数步长抽稀，1024 对 1000~2000px 的图正好是 1~2 倍抽稀，
 # 大图不再糊成格子；旧默认 256 会抽稀 4~5 倍，浮雕明显"像素化"。
@@ -158,13 +189,45 @@ MSAA_CHOICES = (0, 2, 4, 8)
 # 区域浮雕/重构等重计算是否放到后台线程（关闭则在主线程同步计算，会卡）。默认开。
 async_compute = True
 
+# STL 导出固定为**闭合实体**（顶面 + 底面 + 四周侧壁，水密）：
+# 切片/3D 打印必须有厚度，不再提供"只导顶面"的开关。
+
+# STL 顶面简化容差（mm）：0 = 只在严格共面时合并（几何零误差）；正值 =
+# 容差自适应简化，块内顶点与拟合面的偏差不超过该值（实测最大偏差约 2*tol）。
+# 默认 0.005mm：约为常见 0.1mm 层高的 1/10，打印结果无差别，文件可再小一半以上。
+stl_merge_tol = 0.005
+STL_MERGE_TOL_CHOICES = (
+    (0.0, "关闭（零损失）"),
+    (0.002, "0.002 mm"),
+    (0.005, "0.005 mm"),
+    (0.01, "0.01 mm"),
+    (0.02, "0.02 mm"),
+    (0.05, "0.05 mm"),
+)
+
 
 # ==================== 文件保存设置（自动保存 / 备份） ====================
-# 自动保存：开启后按间隔把"有文件路径且未保存"的文档另存为 <路径>.autosave 恢复
-# 副本（不改动未保存标记）；备份：保存覆盖已有文件前先复制 <路径>.bak。
-autosave_enabled = False
+# 自动保存：开启后按间隔在软件目录 caibak 文件夹新建独立副本 <主名>.autosave.<时间戳>.cai
+# （不覆盖原文件、不改动未保存标记，每个文档只保留最近若干份）；备份：保存覆盖已有文件前先复制 <路径>.bak。
+autosave_enabled = True
 autosave_interval_min = 5
 backup_on_save = True
+
+# 最近打开过的工程文件（绝对路径，最新在前；仅保留最近 RECENT_MAX 个）。
+RECENT_MAX = 10
+recent_files: list = []
+
+
+def add_recent_file(path: str) -> None:
+    """记录一个刚打开的工程文件（去重、移到最前、截断），并落盘。"""
+    global recent_files
+    p = os.path.abspath(str(path))
+    recent_files = [p] + [x for x in recent_files if x != p]
+    del recent_files[RECENT_MAX:]
+    try:
+        save_perf()
+    except Exception:
+        pass
 
 # ==================== 插件启停状态 ====================
 # 插件 id → 是否启用（缺省视为启用，用户禁用后记 False，重启保持）。
@@ -190,6 +253,8 @@ def perf_snapshot() -> dict:
         "max_field_pixels_side": max_field_pixels_side,
         "undo_memory_budget_mb": undo_memory_budget_mb,
         "gpu_accelerated": gpu_accelerated,
+        "env_map_path": env_map_path,
+        "env_intensity": env_intensity,
         "mesh_max_dim_gpu": mesh_max_dim_gpu,
         "mesh_max_dim_cpu": mesh_max_dim_cpu,
         "preview_max_dim": preview_max_dim,
@@ -198,6 +263,8 @@ def perf_snapshot() -> dict:
         "autosave_enabled": autosave_enabled,
         "autosave_interval_min": autosave_interval_min,
         "backup_on_save": backup_on_save,
+        "stl_merge_tol": stl_merge_tol,
+        "recent_files": list(recent_files),
         "invert_wheel_zoom": invert_wheel_zoom,
         "plugin_state": dict(plugin_state),
     }
@@ -206,14 +273,21 @@ def perf_snapshot() -> dict:
 def perf_restore(snap: dict) -> None:
     """从快照回滚渲染/性能与文件设置。"""
     global max_field_pixels_side, undo_memory_budget_mb, gpu_accelerated
+    global env_map_path, env_intensity
     global mesh_max_dim_gpu, mesh_max_dim_cpu, preview_max_dim
     global msaa_samples, async_compute
     global autosave_enabled, autosave_interval_min, backup_on_save
-    global language, invert_wheel_zoom
+    global stl_merge_tol
+    global language, invert_wheel_zoom, recent_files
     language = snap.get("language", language)
     max_field_pixels_side = snap.get("max_field_pixels_side", max_field_pixels_side)
     undo_memory_budget_mb = snap.get("undo_memory_budget_mb", undo_memory_budget_mb)
     gpu_accelerated = snap.get("gpu_accelerated", gpu_accelerated)
+    env_map_path = str(snap.get("env_map_path", env_map_path) or "")
+    try:
+        env_intensity = float(snap.get("env_intensity", env_intensity))
+    except Exception:
+        pass
     mesh_max_dim_gpu = snap.get("mesh_max_dim_gpu", mesh_max_dim_gpu)
     mesh_max_dim_cpu = snap.get("mesh_max_dim_cpu", mesh_max_dim_cpu)
     preview_max_dim = snap.get("preview_max_dim", preview_max_dim)
@@ -222,6 +296,13 @@ def perf_restore(snap: dict) -> None:
     autosave_enabled = bool(snap.get("autosave_enabled", autosave_enabled))
     autosave_interval_min = int(snap.get("autosave_interval_min", autosave_interval_min))
     backup_on_save = bool(snap.get("backup_on_save", backup_on_save))
+    try:
+        stl_merge_tol = float(snap.get("stl_merge_tol", stl_merge_tol))
+    except Exception:
+        pass
+    rf = snap.get("recent_files")
+    if isinstance(rf, list):
+        recent_files = [str(x) for x in rf if isinstance(x, str)]
     invert_wheel_zoom = bool(snap.get("invert_wheel_zoom", invert_wheel_zoom))
     ps = snap.get("plugin_state")
     if isinstance(ps, dict):
@@ -267,10 +348,13 @@ _SETTINGS_VERSION = 2      # 设置文件版本（用于一次性默认值迁移
 _PERF_KEYS = (
     "language",
     "max_field_pixels_side", "undo_memory_budget_mb", "gpu_accelerated",
+    "env_map_path", "env_intensity",
     "mesh_max_dim_gpu", "mesh_max_dim_cpu", "preview_max_dim",
     "msaa_samples", "async_compute",
     "autosave_enabled", "autosave_interval_min", "backup_on_save",
+    "stl_merge_tol",
     "invert_wheel_zoom",
+    "recent_files",
     "plugin_state",
 )
 

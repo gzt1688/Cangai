@@ -480,3 +480,23 @@ class CangaiAPI:
                 base, "Cangai", "plugin_settings", (safe or "plugin") + ".json"))
             self._settingsCache[pluginId] = st
         return st
+
+
+# ---------------- 全局单例（AI/MCP 等非插件调用方取门面的唯一入口） ----------------
+
+_instance: Optional["CangaiAPI"] = None
+
+
+def setApiInstance(api: "CangaiAPI") -> None:
+    """宿主创建门随后注册全局实例。"""
+    global _instance
+    _instance = api
+
+
+def getApiInstance() -> "CangaiAPI":
+    """取当前应用门面；未创建时返回独立无头门面（仅 core 操作）。"""
+    global _instance
+    if _instance is None:
+        _instance = CangaiAPI()
+    return _instance
+

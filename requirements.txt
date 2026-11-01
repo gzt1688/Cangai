@@ -27,3 +27,17 @@ vtracer==1.0.0a4
 shapely>=2.0
 pyclipper>=1.3
 pydantic>=2.0
+
+# 图片转线稿插件 ai_lineart（plugins_private/ai_lineart，不随主程序打包）
+# opencv：栅格处理（骨架化/连通域/轮廓）；onnxruntime：MTEED/A2S 推理
+# vtracer：描摹方式（主程序不再引用，仅在插件里用）；权重与代码都在插件目录内
+# 注意：主程序其余模块（浮雕/图片转模型）同样依赖 opencv，不能卸
+opencv-python-headless>=4.9
+onnxruntime>=1.17
+scipy>=1.10              # 断头桥接的 KD 树（scipy 已在上面依赖链中）
+# 可选：语义分区（SAM）用；装了才会出「部件闭合轮廓」层，不装自动降级为纯线稿
+#   torch torchvision（CUDA 版：--index-url https://download.pytorch.org/whl/cu126）
+#   controlnet_aux==0.0.10（需 --no-deps 安装，否则会替换成 CPU 版 torch）
+#   timm scikit-image einops huggingface_hub pyyaml safetensors imageio lazy-loader
+# 权重：插件目录 models/mobile_sam/mobile_sam.pt（38.8MB），与插件一起搬运
+# 仅导出 ONNX 时需要（运行不需要）：onnx

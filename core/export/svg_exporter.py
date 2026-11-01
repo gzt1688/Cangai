@@ -130,10 +130,13 @@ def _objColor(doc, obj) -> tuple:
     return (0, 0, 0)
 
 
-def exportSVG(doc, path: str) -> int:
-    """把文档中全部曲线对象导出为 SVG；返回写出路径数。"""
+def exportSVG(doc, path: str, objects=None) -> int:
+    """把曲线对象导出为 SVG；返回写出路径数。
+
+    ``objects`` 不为 ``None`` 时只导出给定对象（UI 选中导出）；为 ``None`` 时导出
+    文档中全部曲线对象。"""
     entries = []   # (pts, closed, color)
-    for obj in doc.allObjects():
+    for obj in (objects if objects is not None else doc.allObjects()):
         t = obj.type()
         if t not in _EXPORTABLE:
             continue

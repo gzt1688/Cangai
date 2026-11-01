@@ -24,6 +24,7 @@ class CommandInstance(ABC):
         self._doc = None
         self._view = None
         self._previewItem: Optional[QGraphicsPathItem] = None
+        self._auxPreviewItem: Optional[QGraphicsPathItem] = None
         self._markerItem: Optional[QGraphicsEllipseItem] = None
         self._previewImages: List = []   # 图片预览项（ImageGraphicsItem），用于移动/旋转/缩放时图片预览出自己
 
@@ -61,6 +62,13 @@ class CommandInstance(ABC):
         self._previewItem.setPen(pen)
         self._previewItem.setBrush(Qt.BrushStyle.NoBrush)   # 预览永不填充
         self._previewItem.setZValue(9999)
+        # 辅助预览：虚线（角度弧的延长线等），与主预览各用一支画笔
+        self._auxPreviewItem = QGraphicsPathItem()
+        apen = QPen(QColor("#15b6c9"), 1, Qt.DashLine)
+        apen.setCosmetic(True)
+        self._auxPreviewItem.setPen(apen)
+        self._auxPreviewItem.setBrush(Qt.BrushStyle.NoBrush)
+        self._auxPreviewItem.setZValue(9998)
         # 光标点：独立图元（白底实心圆），避免给整个预览路径上白笔刷
         self._markerItem = QGraphicsEllipseItem()
         mpen = QPen(QColor("#15b6c9"), 1.5)
@@ -71,6 +79,7 @@ class CommandInstance(ABC):
         self._markerItem.hide()
         if self._view is not None:
             self._view.scene().addItem(self._previewItem)
+            self._view.scene().addItem(self._auxPreviewItem)
             self._view.scene().addItem(self._markerItem)
 
     def _setPreviewPath(self, path, solid: bool = False, color=None) -> None:
@@ -80,6 +89,8 @@ class CommandInstance(ABC):
         避免点击落点时变色闪烁（不传保持默认青色）。"""
         if self._previewItem is None:
             return
+        if path.isEmpty():
+            self._setAuxPreviewPath(QPainterPath())
         self._previewItem.setPath(path)
         pen = self._previewItem.pen()
         if color is not None:
@@ -91,6 +102,18 @@ class CommandInstance(ABC):
             pen.setStyle(Qt.PenStyle.DashLine)
             pen.setWidthF(1.0)
         self._previewItem.setPen(pen)
+
+    def _setAuxPreviewPath(self, path) -> None:
+        """设置辅助预览路径（虚线，颜色跟随主预览）：用于角度弧的延长线等。"""
+        if self._auxPreviewItem is None:
+            return
+        self._auxPreviewItem.setPath(path)
+        pen = QPen(self._previewItem.pen()) if self._previewItem is not None \
+            else QPen(QColor("#15b6c9"), 1.0)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setWidthF(1.0)
+        pen.setCosmetic(True)
+        self._auxPreviewItem.setPen(pen)
 
     def _setPreviewImages(self, imageObjects: list) -> None:
         """设置图片预览项：传入一组经过变换后的 ImageObject（建议是 clone），
@@ -156,6 +179,8 @@ class CommandInstance(ABC):
             sc = self._view.scene()
             if self._previewItem is not None:
                 sc.removeItem(self._previewItem)
+            if self._auxPreviewItem is not None:
+                sc.removeItem(self._auxPreviewItem)
             if self._markerItem is not None:
                 sc.removeItem(self._markerItem)
             for it in self._previewImages:
@@ -164,6 +189,7 @@ class CommandInstance(ABC):
                 except Exception:
                     pass
         self._previewItem = None
+        self._auxPreviewItem = None
         self._markerItem = None
         self._previewImages.clear()
 
@@ -179,6 +205,19 @@ class CommandInstance(ABC):
         if self._previewItem is None:
             return None
         return self._previewItem.pen()
+
+    def auxPreviewPath(self):
+        """辅助预览路径（虚线，如角度弧的延长线）；无则返回 None。"""
+        if self._auxPreviewItem is None:
+            return None
+        path = self._auxPreviewItem.path()
+        return None if path.isEmpty() else path
+
+    def auxPreviewPen(self):
+        """辅助预览画笔（虚线），供 3D/浮雕视口叠加绘制。"""
+        if self._auxPreviewItem is None:
+            return None
+        return self._auxPreviewItem.pen()
 
     def needsCursorMarker(self) -> bool:
         """命令是否需要 3D 视口在光标处绘制预览点（白底实心圆）。

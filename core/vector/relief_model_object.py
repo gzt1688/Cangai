@@ -19,6 +19,7 @@ import numpy as np
 from .base_object import BaseObject
 from .geometry_types import Point3D, BoundingBox3D, ObjectType
 from core.relief.height_field import HeightField
+from core.relief import material_params as matlib
 
 # 2D 预览显示模式（默认"等高线"）
 DISPLAY_MODES = ("gray", "contour")
@@ -56,6 +57,7 @@ class ReliefModelObject(BaseObject):
         self._hf = hf
         self._place = np.eye(3, dtype=np.float64)   # local->world 仿射；单位阵=已对齐
         self._version = 0                            # 网格/参数变更计数（预览缓存键）
+        self._bboxCache = None                       # (键, BoundingBox3D)：见 getBoundingBox
         # 显示参数（按模型存储、可序列化；对齐 ArtCAM 的按模型"浮雕光线"）
         self._displayMode = "contour"
         self._lightAzimuth = 315.0
@@ -71,6 +73,13 @@ class ReliefModelObject(BaseObject):
         #   仍可在右侧变换面板第三颗按钮手动切"渲染"。
         self._display3DMode = "map"
         self._material = "clay"
+        # 渲染材质参数（Blender 原理化 BSDF 风格，扁平 dict）：与 _material 联动，
+        # 切换材质预设时重置为该预设默认值，用户可在材质面板逐项微调。
+        self._matParams = matlib.default_params(self._material)
+        # 渲染质量档位："basic"=粗糙（实时快）/ "fine"=精致（照片级 IBL+GGX+ACES）。
+        self._matQuality = "fine"
+        # 材质参数版本号：仅参数/材质切换时递增（几何不变），供 GL 底色缓存失效。
+        self._matStamp = 0
         # 与 theme 主色一致的默认轮廓色
         self._color = (21, 182, 201)
         # LOD 金字塔缓存：按 (母场 stamp, 长边上限) 记忆化降采样副本。
@@ -162,6 +171,11 @@ class ReliefModelObject(BaseObject):
     def placement(self) -> np.ndarray:
         return self._place
 
+    def setPlacement(self, pl) -> None:
+        """直接设置 local→world 仿射（撤销恢复“移动网格”这类纯变换操作用）。"""
+        self._place = (np.array(pl, dtype=np.float64) if pl is not None
+                       else np.eye(3, dtype=np.float64))
+
     def version(self) -> int:
         return self._version
 
@@ -221,10 +235,49 @@ class ReliefModelObject(BaseObject):
     def material(self) -> str:
         return self._material
 
+    def matStamp(self) -> int:
+        """材质参数版本号（供显示缓存失效：参数变、几何未变也能重算底色）。"""
+        return self._matStamp
+
     def setMaterial(self, m: str) -> None:
         if m in MATERIALS and m != self._material:
             self._material = m
+            self._matParams = matlib.default_params(m)   # 新材质→重置为物理预设
+            self._matStamp += 1
             self.bumpVersion()
+
+    def materialParams(self) -> dict:
+        """当前材质的渲染参数字典（实时引用；调用方只读，修改走 setter）。"""
+        return self._matParams
+
+    def materialQuality(self) -> str:
+        """渲染质量档："basic"=粗糙（快）/ "fine"=精致（照片级）。"""
+        return self._matQuality
+
+    def setMaterialQuality(self, q: str) -> bool:
+        if q not in ("basic", "fine") or q == self._matQuality:
+            return False
+        self._matQuality = q
+        self._matStamp += 1
+        self.bumpVersion()
+        return True
+
+    def setMaterialParam(self, key: str, value) -> bool:
+        """设置单个材质参数；实际变化返回 True（供面板判断是否需重渲染）。"""
+        cur = self._matParams.get(key)
+        same = (list(cur) == list(value)) if isinstance(value, (list, tuple)) \
+            else (cur == value)
+        if same:
+            return False
+        self._matParams[key] = list(value) if isinstance(value, (list, tuple)) else value
+        self._matStamp += 1
+        self.bumpVersion()
+        return True
+
+    def setMaterialParams(self, d: dict) -> None:
+        self._matParams = matlib.normalize_params(d)
+        self._matStamp += 1
+        self.bumpVersion()
 
     # ---------------- 色号蒙版层（区域划分：填色 / 作用区域裁剪 / 颜色块渲染） ----------------
 
@@ -463,6 +516,17 @@ class ReliefModelObject(BaseObject):
     # ---------------- 几何查询 ----------------
 
     def getBoundingBox(self) -> BoundingBox3D:
+        """包围盒（按 版本 + 高度场版本 + 放置仿射 缓存）。
+
+        高度场的 min/max 是整场扫描（4096² 单趟十几毫秒），而视口每帧、
+        变换面板/操作轴每次对象变化都要问一遍——浮雕笔刷（磨光/堆料）期
+        这笔开销按 30 次/秒叠在鼠标事件链上。任一高度/显示变化都会推进
+        version，整场换数据会推进 heightField().stamp，因此缓存不会给旧值。
+        """
+        key = (self._version, self._hf.stamp, self._place.tobytes())
+        got = self._bboxCache
+        if got is not None and got[0] == key:
+            return got[1]
         x0, y0, x1, y1 = self._hf.bbox()
         M = self._place
         z_max = float(self._hf.data.max()) if self._hf.data.size else 0.0
@@ -476,6 +540,7 @@ class ReliefModelObject(BaseObject):
             wy = M[1, 0] * cx + M[1, 1] * cy + M[1, 2]
             bb.expand(Point3D(wx, wy, z_min))
             bb.expand(Point3D(wx, wy, z_max))
+        self._bboxCache = (key, bb)
         return bb
 
     def getPosition(self) -> Point3D:
@@ -501,6 +566,9 @@ class ReliefModelObject(BaseObject):
         o._gridDivisions = self._gridDivisions
         o._display3DMode = self._display3DMode
         o._material = self._material
+        o._matParams = matlib.normalize_params(self._matParams)
+        o._matQuality = self._matQuality
+        o._matStamp = self._matStamp
         o._color = self._color
         o._lineWidth = self._lineWidth
         o._colorMask = None if self._colorMask is None else self._colorMask.copy()
@@ -523,7 +591,9 @@ class ReliefModelObject(BaseObject):
         d["display"] = {"mode": self._displayMode, "azimuth": self._lightAzimuth,
                         "altitude": self._lightAltitude, "zexag": self._zExaggeration,
                         "gridDivisions": self._gridDivisions,
-                        "mode3d": self._display3DMode, "material": self._material}
+                        "mode3d": self._display3DMode, "material": self._material,
+                        "quality": self._matQuality,
+                        "mat_params": matlib.normalize_params(self._matParams)}
         return d
 
     def serialize(self) -> dict:
@@ -625,6 +695,19 @@ class ReliefModelObject(BaseObject):
                     self._place,
                     np.asarray(snap.get("place"), dtype=np.float64)))
 
+    def matchesContent(self, snap: dict) -> bool:
+        """O(1) 内容签名比较（**不含放置阵**）。
+
+        用于区分“只移动/变换了网格”和“改了高度场内容”：前者可归入 2D 的
+        基础操作历史，后者只进浮雕历史（2D 模式不撤高度场操作）。
+        """
+        if "hfStamp" not in snap:
+            return False          # 旧格式快照按内容变更处理
+        return (self._hf.stamp == snap.get("hfStamp")
+                and self._version == snap.get("version")
+                and self._maskStamp == snap.get("maskStamp")
+                and self._curtainStamp == snap.get("curtainStamp", 0))
+
     def snapshotSize(self, snap: dict) -> int:
         cur = len(snap.get("curtains_raw", b""))
         return int(self._hf.data.nbytes) + \
@@ -656,6 +739,10 @@ class ReliefModelObject(BaseObject):
         self._material = disp.get("material", self._material)
         if self._material not in MATERIALS:
             self._material = "clay"
+        _q = disp.get("quality", self._matQuality)
+        self._matQuality = _q if _q in ("basic", "fine") else "fine"
+        self._matParams = matlib.normalize_params(disp.get("mat_params"))
+        self._matStamp += 1
         return (float(o[0]), float(o[1])), sp, nx, ny
 
     def _finishRestore(self) -> None:

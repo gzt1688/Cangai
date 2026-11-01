@@ -18,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import shade
+from . import material_params as matlib
 
 # 3D 显示曲面每边最大网格数：降采样上限，面数≈N²，交互帧率优先于精度
 DEFAULT_MAX_DIM = 64
@@ -31,6 +32,34 @@ _AMBIENT_MAP = 0.70      # 地图/高度色模式：光照更平，保色带鲜�
 _HEAD = 0.90
 _FLOOR = 0.50
 
+# 材质(PBR)专用“摄影棚环境”（GPU gl_surface.FRAG mode==8 与此严格一致）。
+# 真实感来自：按反射向量采样一个程序化 HDRI 风格环境（渐变天空/地面 +
+# 几盏 HDR 柔光箱）作为金属/光泽的镜面反射 + GGX 直接高光 + ACES 色调映射。
+_PI = 3.141592653589793
+_ENV_ZENITH = (0.36, 0.40, 0.48)    # 天顶（淡冷）
+_ENV_HORIZON = (0.60, 0.60, 0.62)   # 地平线（亮中性）
+_ENV_GROUND = (0.10, 0.09, 0.08)    # 地面（暗暖）
+# 柔光箱：(方向(未归一), HDR 颜色(可>1), sigma 角半径)。多盏不同方位/色温
+# 的亮面，被光滑表面反射时产生标志性的亮带——“像渲染”而非“填色”的关键。
+# 含一颚极小极亮的“太阳”高光点（sigma小）→金属上锐利镜面反光。
+_ENV_BOXES = [
+    ((0.45, 0.30, 0.84), (3.00, 2.95, 2.85), 0.28),   # 主灯：上前方大软箱
+    ((0.50, -0.35, 0.72), (7.00, 6.80, 6.30), 0.07),  # 小太阳：锐利高光点
+    ((-0.72, 0.20, 0.62), (0.45, 0.65, 1.05), 0.55),  # 冷侧光：左上方
+    ((0.10, -0.85, 0.40), (1.30, 1.00, 0.68), 0.45),  # 暖轮廓光：后下方
+]
+_KEY_COLOR = (1.00, 0.98, 0.95)   # 直接主光色（中性略暖，由 az/alt 滑块定方向）
+_KEY_INTENSITY = 1.70              # 直接主光强度（提高明暗对比）
+_AMB_DIFF = 0.20                   # 漫反射环境光系数（降低→不洗白、更有方向感）
+_IBL_GAIN = 1.35                   # 环境镜面反射增益（金属更镜）
+# 环境光遮蔽(AO)：由高度场“腔体”(局部平均高-本点高)烘焙，凹陷处变暗→浮雕立体感。
+_AO_MIN = 0.30                     # AO 下限（最深阴影保留亮度）
+_AO_RADII = ((3, 0.55), (8, 0.30), (16, 0.18))   # (盒模糊半径, 权重) 多尺度腔体
+# 反照率纹理：CPU 逐顶点采样易撞频(moiré)，故反照率用低频大尺度图案
+# (`_matAlbedoV`)，高频细节交给 GPU 逐像素 bump(`_matHeightV`)。
+_TEX_ALBEDO_GAIN = 0.5           # 反照率纹理对比缩放
+_EXPOSURE = 1.05                   # 曝光（色调映射前）
+
 
 def _cliffGradientNormals(data: np.ndarray, r_f, c_f):
     """模糊高度场的水平梯度（悬崖面平滑朝向用）。
@@ -39,7 +68,7 @@ def _cliffGradientNormals(data: np.ndarray, r_f, c_f):
     (gx, gy)——两次 5 格盒模糊 ≈ 高斯 σ≈2 格，栅格悬崖的楼梯锯齿在
     模糊场里被抹平，梯度方向即平滑等高线的径向。
     """
-    b = data.astype(np.float64)
+    b = np.asarray(data, dtype=np.float32)
     for _ in range(2):
         c0 = np.cumsum(np.pad(b, ((2, 2), (0, 0)), mode="edge"), axis=0)
         b = (c0[4:, :] - c0[:-4, :]) / 5.0
@@ -56,11 +85,11 @@ def _cliffGradientNormals(data: np.ndarray, r_f, c_f):
 class ReliefMesh:
     """一张已构建的 3D 四边形面网格（世界坐标）。
 
-    verts   : (V,3) float64 世界顶点 (x, y, z)
+    verts   : (V,3) float32 世界顶点 (x, y, z)
     faces   : (F,4) int32   每个面的顶点索引（绕序使法线朝 +Z）
-    normals : (F,3) float64 单位面法线（已翻正，z ≥ 0）
-    centers : (F,3) float64 面中心（世界）
-    hnorm   : (F,)  float64 面高度归一化 [0,1]（按整场 z 的 min/max）
+    normals : (F,3) float32 单位面法线（已翻正，z ≥ 0）
+    centers : (F,3) float32 面中心（世界）
+    hnorm   : (F,)  float32 面高度归一化 [0,1]（按整场 z 的 min/max）
     gnx,gny : int   降采样后网格每边顶点数（供取边界/角点）
     wall_n  : (V,2) float64 或 None——幕帘投影顶点的水平外法向（world，
               未投影顶点为 0），供竖直壁 quad 法线定向与 ROI 增量重算复用
@@ -232,7 +261,11 @@ def buildMesh(hf, placement=None, zexag: float = 1.0,
     退化（覆盖尺寸为 0 或不足 2x2）返回 None。
     """
     small = hf.downsample(int(max_dim))
-    data = np.asarray(small.data, dtype=np.float64)
+    # 顶点/法线/中心全程 float32：GL 上传本来就是 f4（原先 here 造 float64
+    # 再整份 astype 成 f4 是白烧一倍内存），2048² 全量重建的峰值 RSS 从
+    # ~1580MB 降到 ~400MB、耗时从 ~1.05s 降到 ~0.3s。世界坐标 mm 量级下
+    # f4 量化误差 < 1e-4 mm，远小于浮雕显示与拾取精度。
+    data = np.ascontiguousarray(small.data, dtype=np.float32)
     ny, nx = data.shape
     if nx < 2 or ny < 2:
         return None
@@ -240,44 +273,73 @@ def buildMesh(hf, placement=None, zexag: float = 1.0,
     sp = float(small.spacing)
     lx = x0 + np.arange(nx, dtype=np.float64) * sp
     ly = y0 + np.arange(ny, dtype=np.float64) * sp
-    LX, LY = np.meshgrid(lx, ly)                     # (ny, nx)
-    Z = data * float(zexag)
+    M = np.eye(3, dtype=np.float64) if placement is None \
+        else np.asarray(placement, dtype=np.float64)
+    # 无幕帘时世界 XY 用一维行/列广播直接得到 (ny,nx)，省掉两份 meshgrid 坐标表
+    WX = (M[0, 0] * lx)[None, :] + (M[0, 1] * ly)[:, None] + M[0, 2]
+    WY = (M[1, 0] * lx)[None, :] + (M[1, 1] * ly)[:, None] + M[1, 2]
 
     # 消除锯齿幕帘：带内顶点 XY 投影到曲线（local 空间，M 变换之前）
     wall_n = None
     wall_w = None
     if curtains:
         from .wall_curtain import project_vertices_to_curtains
+        LX, LY = np.meshgrid(lx, ly)
         xy = np.stack([LX.ravel(), LY.ravel()], axis=1)
         xy2, _moved, wall_n = project_vertices_to_curtains(xy, curtains, sp)
+        del xy
+        # 投影后顶点 XY 不再可分，只能整表变换
         LX = xy2[:, 0].reshape(ny, nx)
         LY = xy2[:, 1].reshape(ny, nx)
+        WX = M[0, 0] * LX + M[0, 1] * LY + M[0, 2]
+        WY = M[1, 0] * LX + M[1, 1] * LY + M[1, 2]
+        del LX, LY
 
-    M = np.eye(3, dtype=np.float64) if placement is None \
-        else np.asarray(placement, dtype=np.float64)
-    WX = M[0, 0] * LX + M[0, 1] * LY + M[0, 2]
-    WY = M[1, 0] * LX + M[1, 1] * LY + M[1, 2]
-    verts = np.stack([WX.ravel(), WY.ravel(), Z.ravel()], axis=1)   # (V,3)
+    Z = data * np.float32(zexag)
+    verts = np.empty((ny * nx, 3), dtype=np.float32)
+    verts[:, 0] = WX.ravel()
+    verts[:, 1] = WY.ravel()
+    verts[:, 2] = Z.ravel()
+    del WX, WY, Z
 
     # 四边形面索引（行优先 idx = r*nx + c），绕序 v00->v01->v11->v10（法线 +Z）
-    rr, cc = np.meshgrid(np.arange(ny - 1), np.arange(nx - 1), indexing="ij")
-    v00 = (rr * nx + cc).ravel()
-    v01 = v00 + 1
-    v10 = v00 + nx
-    v11 = v10 + 1
-    faces = np.stack([v00, v01, v11, v10], axis=1).astype(np.int32)
+    nqy, nqx = ny - 1, nx - 1
+    _v00 = (np.arange(nqy, dtype=np.int32)[:, None] * np.int32(nx)
+            + np.arange(nqx, dtype=np.int32)[None, :]).ravel()
+    faces = np.empty((_v00.size, 4), dtype=np.int32)
+    faces[:, 0] = _v00
+    faces[:, 1] = _v00
+    faces[:, 1] += 1
+    faces[:, 2] = _v00
+    faces[:, 2] += nx + 1
+    faces[:, 3] = _v00
+    faces[:, 3] += nx
+    del _v00
 
-    p00, p01, p11, p10 = verts[v00], verts[v01], verts[v11], verts[v10]
-    centers = (p00 + p01 + p11 + p10) * 0.25
+    # 面中心/法线直接由网格切片算：旧实现用 4 个 (F,3) 花式索引 gather
+    # （2048² 即 4×100MB 复制），是重建时间的大头。
+    A = verts.reshape(ny, nx, 3)
     # 对角线叉积 = 面积加权法线（鞍形面更稳）；翻正使 z ≥ 0（单值曲面法线朝上）
-    n = np.cross(p11 - p00, p10 - p01)
+    d1 = A[1:, 1:] - A[:-1, :-1]                 # p11 - p00
+    d2 = A[1:, :-1] - A[:-1, 1:]                 # p10 - p01
+    n = np.cross(d1, d2)
+    del d1, d2
+    n = n.reshape(-1, 3)
+    # 四个角点求和后 /4（原地累加，避免 4 份大临时数组）
+    cc = A[:-1, :-1] + A[1:, 1:]
+    cc += A[1:, :-1]
+    cc += A[:-1, 1:]
+    cc *= np.float32(0.25)
+    centers = cc.reshape(-1, 3)
+    del cc
     # 幕帘竖直条/扇面可能产生零面积退化叉积（顶点重合）→ 兜底 +Z，避免归一化 NaN
-    ln = np.linalg.norm(n, axis=1)
+    ln = np.sqrt(np.einsum("ij,ij->i", n, n))
     bad = ln < 1e-12
     if bad.any():
-        n[bad] = np.array([0.0, 0.0, 1.0])
+        n[bad] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         ln[bad] = 1.0
     normals = n / ln[:, None]
+    del n, ln
     normals[normals[:, 2] < 0.0] *= -1.0
     # 无幕帘的陡壁 quad（|n_z|≈0 的悬崖面：STL 圆柱侧壁、台阶底座等）：
     # 对角叉积只剩水平分量，上面的 z≥0 翻正无法定水平朝向 → 相邻壁列
@@ -328,7 +390,8 @@ def buildMesh(hf, placement=None, zexag: float = 1.0,
         wnx = M[0, 0] * wall_n[:, 0] + M[0, 1] * wall_n[:, 1]
         wny = M[1, 0] * wall_n[:, 0] + M[1, 1] * wall_n[:, 1]
         wall_w = np.stack([wnx, wny], axis=1)
-        fn = (wall_w[v00] + wall_w[v01] + wall_w[v11] + wall_w[v10]) * 0.25
+        fn = (wall_w[faces[:, 0]] + wall_w[faces[:, 1]]
+              + wall_w[faces[:, 2]] + wall_w[faces[:, 3]]) * 0.25
         fl = np.hypot(fn[:, 0], fn[:, 1])
         vmask = (fl > 0.3) & (np.abs(normals[:, 2]) < 0.7)
         if vmask.any():
@@ -344,7 +407,8 @@ def buildMesh(hf, placement=None, zexag: float = 1.0,
 
     hz = centers[:, 2]
     lo, hi = float(hz.min()), float(hz.max())
-    hnorm = np.full(hz.shape, 0.5) if hi - lo < 1e-9 else (hz - lo) / (hi - lo)
+    hnorm = (np.full(hz.shape, np.float32(0.5), dtype=np.float32)
+             if hi - lo < 1e-9 else (hz - lo) / (hi - lo))
 
     # 硬边复制：壁面与台面扇面共享的环上顶点复制一份（XYZ 相同，仅分裂
     # 法线/颜色）——壁面改引副本（散射后得水平法线），台面扇面保留原顶点
@@ -376,49 +440,211 @@ def buildMesh(hf, placement=None, zexag: float = 1.0,
                       wall_dup=wall_dup)
 
 
-def _materialBase(mesh: ReliefMesh, material: str, base_color) -> np.ndarray:
-    """材质程序化底色 (F,3) float64（未打光）。木纹/石材按世界坐标稳定生成。"""
+def _matParams(material: str, mat_params: dict | None) -> dict:
+    """取材质参数：优先用户参数，缺省回落到该材质的物理预设（与 GPU 分支一致）。"""
+    if mat_params:
+        return matlib.normalize_params(mat_params)
+    return matlib.default_params(material)
+
+
+def _vhash2(ix, iy):
+    """确定性格点哈希 → [0,1)（numpy 值噪声用）。"""
+    n = ix * 127.1 + iy * 311.7
+    return np.mod(np.sin(n) * 43758.5453123, 1.0)
+
+
+def _noise2(x, y):
+    """双线性平滑值噪声 → [0,1)。"""
+    ix = np.floor(x); iy = np.floor(y)
+    fx = x - ix; fy = y - iy
+    ux = fx * fx * (3.0 - 2.0 * fx)
+    uy = fy * fy * (3.0 - 2.0 * fy)
+    a = _vhash2(ix, iy); b = _vhash2(ix + 1.0, iy)
+    c = _vhash2(ix, iy + 1.0); d = _vhash2(ix + 1.0, iy + 1.0)
+    return (a * (1 - ux) + b * ux) * (1 - uy) + (c * (1 - ux) + d * ux) * uy
+
+
+def _fbm2(x, y, octaves: int = 4):
+    """分形布朗运动（多倍频值噪声叠加）→ 大致 [0,1]，有机、不重复。"""
+    x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
+    tot = np.zeros_like(x); amp = 0.5; freq = 1.0; norm = 0.0
+    for _ in range(octaves):
+        tot = tot + amp * _noise2(x * freq, y * freq)
+        norm += amp; freq *= 2.0; amp *= 0.5
+    return tot / norm
+
+
+def _matAlbedoV(tid: int, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """反照率专用**低频有机**噪声纹理 h≈[-1,1]（值噪声 fBm，非规则正弦）。
+
+    仅用于 CPU 逐顶点反照率调制（低频→不撞频）；高频凹凸在 GPU 逐像素 bump。
+    用噪声取代纯正弦→消除“太规则/机械重复”的观感。
+    """
+    if tid == 1:      # wood：不规则年轮（半径被噪声扰动）
+        return np.clip(np.sin(u * 2.2 + 2.2 * _fbm2(u * 0.5, v * 0.5, 3)), -1.0, 1.0)
+    if tid == 2:      # plastic：极淡橘皮
+        return (_fbm2(u * 1.6, v * 1.6, 3) - 0.5) * 0.8
+    if tid == 3:      # stone：多倍频岩石斑块
+        return (_fbm2(u * 1.1, v * 1.1, 5) - 0.5) * 2.0
+    if tid == 4:      # metal：拉丝（沿 u 拉长→各向异性）
+        return (_fbm2(u * 0.5, v * 3.0, 4) - 0.5) * 1.2
+    # clay(0)：柔和有机斑驳
+    return (_fbm2(u * 1.2, v * 1.2, 4) - 0.5) * 1.6
+
+
+def _boxblur(a: np.ndarray, r: int) -> np.ndarray:
+    """可分离盒模糊（边缘延拓），用于多尺度腔体 AO。返回同形状。"""
+    if r < 1:
+        return a.copy()
+    k = 2 * r + 1
+    ap = np.pad(a, r, mode="edge")
+    cs = np.cumsum(ap, axis=1, dtype=np.float64)
+    cs = np.insert(cs, 0, 0.0, axis=1)                 # 前缀和补零→窗口数=原长
+    row = (cs[:, k:] - cs[:, :-k]) / k
+    cs2 = np.cumsum(row, axis=0, dtype=np.float64)
+    cs2 = np.insert(cs2, 0, 0.0, axis=0)
+    return (cs2[k:, :] - cs2[:-k, :]) / k
+
+
+def _faceAO(mesh: ReliefMesh) -> np.ndarray:
+    """逐面环境光遮蔽 (F,) float [~_AO_MIN..1]：高度场“腔体”多尺度烘焙。
+
+    以局部平均高与本身高之差(凹陷为正)估计遮蔽，多个模糊半径加权；
+    按全场高度范围归一→与尺寸/zexag 无关。非纯网格(面数≠(gny-1)*(gnx-1))时返回 1。
+    """
+    gny, gnx = mesh.gny, mesh.gnx
+    F = mesh.centers.shape[0]
+    if (gny - 1) * (gnx - 1) != F:
+        return np.ones(F)
+    H = mesh.centers[:, 2].reshape(gny - 1, gnx - 1)
+    rng = (H.max() - H.min()) + 1e-6
+    occ = np.zeros_like(H)
+    for rad, wt in _AO_RADII:
+        cav = np.clip(_boxblur(H, rad) - H, 0.0, None)
+        occ += wt * np.clip(cav / rng * 2.2, 0.0, 1.0)
+    return np.clip(1.0 - occ, _AO_MIN, 1.0).reshape(-1)
+
+
+def _materialBase(mesh: ReliefMesh, material: str, base_color,
+                  mat_params: dict | None = None) -> np.ndarray:
+    """材质反照率 (F,3) float64 [0,255]（未打光）：基础色 × 低通纹理 × AO。
+
+    反照率纹理用大尺度/低对比（避免逐顶点撞频 moiré），高频细节交给 GPU 逐像素 bump；
+    同时乘上由高度场烘焙的环境光遮蔽 AO（凹陷变暗）→浮雕立体感。
+    """
+    P = _matParams(material, mat_params)
+    bc = np.asarray(P["base_color"], dtype=np.float64) * 255.0
     c = mesh.centers
-    if material == "wood":
-        wx, wy = c[:, 0], c[:, 1]
-        # 沿 X 的年轮条纹 + 随 Y 轻微扭曲（0..1）
-        g = 0.5 + 0.5 * np.sin((wx * 0.9 + 2.0 * np.sin(wy * 0.12)) * 0.6)
-        dark = np.array((94.0, 58.0, 30.0))
-        light = np.array((178.0, 128.0, 79.0))
-        return dark[None, :] * (1.0 - g[:, None]) + light[None, :] * g[:, None]
-    if material == "stone":
-        wx, wy = c[:, 0], c[:, 1]
-        speck = 0.5 + 0.5 * np.sin(wx * 3.1) * np.sin(wy * 2.7)
-        return np.array((150.0, 148.0, 142.0)) * (0.86 + 0.28 * speck)[:, None]
-    if material == "metal":
-        return np.tile(np.array((176.0, 182.0, 190.0)), (c.shape[0], 1))
-    if material == "plastic":
-        rgb = np.array(base_color if base_color else (230.0, 230.0, 235.0),
-                       dtype=np.float64)
-        return np.tile(rgb, (c.shape[0], 1))
-    # clay（默认陶土/蜡）：使用模型底色（精雕黄面效果）；缺省暖灰哑光
-    rgb = np.array(base_color if (base_color and len(base_color) == 3)
-                   else (198.0, 187.0, 172.0), dtype=np.float64)
-    return np.tile(rgb, (c.shape[0], 1))
+    mod = _faceAO(mesh)                        # (F,) AO
+    scale = max(float(P.get("tex_scale", 6.0)), 0.5)
+    amount = float(P.get("tex_amount", 0.0))
+    if float(P.get("tex_on", 1.0)) <= 0.5:     # 纹理开关（勾选）：关→仅 AO、无纹理
+        amount = 0.0
+    if amount > 0.0:
+        h = _matAlbedoV(matlib.TEXTURE_ID.get(material, 0), c[:, 0] / scale, c[:, 1] / scale)
+        mod = mod * np.clip(1.0 + amount * _TEX_ALBEDO_GAIN * h, 0.0, 2.0)
+    return bc[None, :] * mod[:, None]
 
 
-def _materialShading(material: str, diff, spec_ang, normals):
-    """材质的高光强度/指数与漫反射权重（返回 kd, specGain, specPow, addAmbient）。"""
-    if material == "plastic":
-        return 0.58, 150.0, 60.0, 0.42     # 强锐镜面高光、亮底
-    if material == "metal":
-        return 0.45, 210.0, 80.0, 0.25     # 低漫反射、极锐高光 + 菲涅尔
-    if material == "wood":
-        return None, 26.0, 16.0, None      # 半光泽清漆（用 lit）
-    if material == "stone":
-        return None, 18.0, 20.0, None
-    return None, 70.0, 30.0, None          # clay：用 lit + 明显高光（反光实物感）
+def _envSample(d: np.ndarray) -> np.ndarray:
+    """程序化摄影棚环境 HDR 辐亮度：渐变天空/地面 + 多柔光箱。
+
+    d: (F,3) 单位方向。返回 (F,3) float HDR（可 >1）。与 GPU envSample 一致。
+    """
+    z = d[:, 2]
+    zen = np.asarray(_ENV_ZENITH); hor = np.asarray(_ENV_HORIZON); grd = np.asarray(_ENV_GROUND)
+    t = np.clip(z, 0.0, 1.0) ** 0.6          # 地平线→天顶
+    gt = np.clip(-z, 0.0, 1.0) ** 0.5        # 地平线→地面
+    base = hor[None, :] * (1.0 - t[:, None]) + zen * t[:, None]
+    base = base * (1.0 - gt[:, None]) + grd * gt[:, None]
+    # 柔光箱高斯瓣（以单位向量弦距近似角距：弦长²≈2(1-cosθ)）
+    for bdir, bcol, sig in _ENV_BOXES:
+        bn = np.asarray(bdir, dtype=np.float64)
+        bn = bn / np.linalg.norm(bn)
+        ang2 = np.clip(((d - bn) ** 2).sum(-1), 0.0, None)
+        w = np.exp(-ang2 / (2.0 * sig * sig))
+        base = base + np.asarray(bcol) * w[:, None]
+    return base
+
+
+def _acesFilmic(x: np.ndarray) -> np.ndarray:
+    """ACES 近似色调映射（HDR→LDR）：高光滚降、中等对比。逐通道。"""
+    a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
+    return np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
+
+
+def _pbrShade(P: dict, albedo: np.ndarray, N: np.ndarray, L: np.ndarray,
+              Vn: np.ndarray, spec_ang: np.ndarray, quality: str = "fine"):
+    """逐面 PBR 着色 → rgb float [0,1]（环境IBL + GGX + ACES）。
+
+    albedo (F,3) 反照率[0,1]；N/L/Vn 均为单位向量 (F,3)/(3,)；spec_ang=dot(N,H)。
+    金属/光泽按反射向量 R 采样摄影棚环境（亮带随曲面扫过→金属感）；GGX 微表面
+    直接高光使粗糙度改变高光形状而非明暗；ACES 色调映射避免高光削平。与 GPU 严格一致。
+    """
+    metallic = float(P["metallic"]); rough = min(max(float(P["roughness"]), 0.03), 1.0)
+    ior = float(P["ior"]); spec_level = float(P["spec_level"])
+    sss = float(P["sss_weight"]); trans = float(P["trans_weight"])
+    emis = np.asarray(P["emis_color"], dtype=np.float64) * min(float(P["emis_strength"]), 1.0)
+    key_c = np.asarray(_KEY_COLOR) * _KEY_INTENSITY
+
+    f0d = min((((ior - 1.0) / (ior + 1.0)) ** 2) * (spec_level * 2.0), 1.0)
+    F0 = f0d * (1.0 - metallic) + albedo * metallic               # (F,3)
+    diffAlb = albedo * (1.0 - metallic) * (1.0 - trans)           # 漫反射反照率
+
+    nv = np.clip(np.einsum("ij,ij->i", N, Vn), 1e-4, 1.0)         # N·V
+    nl = np.clip(N @ L, 0.0, 1.0)                                 # N·L
+    fr = F0 + (1.0 - F0) * ((1.0 - nv) ** 5)[:, None]             # Schlick 菲涅尔
+
+    if quality != "fine":
+        # 粗糙档：半球环境光 + Blinn 高光；无逐像素环境采样/无 GGX/无 ACES，更快。
+        hemi = 0.5 + 0.5 * N[:, 2]
+        zen = np.asarray(_ENV_ZENITH); grd = np.asarray(_ENV_GROUND)
+        ambient = (grd[None, :] * (1.0 - hemi[:, None]) + zen * hemi[:, None]) * 0.55
+        shin = min(max(2.0 / (rough * rough) - 2.0, 2.0), 1200.0)
+        keySpec = fr * (spec_ang ** shin)[:, None] * key_c[None, :] \
+            * (0.3 + 0.7 * (1.0 - rough)) * nl[:, None]
+        rgb = diffAlb * (key_c[None, :] * nl[:, None] + ambient) + keySpec + fr * ambient * 0.6
+        rgb = rgb + albedo * ambient * (sss * 0.4) + emis[None, :]
+        return np.clip(rgb, 0.0, 1.0)
+
+    # 环境：漫反射环境辐照度(取法线方向近似) + 镜面按反射向量采样(粗糙度模糊)
+    envN = _envSample(N)
+    R = 2.0 * nv[:, None] * N - Vn
+    R = R / np.maximum(np.linalg.norm(R, axis=1, keepdims=True), 1e-9)
+    envR = _envSample(R) * (1.0 - rough) + envN * rough           # 粗糙→向法线环境模糊
+
+    # 菲涅尔（Schlick）：环镜 IB 与 GGX 共用（basic 已提前返回，这里复用 fr）
+
+    # GGX 直接高光（主光）
+    a2 = (rough * rough) ** 2
+    NoH = np.clip(spec_ang, 0.0, 1.0)
+    den = NoH * NoH * (a2 - 1.0) + 1.0
+    D = a2 / (_PI * den * den + 1e-7)
+    k = (rough * rough) * 0.5
+    G = (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k))
+    Hn = _normalizeRows(L[None, :] + Vn)
+    VoH = np.clip(np.einsum("ij,ij->i", Vn, Hn), 0.0, 1.0)
+    Fdir = F0 + (1.0 - F0) * ((1.0 - VoH) ** 5)[:, None]
+    ggx = (D * G) / (4.0 * nv * nl + 1e-5)                        # (F,) 逐面标量
+    spec_dir = Fdir * ggx[:, None] * key_c[None, :] * nl[:, None]
+
+    # 漫反射：方向主光 Lambert + 环境（金属无漫反射）；环境系数低→不洗白、有方向感
+    diff = diffAlb * ((key_c[None, :] * (nl * 0.5)[:, None]) + envN * _AMB_DIFF)
+    # 环境镜面（IBL）：金属反射亮带主要来源；按 (1-rough) 强衰减→粗糙介质(泥/木/石)几乎不反射
+    spec_ibl = fr * envR * (1.0 - rough) * _IBL_GAIN
+
+    rgb = diff + spec_dir + spec_ibl
+    rgb = rgb + albedo * envN * (sss * 0.4)                      # 次表面柔光
+    rgb = rgb + emis[None, :]
+    rgb = _acesFilmic(rgb * _EXPOSURE)                            # 色调映射
+    return np.clip(rgb, 0.0, 1.0)
 
 
 def colorFaces(mesh: ReliefMesh, mode: str = "material", material: str = "clay",
                base_color=(21, 182, 201), light=(0.5, -0.5, 0.7),
                eye=(0.0, 0.0, 300.0), lut: np.ndarray | None = None,
-               face_base: np.ndarray | None = None) -> np.ndarray:
+               face_base: np.ndarray | None = None,
+               mat_params: dict | None = None, quality: str = "fine") -> np.ndarray:
     """逐面着色 → ``(F,3) uint8``。mode ∈ {map, color, material}。
 
     light: 指向光源单位向量；eye: 相机世界位置（算逐面视线方向做镜面高光）；
@@ -455,16 +681,8 @@ def colorFaces(mesh: ReliefMesh, mode: str = "material", material: str = "clay",
                             dtype=np.float64)
             rgb = base[None, :] * lit[:, None] + 50.0 * (spec_ang ** 32)[:, None]
     else:
-        base = _materialBase(mesh, material, base_color)
-        kd, specGain, specPow, addAmb = _materialShading(
-            material, diff, spec_ang, N)
-        if kd is None:                                   # wood/stone/clay：用 lit
-            rgb = base * lit[:, None]
-        else:                                            # plastic/metal：显式环境+漫反射
-            rgb = base * (addAmb + kd * soft)[:, None]
-        if material == "metal":                          # 边缘菲涅尔提亮
-            fres = (1.0 - np.clip(N[:, 2], 0.0, 1.0)) ** 2
-            rgb = rgb + base * (0.5 * fres)[:, None]
-        rgb = rgb + specGain * (spec_ang ** specPow)[:, None]
+        P = _matParams(material, mat_params)
+        albedo = _materialBase(mesh, material, base_color, P) / 255.0   # (F,3) [0,1]
+        rgb = _pbrShade(P, albedo, N, L, Vn, spec_ang, quality) * 255.0
 
     return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)

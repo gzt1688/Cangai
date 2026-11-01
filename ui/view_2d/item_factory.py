@@ -5,6 +5,7 @@ from typing import Optional
 from PySide6.QtGui import QPainterPath
 
 from core.vector.geometry_types import ObjectType, Point3D
+from ..qt_path import appendSmooth
 from .items.base_item import BaseGraphicsItem
 from .items.relief_model_item import ReliefModelItem
 from .items.image_item import ImageGraphicsItem
@@ -59,23 +60,25 @@ def _buildPath(obj, viewScale: float = 1.0) -> QPainterPath:
             path = tr.map(path)
     elif t == ObjectType.CURVE:
         pts = obj.getSampledPoints()
-        if pts:
-            path.moveTo(pts[0].x, pts[0].y)
-            for p in pts[1:]:
-                path.lineTo(p.x, p.y)
+        appendSmooth(path, [(p.x, p.y) for p in pts], move=True)
     elif t == ObjectType.NURBS_CURVE:
         pts = obj.getSampledPoints()
-        if pts:
-            path.moveTo(pts[0].x, pts[0].y)
-            for p in pts[1:]:
-                path.lineTo(p.x, p.y)
+        appendSmooth(path, [(p.x, p.y) for p in pts], move=True)
     elif t == ObjectType.POLYCURVE:
         for seg in obj.segments():
             pts = seg.get("points", [])
-            if pts:
-                path.moveTo(pts[0][0], pts[0][1])
-                for p in pts[1:]:
-                    path.lineTo(p[0], p[1])
+            if not pts:
+                continue
+            xy = [(p[0], p[1]) for p in pts]
+            # 仅样条类型段平滑显示；折线段（修剪/闭合/文字轮廓等
+            # 只有 points、无 type/inputPoints）保持直线，不圆化尖角
+            if (seg.get("type") == "Curve" or seg.get("inputPoints")) \
+                    and len(xy) >= 3:
+                appendSmooth(path, xy, move=True)
+            else:
+                path.moveTo(xy[0][0], xy[0][1])
+                for q in xy[1:]:
+                    path.lineTo(q[0], q[1])
     elif t == ObjectType.REVCLOUD:
         path = obj.path()
     elif t == ObjectType.IMAGE:

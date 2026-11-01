@@ -17,9 +17,14 @@ from core.relief import paint_palette
 
 
 class PaintState(QObject):
-    """当前颜色单例（QObject）：调色板 + 当前索引，切换时发 currentChanged。"""
+    """当前颜色单例（QObject）：调色板 + 当前索引，切换时发 currentChanged。
+
+    额外维护一个“基础色”（浮雕模型/图层颜色）：与调色板第 2 个色块直接
+    关联，图层改色时经 setBaseColor 同步并发 baseColorChanged 供底部色栏重绘。
+    """
 
     currentChanged = Signal(int)          # 载荷为新当前索引（0 基）
+    baseColorChanged = Signal()           # 基础色（第 2 色）变化
 
     _instance: Optional["PaintState"] = None
 
@@ -32,6 +37,23 @@ class PaintState(QObject):
         if cls._instance is None:
             cls._instance = PaintState()
         return cls._instance
+
+    # ------------------------------------------------------------------
+    # 基础色（浮雕模型/图层颜色 ↔ 调色板第 2 色）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def baseColor() -> Tuple[int, int, int]:
+        return paint_palette.base_color()
+
+    def setBaseColor(self, rgb) -> None:
+        """把浮雕模型颜色同步为调色板第 2 色；变化则发 baseColorChanged。
+
+        若当前选中的正是基础色槽，一并重发 currentChanged 刷新“当前颜色”块。
+        """
+        if paint_palette.set_base_color(rgb):
+            self.baseColorChanged.emit()
+            if self._index == paint_palette.BASE_INDEX:
+                self.currentChanged.emit(self._index)
 
     # ------------------------------------------------------------------
     # 调色板（转发自 core，保证 core/UI 用同一张表）

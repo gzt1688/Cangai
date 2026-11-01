@@ -21,6 +21,8 @@ from PySide6.QtCore import QObject, QPoint, QPointF, Qt
 from PySide6.QtGui import QColor, QFont, QPolygonF
 
 from core.vector.geometry_types import Point3D, BoundingBox3D
+from core.vector.transform_geometry import scaleObjectAround
+from ui.view_3d._renderdbg import vdbg
 from .gizmo_dialog import GizmoInputDialog
 
 # ---------------- 常量（与原项目 GizmoConst / 各 Geometry 头文件一致） ----------------
@@ -218,6 +220,8 @@ class GizmoManager(QObject):
         self._editCtrl = None   # 曲线编辑控制器：选中控制点时操作轴作用于控制点
         self._center = (0.0, 0.0, 0.0)
         self._bboxSize = (1.0, 1.0, 1.0)
+        # 缩放中心：overall=所有选中绕合并包围盒中心；individual=各自包围盒中心
+        self._centerMode = "overall"
         # 交互状态
         self._mode = None               # "move" / "rotate" / "scale"
         self._dragging = False
@@ -249,6 +253,7 @@ class GizmoManager(QObject):
         self._inputDialog = None
 
         # 信号槽保存引用：setDocument 换绑文档时需按引用断开（lambda 直接断开会误伤）
+        self._staleDuringCmd = False   # 命令期间收到的刷新请求（命令结束补一次）
         self._onDocAdded = lambda *_: self.refresh()
         self._onDocRemoved = lambda *_: self.refresh()
         self._onObjChanged = lambda *_: self.refresh()
@@ -256,6 +261,8 @@ class GizmoManager(QObject):
         doc.objectChanged.connect(self._onObjChanged)
         doc.objectAdded.connect(self._onDocAdded)
         doc.objectRemoved.connect(self._onDocRemoved)
+        if cm is not None:
+            cm.commandFinished.connect(self._onCommandFinished)
 
     # ---------------- 对外接口 ----------------
 
@@ -296,11 +303,37 @@ class GizmoManager(QObject):
     def isDragging(self) -> bool:
         return self._dragging
 
+    def setCenterMode(self, mode: str) -> None:
+        """缩放中心模式（来自变换面板）：overall=整体包围盒 / individual=各自包围盒。"""
+        self._centerMode = "individual" if mode == "individual" else "overall"
+
+    def _onCommandFinished(self, *_a) -> None:
+        """命令结束：期间被略过的刷新在此补上（操作轴回到按当前选中的几何）。"""
+        if self._staleDuringCmd:
+            self._staleDuringCmd = False
+            self.refresh()
+
     def refresh(self) -> None:
         """按当前选择重算中心与包围盒尺寸（拖动中不移动中心，避免抖动）。
 
         编辑曲线开启时：优先以选中的控制点包围盒为基准，其次以目标曲线
         包围盒为基准，操作轴变换即作用于控制点。"""
+        # 平移拖动中：中心/包围盒由 _doMoveDrag 自行维护且与显示无关，
+        # 这里提前返回——否则拖动的每个鼠标事件 × 每个选中对象都会触发
+        # 全量包围盒重算 + 双视口重绘，是大场景拖动卡顿的主因之一。
+        if self._dragging and self._mode == "move":
+            return
+        # 命令进行中：操作轴本来就不显示（_isActive 拒绝绘制），而浮雕笔刷
+        # （磨光/堆料/涂抹）每 33ms 推一次 objectChanged，每次都扫全量高度场
+        # 重算包围盒 + 双视口重绘，纯属白烧；记下待办，命令
+        # 结束时由 _onCommandFinished 补一次。
+        if self._cm is not None and self._cm.hasActive():
+            self._staleDuringCmd = True
+            return
+        self._staleDuringCmd = False
+        # 逐事件流水（拖动期每个鼠标事件都进出各一行，且同步 flush 到磁盘）：
+        # 默认不写，需抓事件链时 _renderdbg.verbose(True) 打开
+        vdbg("gizmo refresh begin")
         if self._editCtrl is not None and self._editCtrl.isActive():
             # 已选中控制点：操作轴以控制点包围盒为基准，作用于控制点
             if self._editCtrl.hasSelectedControls():
@@ -339,6 +372,7 @@ class GizmoManager(QObject):
                           max(bb.depth(), 1e-9))
         self._visible = True
         self._redrawAll()
+        vdbg("gizmo refresh end")
 
     def _isActive(self) -> bool:
         if not self._enabled or not self._visible:
@@ -941,9 +975,23 @@ class GizmoManager(QObject):
             cx, cy, cz = self._center
             ctrl.scaleSelected(sx, sy, cx, cy)
             return
+        if self._centerMode == "individual":
+            # 各自：每个对象绕自身包围盒中心缩放（对象位置基本不动）
+            for obj in self._transformable():
+                c = Point3D(*self._center)
+                try:
+                    bb = obj.getBoundingBox()
+                except Exception:
+                    bb = None
+                if bb is not None and bb.isValid():
+                    bc = bb.center()
+                    c = Point3D(bc.x, bc.y, bc.z)
+                scaleObjectAround(obj, sx, sy, sz, c, self._doc)
+                self._doc.notifyObjectChanged(obj.id())
+            return
         c = Point3D(*self._center)
         for obj in self._transformable():
-            obj.scaleAround(sx, sy, sz, c)
+            scaleObjectAround(obj, sx, sy, sz, c, self._doc)
             self._doc.notifyObjectChanged(obj.id())
 
     def _cloneSelection(self) -> None:

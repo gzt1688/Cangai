@@ -73,6 +73,7 @@ RELIEF_COMMAND_KEYS = {
     "NewModel", "ReliefUndo", "ReliefRedo", "Solidify", "AddMaterial",
     "RegionRelief", "Stamp", "SweepMaterial", "Smooth", "Move", "SweepSmooth",
     "DeJitter", "RegionTransform", "RegionDeform", "LevelCalibrate", "RegionSlope",
+    "HeightContrast",
     "RevolveSlope", "ModelScale",
     "TextureFill", "SlopeZone",
 }
@@ -197,6 +198,13 @@ class QuickAccessBar(QWidget):
                     btn.setContextMenuPolicy(Qt.CustomContextMenu)
                     btn.customContextMenuRequested.connect(
                         lambda pos: self.commandRequested.emit("Ungroup"))
+                if key == "Join":
+                    # 组合/炸开二合一：左键组合，右键炸开（逆操作）
+                    btn.setToolTip(tr("左：组合多条曲线\n右：炸开组合"))
+                    self._buttonTooltips[btn] = "左：组合多条曲线\n右：炸开组合"
+                    btn.setContextMenuPolicy(Qt.CustomContextMenu)
+                    btn.customContextMenuRequested.connect(
+                        lambda pos: self.commandRequested.emit("Explode"))
                 # 路径塑形：左键=路径塑形（导动堆料）
                 if key == "SweepMaterial":
                     btn.setToolTip(tr("路径塑形"))

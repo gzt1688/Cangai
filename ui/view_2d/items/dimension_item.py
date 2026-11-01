@@ -125,8 +125,9 @@ class DimensionGraphicsItem(QGraphicsPathItem):
                 painter.drawPath(shrink.map(path))
                 painter.restore()
 
-        # XY 标注选中：读数字样画虚线圆环，提示可单独拖动子标注
-        if obj.isSelected() and obj.kind() == "xy":
+        # 可拖动的标注选中：读数字样画虚线圆环，提示拖读数可改摆放
+        # （XY 子标注单向拉动 / 圆标注转动直径线）
+        if obj.isSelected() and obj.kind() in ("xy", "circle"):
             painter.save()
             hpen = QPen(QColor(hl), 1.0, Qt.PenStyle.DashLine)
             hpen.setCosmetic(True)

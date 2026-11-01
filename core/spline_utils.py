@@ -398,6 +398,398 @@ def nurbs_fit_samples(points: Sequence[Point3D],
         return catmullRom(pts, spp)
 
 
+# ---------------- 贝塞尔手柄（曲线点编辑控制柄） ----------------
+
+def nurbs_fit_derivatives(points: Sequence[Point3D],
+                          closed: bool = False,
+                          knots: str = 'chord') -> tuple:
+    """拟合点样条的参数/导数结构（与 nurbs_fit_samples 同一全局插值解）。
+
+    返回 (u, dv, extra)：
+      u     拟合点归一化参数（闭合含末项绕回 1.0）；
+      dv    各拟合点一阶导 dC/du；
+      extra 开放曲线的内部平均节点 [(param, 位置C(k), 导数dC/du), ...]
+            ——C2 样条的多项式分段边界（闭合周期样条的分段边界就是
+            拟合参数，extra=[]）。
+    贝塞尔手柄自动速度 = 导数 × 分段 Δu（链式法则精确）→ 手柄模式曲线
+    在未拖柄区域与原拟合样条**逐位一致**（转换零跳变，手柄只弯相邻
+    子段）。失败/路径不支持返回 ([], [], [])（调用方回退采样差分 /
+    Catmull-Rom 估算）。"""
+    n = len(points)
+    if n < 2:
+        return [], [], []
+    pts = list(points)
+    if closed and n > 3 and pts[0].distanceTo(pts[-1]) < 1e-12:
+        pts.pop()
+        n = len(pts)
+    if n < 2:
+        return [], [], []
+    if n == 2:
+        return ([0.0, 1.0],
+                [Point3D(pts[1].x - pts[0].x, pts[1].y - pts[0].y,
+                         pts[1].z - pts[0].z)] * 2, [])
+    if closed and n <= 3:
+        return [], [], []
+    u = _fit_params(pts, knots, closed)
+    try:
+        from scipy.interpolate import BSpline
+        if closed:
+            p = 3
+            kv = _periodic_knots(u, n, p)
+            a = [[0.0] * n for _ in range(n)]
+            bx = [0.0] * n
+            by = [0.0] * n
+            bz = [0.0] * n
+            for i in range(n):
+                span = _find_span(n + p - 1, p, u[i], kv)
+                b = _basis(span, u[i], p, kv)
+                for kk, v in enumerate(b):
+                    j = (span + kk - p) % n
+                    a[i][j] += v
+                bx[i] = pts[i].x
+                by[i] = pts[i].y
+                bz[i] = pts[i].z
+            sol = np.linalg.solve(np.array(a),
+                                  np.array([bx, by, bz], dtype=float).T)
+            control = [Point3D(float(sol[i, 0]), float(sol[i, 1]), float(sol[i, 2]))
+                       for i in range(n)]
+            control.extend(control[:p])   # 与 _nurbs_periodic_samples 同构
+            spl = BSpline(kv, np.array([[c.x, c.y, c.z] for c in control]), p)
+            extra: List[tuple] = []
+        else:
+            p, kv = _interp_knots(u)
+            m = len(kv) - p - 1   # 控制点数 = 拟合点数
+            a = [[0.0] * m for _ in range(m)]
+            bx = [0.0] * m
+            by = [0.0] * m
+            bz = [0.0] * m
+            for row, (ui, q) in enumerate(zip(u, pts)):
+                span = _find_span(m - 1, p, ui, kv)
+                b = _basis(span, ui, p, kv)
+                for kk, v in enumerate(b):
+                    j = span + kk - p
+                    if 0 <= j < m:
+                        a[row][j] += v
+                bx[row] = q.x
+                by[row] = q.y
+                bz[row] = q.z
+            sol = np.linalg.solve(np.array(a),
+                                  np.array([bx, by, bz], dtype=float).T)
+            control = [Point3D(float(sol[i, 0]), float(sol[i, 1]), float(sol[i, 2]))
+                       for i in range(m)]
+            spl = BSpline(kv, np.array([[c.x, c.y, c.z] for c in control]), p)
+            # 内部平均节点 = 样条多项式分段边界（去重）
+            extra = []
+            lo, hi = kv[p], kv[m]
+            for k in sorted({float(kv[i]) for i in range(p + 1, len(kv) - p - 1)}):
+                if lo < k < hi:
+                    extra.append((k, None))   # 导数占位，稍后统一求值
+        if any(not (math.isfinite(c.x) and math.isfinite(c.y) and math.isfinite(c.z))
+               for c in control):
+            return [], [], []
+        der = spl.derivative()
+        uu = u[:n] if closed else u
+        out = [Point3D(float(v[0]), float(v[1]), float(v[2])) for v in der(uu)]
+        if extra:
+            kvs = [k for k, _ in extra]
+            poss = [Point3D(float(v[0]), float(v[1]), float(v[2]))
+                    for v in spl(kvs)]
+            dvs = [Point3D(float(v[0]), float(v[1]), float(v[2]))
+                   for v in der(kvs)]
+            extra = list(zip(kvs, poss, dvs))
+        if any(not (math.isfinite(v.x) and math.isfinite(v.y) and math.isfinite(v.z))
+               for v in out) or any(not (math.isfinite(p.x) and math.isfinite(p.y)
+                                         and math.isfinite(p.z)
+                                         and math.isfinite(v.x) and math.isfinite(v.y)
+                                         and math.isfinite(v.z))
+                                    for _, p, v in extra):
+            return [], [], []
+        return u, out, extra
+    except Exception:
+        return [], [], []
+
+
+def _fitTangentDirections(pts: Sequence[Point3D],
+                          samples: Sequence[Point3D],
+                          closed: bool) -> List[Optional[Point3D]]:
+    """从渲染采样折线提取各拟合点的**真实**单位切向。
+
+    采样严格过拟合点且沿曲线有序（clamped/周期/猫挠旋转全部成立）：
+    两指针顺序最近邻定位拟合点（距离沿采样单调降至 0），中心差分取
+    切向（闭合循环取邻，天然跨接缝）。个别点失效返回 None（回退估算）。
+    samples 兼容 [x,y,z] 列表（PolyCurve 段数据）与 Point3D。"""
+    if samples and not isinstance(samples[0], Point3D):
+        samples = [Point3D(s[0], s[1], s[2]) for s in samples]
+    m = len(samples)
+    dirs: List[Optional[Point3D]] = []
+    # 尺度容差：最近邻应精确落在拟合点上（~1e-9），偏到别的采样即失效
+    chord_scale = (sum(pts[k].distanceTo(pts[k + 1]) for k in range(len(pts) - 1))
+                   / max(1, len(pts) - 1)) if len(pts) > 1 else 0.0
+    tol = 1e-3 * (chord_scale + 1e-12)
+    j = 0
+    for p in pts:
+        while (j + 1 < m
+               and samples[j + 1].distanceTo(p) < samples[j].distanceTo(p)):
+            j += 1
+        if samples[j].distanceTo(p) > tol:
+            dirs.append(None)
+            continue
+        if closed:
+            a, b = samples[(j - 1) % m], samples[(j + 1) % m]
+        else:
+            a, b = samples[max(j - 1, 0)], samples[min(j + 1, m - 1)]
+        d = Point3D(b.x - a.x, b.y - a.y, b.z - a.z)
+        ln = math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
+        dirs.append(Point3D(d.x / ln, d.y / ln, d.z / ln) if ln > 1e-12 else None)
+    return dirs
+
+
+def _fitDerivData(pts: Sequence[Point3D], closed: bool, derivs) -> Optional[tuple]:
+    """校验并展开 nurbs_fit_derivatives 的 (u, dv, extra)。
+    open: u n 项 / dv n 项；closed: u n+1 项（末项=绕回终点）/ dv n 项。"""
+    if not derivs or len(derivs) != 3:
+        return None
+    u, dv, extra = derivs
+    n = len(pts)
+    if closed and len(u) == n + 1 and len(dv) == n:
+        return u, dv, extra
+    if not closed and len(u) == n and len(dv) == n:
+        return u, dv, extra
+    return None
+
+
+def autoHandleOffsets(pts: Sequence[Point3D], closed: bool,
+                      samples: Optional[Sequence[Point3D]] = None,
+                      derivs=None
+                      ) -> List[Tuple[Optional[Point3D], Optional[Point3D]]]:
+    """各拟合点的自动手柄偏移（Bézier 控制偏移 = 切向速度的 1/3）。
+
+    返回与 pts 等长的 [(h_in, h_out), ...]；h_in 指向曲线来向（后侧），
+    h_out 指向去处（前侧）。开放段端点只有一侧（另一侧为 None）。
+    切向来源优先级：
+      1. derivs = (u, dC/du) 拟合样条节点导数（nurbs_fit_derivatives）
+         —— 幅值 = 导数 × 相邻区间参数步长 Δu 均值，与画出的曲线严格
+         同切向同速度，手柄模式与原曲线为同一条（转换零跳变）；
+      2. samples = 渲染采样折线中心差分（方向正确、幅值近似）；
+      3. Catmull-Rom 估算（内点 (P[i+1]-P[i-1])/2，端点单侧，闭合循环）。
+    样条导数下的幅值 = |dC/du| × Δu 均值；其余 = 相邻弦长均值
+    （端点 = 本侧弦长）。"""
+    n = len(pts)
+    if n < 2:
+        return [(None, None)] * n
+    dirs = _fitTangentDirections(pts, samples, closed) \
+        if samples is not None and len(samples) >= 2 else None
+
+    def crVel(i: int) -> Point3D:
+        if closed:
+            return Point3D((pts[(i + 1) % n].x - pts[(i - 1) % n].x) * 0.5,
+                           (pts[(i + 1) % n].y - pts[(i - 1) % n].y) * 0.5,
+                           (pts[(i + 1) % n].z - pts[(i - 1) % n].z) * 0.5)
+        if i == 0:
+            return Point3D(pts[1].x - pts[0].x, pts[1].y - pts[0].y,
+                           pts[1].z - pts[0].z)
+        if i == n - 1:
+            return Point3D(pts[n - 1].x - pts[n - 2].x,
+                           pts[n - 1].y - pts[n - 2].y,
+                           pts[n - 1].z - pts[n - 2].z)
+        return Point3D((pts[i + 1].x - pts[i - 1].x) * 0.5,
+                       (pts[i + 1].y - pts[i - 1].y) * 0.5,
+                       (pts[i + 1].z - pts[i - 1].z) * 0.5)
+
+    chords = [pts[(k + 1) % n].distanceTo(pts[k]) for k in range(n)]
+    ddata = _fitDerivData(pts, closed, derivs)
+    out: List[Tuple[Optional[Point3D], Optional[Point3D]]] = []
+    for i in range(n):
+        m_in: Optional[Point3D] = None
+        m_out: Optional[Point3D] = None
+        if ddata is not None:
+            # 真实 Bézier 控制偏移：入/出侧各取 |dC/du| × 相邻分段 Δu / 3
+            # （原位 materialize 与自动 Hermite 速度一致 → 零跳变；
+            #   不均匀间距下两侧柄长不同属正常，控制器按对称性决定镜像）
+            u_fit, dv_fit, extra = ddata
+            dv = dv_fit[i]
+            if closed:
+                # u 含末项绕回：区间 k = P_k→P_{k+1}（含绕回腿）
+                du_in = u_fit[i] - u_fit[i - 1] if i > 0 \
+                    else u_fit[n] - u_fit[n - 1]
+                du_out = u_fit[i + 1] - u_fit[i]
+            else:
+                bs = sorted(set(u_fit) | {k for k, _, _ in extra})
+                idx = bs.index(u_fit[i])
+                du_in = u_fit[i] - bs[idx - 1] if idx > 0 else None
+                du_out = bs[idx + 1] - u_fit[i] if idx + 1 < len(bs) else None
+            if du_out is not None:
+                m_out = Point3D(dv.x * du_out / 3.0, dv.y * du_out / 3.0,
+                                dv.z * du_out / 3.0)
+            if du_in is not None:
+                m_in = Point3D(-dv.x * du_in / 3.0, -dv.y * du_in / 3.0,
+                               -dv.z * du_in / 3.0)
+        elif dirs is not None and dirs[i] is not None:
+            if closed:
+                scale = (chords[(i - 1) % n] + chords[i]) * 0.5
+            elif i == 0:
+                scale = chords[0]
+            elif i == n - 1:
+                scale = chords[n - 2]
+            else:
+                scale = (chords[i - 1] + chords[i]) * 0.5
+            h = Point3D(dirs[i].x * scale / 3.0, dirs[i].y * scale / 3.0,
+                        dirs[i].z * scale / 3.0)
+            if closed:
+                m_in, m_out = Point3D(-h.x, -h.y, -h.z), h
+            elif i == 0:
+                m_out = h
+            elif i == n - 1:
+                m_in = h
+            else:
+                m_in, m_out = Point3D(-h.x, -h.y, -h.z), h
+        else:
+            mv = crVel(i)
+            h = Point3D(mv.x / 3.0, mv.y / 3.0, mv.z / 3.0)
+            if closed:
+                m_in, m_out = Point3D(-h.x, -h.y, -h.z), h
+            elif i == 0:
+                m_out = h
+            elif i == n - 1:
+                m_in = h
+            else:
+                m_in, m_out = Point3D(-h.x, -h.y, -h.z), h
+        out.append((m_in, m_out))
+    return out
+
+
+def hermiteHandleSamples(pts: Sequence[Point3D],
+                         h_in: Sequence[Optional[Point3D]],
+                         h_out: Sequence[Optional[Point3D]],
+                         closed: bool, samples_per_interval: int = 20,
+                         samples: Optional[Sequence[Point3D]] = None,
+                         derivs: Optional[Sequence[Point3D]] = None
+                         ) -> List[Point3D]:
+    """手柄模式重采样：逐区间三次 Hermite（与三次 Bézier 等价），
+    严格过每个拟合点。h_in/h_out 为各点 Bézier 控制偏移（0 向量 =
+    自动：优先 derivs=(u, dC/du) 样条节点导数 × 本区间 Δu（与原曲线
+    逐位一致），其次 samples 中心差分；None = 该侧不存在）。
+    闭合时追加末点→首点的闭合腿（邻居循环取用）。"""
+    n = len(pts)
+    if n < 2:
+        return list(pts)
+    spp = max(4, int(samples_per_interval))
+    pairs = [(i, i + 1) for i in range(n - 1)]
+    if closed and n >= 3:
+        pairs.append((n - 1, 0))
+    chords = [pts[(k + 1) % n].distanceTo(pts[k]) for k in range(n)]
+    # chords[k] = |P[k+1]-P[k]|（闭合时 P[n] 即 P[0]）；chords[k-1] 为来向弦
+    auto = autoHandleOffsets(pts, closed, samples, derivs)
+    ddata = _fitDerivData(pts, closed, derivs)
+    out: List[Point3D] = []
+    for a, b in pairs:
+        A, B = pts[a], pts[b]
+        if A.distanceTo(B) < 1e-12:
+            continue
+        if ddata is not None:
+            # 样条导数路径：按样条多项式分段边界细分（开放 = 内部平均
+            # 节点），自动速度 = 边界导数 × 分段 Δu → 未拖柄区域与原
+            # 拟合曲线逐位一致；materialized 柄只弯相邻子段
+            u_fit, dv_fit, extra = ddata
+            bmap = {k: (pos, dv) for k, pos, dv in extra}
+            if closed:
+                end_param = u_fit[n] if a == n - 1 else u_fit[b]
+                seq = [(u_fit[a], a), (end_param, b)]
+            else:
+                ks = [k for k in bmap if u_fit[a] < k < u_fit[b]]
+                seq = [(u_fit[a], a)] + [(k, None) for k in ks] + [(u_fit[b], b)]
+
+            def _vel(param: float, fidx: Optional[int], is_end: bool,
+                     dup: float) -> Optional[Point3D]:
+                # materialized 手柄优先，否则样条导数 × 本分段 Δu
+                if fidx is not None and 0 <= fidx < n:
+                    if is_end:
+                        hi_ = h_in[fidx] if fidx < len(h_in) else None
+                        if hi_ is not None and (hi_.x or hi_.y or hi_.z):
+                            return Point3D(-hi_.x * 3.0, -hi_.y * 3.0,
+                                           -hi_.z * 3.0)
+                    else:
+                        ho_ = h_out[fidx] if fidx < len(h_out) else None
+                        if ho_ is not None and (ho_.x or ho_.y or ho_.z):
+                            return Point3D(ho_.x * 3.0, ho_.y * 3.0,
+                                           ho_.z * 3.0)
+                    dv = dv_fit[fidx]
+                    return Point3D(dv.x * dup, dv.y * dup, dv.z * dup)
+                ent = bmap.get(param)
+                if ent is None:
+                    return None
+                dv = ent[1]
+                return Point3D(dv.x * dup, dv.y * dup, dv.z * dup)
+
+            def _pos(param: float, fidx: Optional[int]) -> Optional[Point3D]:
+                if fidx is not None and 0 <= fidx < n:
+                    return pts[fidx]
+                ent = bmap.get(param)
+                return ent[0] if ent is not None else None
+
+            for (pa, ia), (pb, ib) in zip(seq[:-1], seq[1:]):
+                dup = pb - pa
+                if dup < 1e-15:
+                    continue
+                mA = _vel(pa, ia, False, dup)
+                mB = _vel(pb, ib, True, dup)
+                P0 = _pos(pa, ia)
+                P1 = _pos(pb, ib)
+                if mA is None or mB is None or P0 is None or P1 is None:
+                    continue
+                for j in range(spp):
+                    t = j / spp
+                    t2, t3 = t * t, t * t * t
+                    h00 = 2 * t3 - 3 * t2 + 1
+                    h10 = t3 - 2 * t2 + t
+                    h01 = -2 * t3 + 3 * t2
+                    h11 = t3 - t2
+                    out.append(Point3D(
+                        h00 * P0.x + h10 * mA.x + h01 * P1.x + h11 * mB.x,
+                        h00 * P0.y + h10 * mA.y + h01 * P1.y + h11 * mB.y,
+                        h00 * P0.z + h10 * mA.z + h01 * P1.z + h11 * mB.z))
+            continue
+        d = A.distanceTo(B)
+        prev_d = chords[(a - 1) % n] if (closed or a > 0) else d
+        next_d = chords[b % n] if (closed or b < n - 1) else d
+        mA = None
+        mB = None
+        ho = h_out[a] if a < len(h_out) else None
+        if ho is not None and (ho.x or ho.y or ho.z):
+            mA = Point3D(ho.x * 3.0, ho.y * 3.0, ho.z * 3.0)
+        else:
+            m = auto[a][1]
+            mA = None if m is None else Point3D(
+                m.x * 6.0 * d / (prev_d + d),
+                m.y * 6.0 * d / (prev_d + d),
+                m.z * 6.0 * d / (prev_d + d))
+        hi = h_in[b] if b < len(h_in) else None
+        if hi is not None and (hi.x or hi.y or hi.z):
+            mB = Point3D(-hi.x * 3.0, -hi.y * 3.0, -hi.z * 3.0)
+        else:
+            m = auto[b][0]
+            mB = None if m is None else Point3D(
+                -m.x * 6.0 * d / (d + next_d),
+                -m.y * 6.0 * d / (d + next_d),
+                -m.z * 6.0 * d / (d + next_d))
+        if mA is None or mB is None:
+            out.append(A)
+            continue
+        for j in range(spp):
+            t = j / spp
+            t2, t3 = t * t, t * t * t
+            h00 = 2 * t3 - 3 * t2 + 1
+            h10 = t3 - 2 * t2 + t
+            h01 = -2 * t3 + 3 * t2
+            h11 = t3 - t2
+            out.append(Point3D(
+                h00 * A.x + h10 * mA.x + h01 * B.x + h11 * mB.x,
+                h00 * A.y + h10 * mA.y + h01 * B.y + h11 * mB.y,
+                h00 * A.z + h10 * mA.z + h01 * B.z + h11 * mB.z))
+    out.append(pts[pairs[-1][1]] if pairs else pts[-1])
+    return out
+
+
 def _nurbs_periodic_samples(pts: List[Point3D], u: List[float],
                             spp: int) -> List[Point3D]:
     """周期闭合拟合（cadcraft closed_fit 移植）：unclamped 节点 +

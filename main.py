@@ -126,7 +126,7 @@ def _qt_msg_handler(msg_type: QtMsgType, ctx: QMessageLogContext, msg: str) -> N
 
 qInstallMessageHandler(_qt_msg_handler)
 
-from PySide6.QtWidgets import QApplication, QStyleFactory
+from PySide6.QtWidgets import QStyleFactory
 from PySide6.QtGui import QIcon
 from resource_path import resource_path
 from PySide6.QtCore import QTimer
@@ -145,7 +145,10 @@ def _startup_file_arg() -> str:
 
 
 def main() -> None:
-    app = QApplication(sys.argv)
+    # 带慢事件打点的 QApplication：浮雕模式卡顿时，render_debug.log 会直接
+    # 写出"哪个事件慢了多少毫秒"，不用再靠猜（详见 ui/perf_monitor.py）。
+    from ui.perf_monitor import CangaiApplication
+    app = CangaiApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setWindowIcon(QIcon(resource_path("icons/Cangai.ico")))
     # 初始化界面语言（从持久化设置加载；默认简体中文）

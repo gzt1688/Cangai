@@ -41,6 +41,7 @@ COMMAND_MODES = {
     "cookie_cutter.cookie_extrude":  ("3d",),   # 饼干拉伸
     # 浮雕模式功能（模具组内用分割线与 3D 实体功能分开）
     "cookie_cutter.biscuit_relief":  ("relief",),  # 浮雕饼干
+    "cookie_cutter.silicone_rim":    ("relief",),  # 硅胶外围
 
     # ---- 浮雕命令：仅浮雕模式 ----
     "NewModel":        ("relief",),   # 新建模型
@@ -60,6 +61,7 @@ COMMAND_MODES = {
     "RegionSymmetry":  ("relief",),   # 区域对称
     "RegionDeform":    ("relief",),   # 区域变形
     "LevelCalibrate":  ("relief",),   # 水平校准
+    "HeightContrast":  ("relief",),   # 高差调整（对比度增强）
     "RegionSlope":     ("relief",),   # 斜面
     "RevolveSlope":    ("relief",),   # 旋转面
     "TextureFill":     ("relief",),   # 纹理填充（几何纹理族）

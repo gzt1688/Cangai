@@ -11,6 +11,7 @@ from core.grid_manager import GridManager
 import core.app_settings as app_settings
 from ui.styles import theme
 from ui.widgets.step_hint import StepHintOverlay
+from ui.widgets.overlap_pick import isCurveLike, pickFromMenu
 from core.snap.snap_manager import SnapManager
 from core.snap.snap_types import SnapResult, snapLabel, SnapType
 from core.vector.geometry_types import Point3D, ObjectType
@@ -196,10 +197,11 @@ class GraphicsView(QGraphicsView):
         self._viewMode = 1
         # XY 尺寸标注“子标注单独拖动”（X 宽沿 Y 上下 / Y 高沿 X 左右）
         self._dimDragObj = None
-        self._dimDragAxis = ""          # 'x'=拖动 X 宽读数(改 yOff)，'y'=拖动 Y 高读数(改 xOff)
+        self._dimDragAxis = ""          # 'x'=拖动 X 宽读数(改 yOff)，'y'=拖动 Y 高读数(改 xOff)，'rot'=转动圆标注直径线
         self._dimStartWorld = Point3D()
         self._dimStartOx = 0.0
         self._dimStartOy = 0.0
+        self._dimStartAng = 0.0         # rot 拖动：按下时相对圆心的角度（度）
         self._dimCursorSet = False      # 标注悬停光标是否已设置（便于还原）
         self.scale(1, -1)
 
@@ -214,10 +216,10 @@ class GraphicsView(QGraphicsView):
                                     vis.width() * 0.5, vis.height() * 0.5))
         if nr == sr:
             return
-        keep = self.mapToScene(self.viewport().rect().center())
+        # 只扩矩形不触发重绘：场景内容未变，背景/图元由滚动时的
+        # 暴露边条重绘覆盖；此前每步 updateScene(全域)+centerOn 会让
+        # 平移/缩放在扩区期间整视口反复全量重绘，曲线多时明显卡顿
         self.scene().setSceneRect(nr)
-        self.updateScene([nr])
-        self.centerOn(keep)   # 扩区不得改变当前视野位置
 
     def setCommandManager(self, cm) -> None:
         self._commandManager = cm
@@ -368,11 +370,14 @@ class GraphicsView(QGraphicsView):
             return Point3D(gx, gy, 0.0)
         return wp
 
-    # ---- 尺寸标注：XY 子标注可单独拖动（X 宽读数沿 Y / Y 高读数沿 X） ----
+    # ---- 尺寸标注：XY 子标注可单独拖动（X 宽读数沿 Y / Y 高读数沿 X），
+    #      圆标注拖读数可绕圆转动直径线 ----
 
     def _dimHandleAt(self, pos) -> tuple | None:
-        """光标下的可拖动 XY 子标注 (obj, axis)。axis='x' 表示下方 X 宽标注
-        （上下拖动改 yOff），'y' 表示左侧 Y 高标注（左右拖动改 xOff）。
+        """光标下的可拖动标注读数 (obj, axis)。
+        XY 标注：axis='x' 表示下方 X 宽标注（上下拖动改 yOff），'y' 表示左侧
+        Y 高标注（左右拖动改 xOff）；
+        圆标注：axis='rot'，拖动读数即绕圆心转动直径线。
         仅当该标注已被选中且未锁定；读数文字中心即拖动柄（命中半径 12px）。"""
         if self._doc is None:
             return None
@@ -386,7 +391,8 @@ class GraphicsView(QGraphicsView):
             obj = it.object()
             if obj is None or obj.isLocked() or not obj.isSelected():
                 continue
-            if getattr(obj, "kind", lambda: "")() != "xy":
+            kind = getattr(obj, "kind", lambda: "")()
+            if kind not in ("xy", "circle"):
                 continue
             lay = obj.layout()
             for t in lay["texts"]:
@@ -394,10 +400,20 @@ class GraphicsView(QGraphicsView):
                 d = math.hypot(sc.x() - pos.x(), sc.y() - pos.y())
                 if d <= bestDist:
                     bestDist = d
-                    a = abs(t["angle"] % 180.0)
-                    axis = "y" if abs(a - 90.0) < 1.0 else "x"
-                    best = (obj, axis)
+                    if kind == "circle":
+                        best = (obj, "rot")
+                    else:
+                        a = abs(t["angle"] % 180.0)
+                        axis = "y" if abs(a - 90.0) < 1.0 else "x"
+                        best = (obj, axis)
         return best
+
+    @staticmethod
+    def _dimCursorFor(axis: str):
+        """拖动轴→光标（rot 是转动，用指针形光标区分于平移）。"""
+        if axis == "rot":
+            return Qt.PointingHandCursor
+        return Qt.SizeVerCursor if axis == "x" else Qt.SizeHorCursor
 
     def _updateDimCursor(self, pos) -> None:
         """悬停读数文字时给出上下/左右可拖光标提示。"""
@@ -406,8 +422,7 @@ class GraphicsView(QGraphicsView):
         hit = self._dimHandleAt(pos)
         if hit is not None:
             self._dimCursorSet = True
-            self.setCursor(Qt.SizeVerCursor if hit[1] == "x"
-                           else Qt.SizeHorCursor)
+            self.setCursor(self._dimCursorFor(hit[1]))
         elif self._dimCursorSet:
             self._dimCursorSet = False
             self.setCursor(Qt.ArrowCursor)
@@ -456,6 +471,16 @@ class GraphicsView(QGraphicsView):
         wp = self.screenToWorld(
             self.viewport().mapFrom(self, event.position().toPoint()))
         self.fileDropped.emit(paths, wp)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        # 双击控制点 → 恢复该点两侧贝塞尔手柄共线（平滑）
+        if event.button() == Qt.LeftButton and self._curveEdit is not None:
+            if self._curveEdit.handleDoubleClick(
+                    self._curveEditAdapter, event.pos(), event.modifiers()):
+                self._boxStart = None
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MiddleButton:
@@ -520,7 +545,8 @@ class GraphicsView(QGraphicsView):
                     self._boxStart = None   # 操作轴拖动优先，禁止残留框选态
                     event.accept()
                     return
-            # XY 标注子标注拖动：已选中标注的读数文字按下即开始（可在 Y/X 向单独拉动）
+            # 标注读数拖动：已选中标注的读数文字按下即开始（XY 子标注单向拉动，
+            # 圆标注绕圆转动直径线）
             hit = self._dimHandleAt(event.pos())
             if hit is not None:
                 obj, axis = hit
@@ -528,10 +554,17 @@ class GraphicsView(QGraphicsView):
                 self._dimDragAxis = axis
                 self._dimStartWorld = self.screenToWorld(event.pos())
                 self._dimStartOx, self._dimStartOy = obj.xyOffsets()
+                if axis == "rot":
+                    # 记下按下点相对圆心的角与当前直径线方向角，拖动量 = 角度差
+                    c = obj.circle()
+                    if c is not None:
+                        self._dimStartAng = math.degrees(math.atan2(
+                            self._dimStartWorld.y - c[1],
+                            self._dimStartWorld.x - c[0]))
+                    self._dimStartOx = obj.diameterAngle()
                 self._doc.beginEdit()
                 self._boxStart = None
-                self.setCursor(Qt.SizeVerCursor if axis == "x"
-                               else Qt.SizeHorCursor)
+                self.setCursor(self._dimCursorFor(axis))
                 event.accept()
                 return
             self._boxStart = event.pos()
@@ -563,9 +596,16 @@ class GraphicsView(QGraphicsView):
             event.accept()
             return
         if self._dimDragObj is not None:
-            # XY 子标注拖动：X 宽标注只取 Y 分量、Y 高标注只取 X 分量
+            # XY 子标注拖动：X 宽标注只取 Y 分量、Y 高标注只取 X 分量；
+            # 圆标注（rot）取拖动点相对圆心的角度增量，驱动直径线转动
             wpt = self.screenToWorld(event.pos())
-            if self._dimDragAxis == "x":
+            if self._dimDragAxis == "rot":
+                c = self._dimDragObj.circle()
+                if c is not None:
+                    ang = math.degrees(math.atan2(wpt.y - c[1], wpt.x - c[0]))
+                    self._dimDragObj.setDiameterAngle(
+                        self._dimStartOx + (ang - self._dimStartAng))
+            elif self._dimDragAxis == "x":
                 oy = self._dimStartOy - (wpt.y - self._dimStartWorld.y)
                 self._dimDragObj.setXYOffset(self._dimStartOx, oy)
             else:
@@ -709,9 +749,10 @@ class GraphicsView(QGraphicsView):
         """左键点选：空白清选；Ctrl 切换、Shift 加选（同原版选择约定）。
 
         锁定对象（含所在图层被锁定）不可被点选：与操作轴/变换/框选的
-        排除规则一致，避免“选中了却没有操作轴”的困惑。"""
-        item = None
-        # 从顶层往下找第一个可选中图元（坐标轴等参考线不可选中，需跳过；
+        排除规则一致，避免“选中了却没有操作轴”的困惑。
+        同一位置命中 ≥2 条曲线时弹出候选菜单（仿 Rhino），点选其一。"""
+        cands = []   # [(图元, 文档对象或 None)]
+        # 从顶层往下收集可选中图元（坐标轴等参考线不可选中，需跳过；
         # 隐藏图层图元不可选中）
         for it in self.items(pos):
             if not it.isVisible():
@@ -720,16 +761,24 @@ class GraphicsView(QGraphicsView):
                 continue
             # 图元映射到文档对象：锁定对象跳过（等同未点中，继续找下层图元）
             oid = it.objectId() if hasattr(it, "objectId") else None
-            if oid is not None:
-                obj = self._doc.object(oid) if self._doc is not None else None
-                if obj is not None and obj.isLocked():
-                    continue
-            item = it
-            break
+            obj = self._doc.object(oid) if (self._doc is not None and oid) else None
+            if obj is not None and obj.isLocked():
+                continue
+            cands.append((it, obj))
         scene = self.scene()
-        if item is None:
+        if not cands:
             scene.clearSelection()
             return
+        item = cands[0][0]
+        curves = [(it, obj) for it, obj in cands if isCurveLike(obj)]
+        if len(curves) >= 2:
+            chosen, shown = pickFromMenu(
+                self, self.viewport().mapToGlobal(pos),
+                [obj for _it, obj in curves])
+            if shown:
+                if chosen is None:
+                    return      # 用户在候选菜单中取消：保持原选择不变
+                item = next(it for it, obj in curves if obj is chosen)
         if mods & Qt.KeyboardModifier.ControlModifier:
             item.setSelected(not item.isSelected())
         elif mods & Qt.KeyboardModifier.ShiftModifier:
@@ -807,27 +856,105 @@ class GraphicsView(QGraphicsView):
             p = obj.position()
             return wr.adjusted(-pad, -pad, pad, pad).contains(
                 QPointF(p.x, p.y))
+        if obj.type() == ObjectType.DIMENSION:
+            return self._dimensionInRect(obj, wr, leftToRight)
         pts = obj.points() if hasattr(obj, "points") else None
+        if (pts is None or len(pts) < 2):
+            # 圆/弧/椭圆等解析对象没有顶点列表：按真实轮廓采样判定，
+            # 否则只能用包围盒——会在圆内部框选时误判"相交"而选中整圆。
+            pts = self._outlinePoints(obj)
         if pts is not None and len(pts) >= 2:
             if leftToRight:
-                # 包含选择：全部顶点在框内（同原版逐点判定）
+                # 包含选择：全部轮廓点在框内
                 return all(wr.contains(QPointF(p.x, p.y)) for p in pts)
-            # 相交选择：任一顶点在框内或任一线段与框相交
+            # 相交选择：任一轮廓点在框内或任一线段与框相交
             if any(wr.contains(QPointF(p.x, p.y)) for p in pts):
                 return True
             n = len(pts)
             closed = bool(getattr(obj, "isClosed", lambda: False)())
+            if obj.type() in (ObjectType.CIRCLE, ObjectType.ELLIPSE,
+                              ObjectType.RECTANGLE, ObjectType.REVCLOUD):
+                closed = True
             segCount = n if closed else n - 1
             for i in range(segCount):
                 if _segIntersectsRect(pts[i], pts[(i + 1) % n], wr):
                     return True
             return False
-        # 圆/弧/椭圆等解析对象：按包围盒判定（近似，同原版 3D 选择器做法）
+        # 兜底（图片/标注等无轮廓采样的对象）：按包围盒判定
         bb = obj.getBoundingBox()
         if not bb.isValid():
             return False
         br = QRectF(QPointF(bb.min.x, bb.min.y), QPointF(bb.max.x, bb.max.y))
         return wr.contains(br) if leftToRight else bool(wr.intersects(br))
+
+    def _dimensionInRect(self, obj, wr: QRectF, leftToRight: bool) -> bool:
+        """标注的框选命中判定：只用真实绘制几何（尺寸线/延伸线/箭头 +
+        读数文字），不含被测区域的“空白外框”。
+
+        标注对象的 points()/包围盒是整个外框（覆盖曲线区域），旧逻辑把
+        它当实心矩形：只要框落在外框范围内就会选中标注，哪怕根本没有碰到
+        任何尺寸线/文字。改按与点选 shape() 一致的线条/文字几何判定：左→右
+        包含=全部几何点入框；右→左相交=任一点入框或任一线段穿框。"""
+        pts, segs = [], []
+        try:
+            lines = obj.layout().get("lines", [])
+        except Exception:
+            lines = []
+        for seg in lines:
+            if len(seg) == 6:          # Z 标注：带 z 的分段，XY 投影参与判定
+                x1, y1, _z1, x2, y2, _z2 = seg
+            else:
+                x1, y1, x2, y2 = seg
+            pts.append((x1, y1))
+            pts.append((x2, y2))
+            segs.append(((x1, y1), (x2, y2)))
+        try:
+            tbounds = obj.textBounds()
+        except Exception:
+            tbounds = []
+        for x0, y0, x1, y1 in tbounds:
+            pts += [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            segs += [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
+                     ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))]
+        if not pts:
+            bb = obj.getBoundingBox()
+            if not bb.isValid():
+                return False
+            br = QRectF(QPointF(bb.min.x, bb.min.y),
+                        QPointF(bb.max.x, bb.max.y))
+            return wr.contains(br) if leftToRight else bool(wr.intersects(br))
+        if leftToRight:
+            return all(wr.contains(QPointF(px, py)) for px, py in pts)
+        if any(wr.contains(QPointF(px, py)) for px, py in pts):
+            return True
+        return any(_segIntersectsRect(Point3D(a[0], a[1], 0.0),
+                                      Point3D(b[0], b[1], 0.0), wr)
+                   for a, b in segs)
+
+    @staticmethod
+    def _outlinePoints(obj):
+        """对象真实轮廓的采样点（世界坐标）；无法采样返回 None。"""
+        try:
+            fn = getattr(obj, "getSampledPoints", None)
+            if callable(fn):
+                pts = list(fn())
+                if len(pts) >= 2:
+                    return pts
+        except Exception:
+            pass
+        try:
+            fn = getattr(obj, "toPolycurve", None)
+            if callable(fn):
+                pts = []
+                for seg in fn().segments():
+                    for p in seg.get("points", []):
+                        pts.append(Point3D(p[0], p[1],
+                                           p[2] if len(p) > 2 else 0.0))
+                if len(pts) >= 2:
+                    return pts
+        except Exception:
+            pass
+        return None
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         angle = event.angleDelta().y() / 120.0

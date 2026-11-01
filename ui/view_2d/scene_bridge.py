@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QGraphicsScene
 
 from core.document import Document
 from core.vector.geometry_types import ObjectType
+from ui.view_3d._renderdbg import dbg, vdbg
 from .item_factory import createItem, updateItem
 from .items.base_item import BaseGraphicsItem
 
@@ -96,6 +97,8 @@ class SceneBridge:
                     o.setSelected(want)
             self._lastDocSelIds = selIds
             if changed:
+                from ui.view_3d._renderdbg import dbg
+                dbg(f"bridge scene->doc sel {len(selIds)}")
                 self._doc.selectionChanged.emit()
         finally:
             self._syncing = False
@@ -123,6 +126,7 @@ class SceneBridge:
         item.setVisible(self._itemVisible(obj))
         self._items[oid] = item
         self._scene.addItem(item)
+        dbg(f"bridge add {oid} {obj.type().name}")
 
     def _layerVisible(self, obj) -> bool:
         """对象所在图层是否可见（图层不存在视为可见，兼容旧数据）。
@@ -157,13 +161,47 @@ class SceneBridge:
 
     def _onRemoved(self, oid: str) -> None:
         item = self._items.pop(oid, None)
-        if item is not None:
+        if item is None:
+            return
+        dbg(f"bridge remove {oid} sel={item.isSelected()} "
+            f"sceneSel={len(self._scene.selectedItems())}")
+        # 先取消选中再移出场景：removeItem 若在图元仍选中时触发 selectionChanged，
+        # Qt 正处在选中集迭代中，回调里再改选择集/重建图元会原生崩溃
+        self._syncing = True
+        try:
+            if item.isSelected():
+                item.setSelected(False)
             self._scene.removeItem(item)
+        finally:
+            self._syncing = False
 
     def _onChanged(self, oid: str) -> None:
         item = self._items.get(oid)
         obj = self._doc.object(oid)
         if item is not None and obj is not None:
+            # 对象被同 id 就地换实现（圆非等比缩放 → 椭圆）：图元绑的是旧实例，
+            # 必须按新类型重建（updateItem 只刷 path，不改 item._obj）
+            bound = item.object() if hasattr(item, "object") else None
+            if bound is not obj:
+                wasSel = item.isSelected()
+                self._syncing = True
+                try:
+                    if wasSel:
+                        item.setSelected(False)
+                    self._scene.removeItem(item)
+                finally:
+                    self._syncing = False
+                self._items.pop(oid, None)
+                self._onAdded(oid)
+                newItem = self._items.get(oid)
+                if newItem is not None:
+                    if wasSel:
+                        newItem.setSelected(True)
+                    newItem.setVisible(self._itemVisible(obj))
+                return
+            # 逐事件流水（笔刷期每个 objectChanged 一行）：默认不写盘，
+            # 否则每帧几次 flush 会把鼠标事件链拖住
+            vdbg(f"bridge update {oid} {obj.type().name}")
             updateItem(item, obj, self._viewScale)
             item.setVisible(self._itemVisible(obj))
 

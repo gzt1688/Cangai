@@ -13,6 +13,7 @@ if _HERE not in sys.path:
 
 CMD = "cookie_cutter.create"
 RELIEF_CMD = "cookie_cutter.biscuit_relief"
+SILICONE_CMD = "cookie_cutter.silicone_rim"
 GROUP = "模具"
 
 # 移植自 Rhino 插件 Model 的 4 个模具功能（月饼曲线/拉伸 + 饼干曲线/拉伸）
@@ -38,6 +39,11 @@ def register(api):
     except Exception as e:      # 新版文件缺失时只丢这一个功能
         print(f"[cookie_cutter] 浮雕饼干模块不可用: {e}")
         BiscuitReliefCommand = None
+    try:
+        from relief_silicone_rim import SiliconeRimCommand
+    except Exception as e:      # 新版文件缺失时只丢这一个功能
+        print(f"[cookie_cutter] 硅胶外围模块不可用: {e}")
+        SiliconeRimCommand = None
 
     api.registerCommand(
         CMD, CookieCutterCommand,
@@ -89,6 +95,21 @@ def register(api):
                 icon="")
         except Exception as e:
             print(f"[cookie_cutter] 浮雕饼干注册失败（不影响其它按钮）: {e}")
+    if SiliconeRimCommand is not None:
+        try:
+            api.registerCommand(
+                SILICONE_CMD, SiliconeRimCommand,
+                {"title": "硅胶外围", "group": GROUP,
+                 "description": "选中/点选闭合曲线 → 外偏距离内整体相对抬升"
+                                "（垫底），再往外的外沿环带绝对冲压到"
+                                "模型最高点+壁顶加高"})
+            api.registerToolButton(
+                key=SILICONE_CMD, label="硅胶外围", group=GROUP,
+                tooltip="选闭合曲线 → 外偏内垫底（相对冲压），"
+                        "外沿环带冲到模型最高点+加高值",
+                icon="")
+        except Exception as e:
+            print(f"[cookie_cutter] 硅胶外围注册失败（不影响其它按钮）: {e}")
 
 
 def unregister(api):

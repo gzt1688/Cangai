@@ -34,14 +34,17 @@ from ..param_panels import (ChamferParamPanel, TrimParamPanel, ArrayParamPanel,
                             OffsetParamPanel, MirrorParamPanel,
                             ExtendParamPanel, CloseParamPanel,
                             OutlineParamPanel, AlignParamPanel,
-                            BridgeParamPanel)
+                            BBoxParamPanel, BridgeParamPanel)
 from core.vector.bridge_geometry import locatorCrossings, splitPolyline
 from core.vector.array_generator import (rectangularArray, circularArray,
                                           curveArray, getObjectsCenter)
 from core.vector.mirror_geometry import mirrorObject
-from core.vector.join_geometry import (joinObjects, _segmentsOf as _objToSegments)
+from core.vector.join_geometry import (joinObjects, explodeObject,
+                                      _segmentsOf as _objToSegments)
 from core.vector.extend_geometry import extendObject
 from core.vector.close_geometry import closingSegmentFor
+from core.vector.transform_geometry import scaleObjectAround
+from core.vector.object_factory import createFromType
 from core.vector.outline_geometry import (computeOuterOutline,
                                           RegionFinder,
                                           simplifyPolyline,
@@ -518,6 +521,73 @@ class JoinCommand(CommandInstance):
                 f"已组合：生成 {nNew} 条多段线，移除 {nDel} 个原对象")
         finally:
             self._doc.endEdit()
+        self.finish()
+
+    def onMousePress(self, wp, mods) -> None:
+        pass
+
+    def onMouseMove(self, wp, mods) -> None:
+        pass
+
+
+class ExplodeCommand(CommandInstance):
+    """炸开：把选中的组合（多段曲线）拆回独立曲线，是“组合”的逆操作。
+    工具栏“组合”按钮右键触发；一次性动作，拆分后立即结束。
+    """
+
+    def name(self) -> str:
+        return "Explode"
+
+    def commandTitle(self) -> str:
+        return "炸开"
+
+    def prompt(self) -> str:
+        return "提示信息显示区"
+
+    def showSnapHints(self) -> bool:
+        return False
+
+    def start(self) -> None:
+        if self._doc is None:
+            self.finish()
+            return
+        sel = self._doc.selectedObjects()
+        polys = [o for o in sel if o.type() == ObjectType.POLYCURVE]
+        if not polys:
+            self._manager.notifyResult("炸开：请先选中已组合的多段曲线")
+            self.finish()
+            return
+        groups = []
+        for poly in polys:
+            parts = explodeObject(poly)
+            if parts:
+                groups.append((poly, parts))
+        if not groups:
+            self._manager.notifyResult("炸开：选中的多段曲线没有可拆分的段")
+            self.finish()
+            return
+        nNew = 0
+        nLine = 0
+        self._doc.beginEdit()
+        try:
+            for poly, parts in groups:
+                for o in parts:
+                    self._doc.addObject(o)
+                    nNew += 1
+                    if o.type() == ObjectType.LINE:
+                        nLine += 1
+                self._doc.removeObject(poly.id())
+        finally:
+            self._doc.endEdit()
+        self._doc.clearSelection()
+        for _poly, parts in groups:
+            for o in parts:
+                self._doc.selectObject(o.id(), append=True)
+        # 结果里带上类型统计：若用户看到的仍像曲线，可一眼区分是“类型判断”
+        # 还是“旧进程未加载新代码”
+        self._manager.notifyResult(
+            f"已炸开：{len(groups)} 条组合 → {nNew} 个对象"
+            f"（直线 {nLine} / 曲线 {nNew - nLine}）")
         self.finish()
 
     def onMousePress(self, wp, mods) -> None:
@@ -1266,11 +1336,12 @@ class OutlineCommand(CommandInstance):
 
     def onRightClick(self, wp: Point3D) -> bool:
         if self._mode == "inner":
-            # 内轮廓：右键结束命令（返回 False → 由调度中心取消）
-            return False
-        # 外轮廓：右键 = 确认生成（原有逻辑）
-        if self._apply():
+            # 内轮廓：右键 = 确认结束（已提取的轮廓保留，面板收起）
             self.finish()
+            return True
+        # 外轮廓：右键 = 确认（无论是否成功生成都结束并收起面板）
+        self._apply()
+        self.finish()
         return True
 
     # ---------- 计算与预览 ----------
@@ -1393,6 +1464,7 @@ class OutlineCommand(CommandInstance):
         if self._doc is None:
             return False
         results = self._compute()
+        dist = self._panel.distance() if self._panel is not None else 0.0
         if not results:
             self._manager.notifyResult("外轮廓：未能生成包裹线（请检查选中曲线与距离）")
             return False
@@ -1470,6 +1542,157 @@ def _unionBBox(a: BoundingBox3D, b: BoundingBox3D) -> BoundingBox3D:
     return BoundingBox3D(
         Point3D(min(a.min.x, b.min.x), min(a.min.y, b.min.y), min(a.min.z, b.min.z)),
         Point3D(max(a.max.x, b.max.x), max(a.max.y, b.max.y), max(a.max.z, b.max.z)))
+
+
+class BBoxCommand(CommandInstance):
+    """包围盒命令（工具栏"包围盒"按钮）。
+
+    选中任意条曲线（不要求闭合/相交）→ 取全部选中对象的联合包围盒 →
+    向外偏移"包围盒距离"（默认 0 = 紧贴）→ 四角按"倒角半径"圆角（默认 3，
+    0 = 直角，自动收敛到短边一半）→ 实时预览 → 确定/右键生成一条闭合多段线。
+    不选中则以提示结束。
+    """
+
+    # 圆角离散的最大矢高（mm）：与偏移圆角同一平滑取向，肉眼看不出棱
+    _FILLET_SAG = 0.02
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._panel = None
+        self._targets = []
+
+    def name(self) -> str:
+        return "BBox"
+
+    def commandTitle(self) -> str:
+        return "包围盒"
+
+    def prompt(self) -> str:
+        return "设置包围盒距离与倒角半径，预览确认后右键/确定生成，Esc 取消"
+
+    def showSnapHints(self) -> bool:
+        return False
+
+    def start(self) -> None:
+        super().start()
+        if self._doc is None:
+            self.finish()
+            return
+        self._targets = [o for o in self._doc.selectedObjects()
+                         if o.type() != ObjectType.SURFACE and not o.isLocked()]
+        if not self._targets:
+            self._manager.notifyResult("包围盒：请先选中曲线")
+            self.finish()
+
+    def paramPanel(self):
+        if self._panel is None:
+            self._panel = BBoxParamPanel()
+            self._panel.paramsChanged.connect(self._refreshPreview)
+            self._panel.confirmed.connect(self._onConfirmed)
+            self._panel.cancelRequested.connect(self.cancel)
+            self._refreshPreview()
+        return self._panel
+
+    # ---------- 面板槽 ----------
+
+    def _onConfirmed(self) -> None:
+        if self._apply():
+            self.finish()
+
+    def onMouseMove(self, wp, mods) -> None:
+        pass
+
+    def onMousePress(self, wp, mods) -> None:
+        pass
+
+    def onRightClick(self, wp: Point3D) -> bool:
+        """右键 = 确认：生成矩形并结束命令（面板随之收起）。"""
+        self._apply()
+        self.finish()
+        return True
+
+    # ---------- 计算与执行 ----------
+
+    def _rectPoints(self) -> Optional[List[Point3D]]:
+        """选中对象的联合包围盒 → 闭合轮廓点列（逆时针）；无效返回 None。
+
+        倒角半径 ≥ 短边一半时退化为“胶囊”（短边整端被半圆取代）；
+        半径为 0 时就是原来的直角矩形四角点。
+        """
+        bbox = None
+        for o in self._targets:
+            b = o.getBoundingBox()
+            if b is not None and b.isValid():
+                bbox = b if bbox is None else _unionBBox(bbox, b)
+        if bbox is None:
+            return None
+        d = max(0.0, float(self._panel.distance())) if self._panel is not None else 0.0
+        x0, y0 = bbox.min.x - d, bbox.min.y - d
+        x1, y1 = bbox.max.x + d, bbox.max.y + d
+        w, h = x1 - x0, y1 - y0
+        if w < 1e-9 or h < 1e-9:
+            return None
+        z = float(bbox.min.z)
+        fr = self._panel.filletRadius() if self._panel is not None else 0.0
+        r = max(0.0, min(float(fr), min(w, h) * 0.5))
+        if r < 1e-9:
+            return [Point3D(x0, y0, z), Point3D(x1, y0, z),
+                    Point3D(x1, y1, z), Point3D(x0, y1, z)]
+        # 逆时针从右下角起：每角一段 1/4 圆弧（起点角 -90/0/90/180）
+        corners = ((x1 - r, y0 + r, -90.0), (x1 - r, y1 - r, 0.0),
+                   (x0 + r, y1 - r, 90.0), (x0 + r, y0 + r, 180.0))
+        n = self._arcSegments(r)
+        pts: List[Point3D] = []
+        for ccx, ccy, a0 in corners:
+            for k in range(n + 1):
+                a = math.radians(a0 + 90.0 * k / n)
+                pts.append(Point3D(ccx + r * math.cos(a), ccy + r * math.sin(a), z))
+        return pts
+
+    @classmethod
+    def _arcSegments(cls, r: float) -> int:
+        """1/4 圆弧的离散段数：按矢高 ≤ _FILLET_SAG 自适应（限 4..36 段）。
+
+        半径越大段数越多，小圆角不会白白堆控制点。"""
+        if r <= 1e-9:
+            return 1
+        step = math.acos(max(-1.0, min(1.0, 1.0 - cls._FILLET_SAG / r)))
+        n = int(math.ceil((math.pi / 2) / step)) if step > 1e-9 else 36
+        return min(36, max(4, n))
+
+    def _refreshPreview(self) -> None:
+        path = QPainterPath()
+        pts = self._rectPoints()
+        if pts is not None:
+            path.moveTo(pts[0].x, pts[0].y)
+            for p in pts[1:]:
+                path.lineTo(p.x, p.y)
+            path.closeSubpath()
+        self._setPreviewPath(path, solid=True)
+
+    def _apply(self) -> bool:
+        if self._doc is None:
+            return False
+        pts = self._rectPoints()
+        if pts is None:
+            self._manager.notifyResult(
+                "包围盒：未能生成矩形（请确认已选中曲线，且包围盒不是零尺寸）")
+            return False
+        self._doc.beginEdit()
+        try:
+            line = LineObject(pts)
+            line.setClosed(True)
+            self._doc.addObject(line)
+        finally:
+            self._doc.endEdit()
+        d = self._panel.distance() if self._panel is not None else 0.0
+        fr = self._panel.filletRadius() if self._panel is not None else 0.0
+        if fr < 1e-9:
+            self._manager.notifyResult("包围盒：已生成包围盒矩形（距离 %.3f，直角）" % d)
+        else:
+            self._manager.notifyResult(
+                "包围盒：已生成包围盒矩形（距离 %.3f，倒角 %.3f）" % (d, fr))
+        return True
 
 
 class AlignCommand(CommandInstance):
@@ -1763,11 +1986,32 @@ class _PanelXformBase(CommandInstance):
         self._editActive: bool = False          # doc.beginEdit() 是否已调用（endEdit 前保持 True）
         self._prevDelta: Optional[tuple] = None # 上一次预览参数（用于反向抵消）
         self._editKind: str = ""                # "move" / "rotate" / "scale"
+        # 缩放中心模式（变换面板“变换中心：整体/各自”）：由主窗口在命令启动后注入。
+        # individual=True 时每个对象绕自身包围盒中心缩放（仅缩放类使用）。
+        self._scaleCenterMode: str = "overall"
+        self._centerIndividual: bool = False
         # 每个对象进入变换阶段时的几何快照（obj.id() → obj.serialize()），
         # 取消时用 deserialize 直接回到命令前的状态，避免 N 次反向 translate 的浮点误差。
         self._geoSnap: dict = {}
 
     # ---------- 选中 ----------
+
+    def setCenterMode(self, mode: str) -> None:
+        """注入变换中心模式（"overall"/"individual"），缩放类命令按需读取。"""
+        self._scaleCenterMode = "individual" if mode == "individual" else "overall"
+
+    def _scaleCenter(self, obj, fallback):
+        """单个对象的缩放中心：各自模式取其自身包围盒中心，否则用 fallback（整体中心）。"""
+        if not self._centerIndividual:
+            return fallback
+        try:
+            bb = obj.getBoundingBox()
+        except Exception:
+            return fallback
+        if not bb.isValid():
+            return fallback
+        c = bb.center()
+        return Point3D(c.x, c.y, c.z)
 
     def _unlockedSelected(self) -> List:
         return [o for o in self._selectedObjects if not o.isLocked()]
@@ -1851,6 +2095,14 @@ class _PanelXformBase(CommandInstance):
             snap = self._geoSnap.get(o.id())
             if snap is None:
                 continue
+            # 缩放可能把圆换成椭圆（类型变了）：按快照类型重建，不能 deserialize
+            if snap.get("type") and snap["type"] != o.type().name \
+                    and self._doc is not None:
+                newObj = createFromType(snap["type"])
+                if newObj is not None:
+                    newObj.deserialize(snap)
+                    self._doc.replaceObject(o.id(), newObj)
+                    continue
             try:
                 o.deserialize(snap)
             except Exception:
@@ -1902,17 +2154,17 @@ class _PanelXformBase(CommandInstance):
             k, cx, cy, cz = delta
             if abs(k) > 1e-12:
                 inv = 1.0 / k
-                c = Point3D(cx, cy, cz)
                 for o in objs:
-                    o.scaleAround(inv, inv, inv, c)
+                    c = self._scaleCenter(o, Point3D(cx, cy, cz))
+                    scaleObjectAround(o, inv, inv, inv, c, self._doc)
         elif self._editKind == "scale3":
             sx, sy, sz, cx, cy, cz = delta
-            c = Point3D(cx, cy, cz)
             ix = 1.0 / sx if abs(sx) > 1e-12 else 1.0
             iy = 1.0 / sy if abs(sy) > 1e-12 else 1.0
             iz = 1.0 / sz if abs(sz) > 1e-12 else 1.0
             for o in objs:
-                o.scaleAround(ix, iy, iz, c)
+                c = self._scaleCenter(o, Point3D(cx, cy, cz))
+                scaleObjectAround(o, ix, iy, iz, c, self._doc)
 
     def _applyDelta(self, delta) -> None:
         """按新 delta 对真实对象施加变换（调用方先 _invertPrev）。
@@ -1934,14 +2186,14 @@ class _PanelXformBase(CommandInstance):
                 o.rotateAround(angle, c)
         elif self._editKind == "scale":
             k, cx, cy, cz = delta
-            c = Point3D(cx, cy, cz)
             for o in objs:
-                o.scaleAround(k, k, k, c)
+                c = self._scaleCenter(o, Point3D(cx, cy, cz))
+                scaleObjectAround(o, k, k, k, c, self._doc)
         elif self._editKind == "scale3":
             sx, sy, sz, cx, cy, cz = delta
-            c = Point3D(cx, cy, cz)
             for o in objs:
-                o.scaleAround(sx, sy, sz, c)
+                c = self._scaleCenter(o, Point3D(cx, cy, cz))
+                scaleObjectAround(o, sx, sy, sz, c, self._doc)
         # 通知 2D/3D 场景：这些对象几何变了，该重画/重算 path
         if self._doc is not None:
             for o in objs:
@@ -2357,6 +2609,8 @@ class PanelScaleCommand(_PanelXformBase):
         self._kbInput: str = ""             # 键盘输入目标长度缓冲
         self._panel = None
         self._mode: str = "point"           # "point" 三点缩放 / "object" 对象模式
+        # 点模式以用户拾取的 P1 为中心（显式指定），不跟随面板“整体/各自”
+        self._centerIndividual = False
         # 对象模式需要跟随选择变化刷新基准对象下拉
         if self._doc is not None:
             self._doc.selectionChanged.connect(self._onDocSelChanged)
@@ -2424,6 +2678,7 @@ class PanelScaleCommand(_PanelXformBase):
         self._p1 = self._p2 = self._p3 = None
         self._cursor = None
         self._kbInput = ""
+        self._centerIndividual = False
         self._cancelLiveEdit()
         self._setPreviewPath(QPainterPath())
         self._hideCursorMarker()
@@ -2495,6 +2750,8 @@ class PanelScaleCommand(_PanelXformBase):
         sx, sy, sz = factors
         center = Point3D((bb.min.x + bb.max.x) * 0.5,
                          (bb.min.y + bb.max.y) * 0.5, 0.0)
+        # 对象模式没有用户拾取的中心：跟随变换面板“整体 / 各自”
+        self._centerIndividual = self._scaleCenterMode == "individual"
         self._startLiveEdit("scale3")
         if not self._editActive:
             self._msg = "缩放事务启动失败"
@@ -3015,10 +3272,12 @@ def registerAll(manager) -> None:
     manager.register("Group", GroupCommand)
     manager.register("Ungroup", UngroupCommand)
     manager.register("Join", JoinCommand)
+    manager.register("Explode", ExplodeCommand)
     manager.register("Mirror", MirrorCommand)
     manager.register("Extend", ExtendCommand)
     manager.register("ClosePath", CloseCommand)
     manager.register("Outline", OutlineCommand)
+    manager.register("BBox", BBoxCommand)
     manager.register("Align", AlignCommand)
     manager.register("Bridge", BridgeCommand)
     manager.register("PanelMove", PanelMoveCommand)
@@ -4028,7 +4287,10 @@ class ArrayCommand(CommandInstance):
         return "阵列参数"
 
     def showSnapHints(self) -> bool:
-        return False
+        # 仅拾取圆心时开启对象捕捉：显示圆心/端点/中点等气泡标记，
+        # 方便对齐已有圆的圆心或其它特征点；选对象阶段交给画布点选，
+        # 不显示气泡以免干扰。
+        return self._pickState == "waitCenter"
 
     def start(self) -> None:
         super().start()
@@ -4071,7 +4333,7 @@ class ArrayCommand(CommandInstance):
             return "选择要阵列的对象（已选中对象自动使用），或点击拾取"
         if self._pickState == "waitCurve":
             return "拾取路径曲线"
-        return "调节参数后点击\"确认执行\"，右键退出"
+        return "调节参数后点击\"确认执行\"或右键生成阵列并结束"
 
     def paramPanel(self):
         if self._panel is None:
@@ -4173,16 +4435,24 @@ class ArrayCommand(CommandInstance):
         self._setPreviewPath(previewPath)
 
     def _rectOffsets(self, objs) -> list:
-        """计算矩形阵列的偏移列表 [(dx,dy,dz,angle)]。"""
+        """计算矩形阵列的偏移列表 [(dx,dy,dz,angle)]，并刷新“总尺寸”信息显示。"""
         from core.vector.array_generator import getObjectsBBox
         bb = getObjectsBBox(objs)
         if not bb.isValid():
+            self._panel.setRectTotal("总尺寸：—")
             return []
         stepX = bb.width() + self._panel.rectGapX()
         stepY = bb.height() + self._panel.rectGapY()
+        nx = self._panel.rectX()
+        ny = self._panel.rectY()
+        # 阵列后总体尺寸 = 单体尺寸 + (数量-1) × 步距（步距 = 单体尺寸 + 间距）
+        totalX = bb.width() + (nx - 1) * stepX
+        totalY = bb.height() + (ny - 1) * stepY
+        self._panel.setRectTotal(
+            "总尺寸：%.2f × %.2f  (%d×%d)" % (totalX, totalY, nx, ny))
         offsets = []
-        for i in range(self._panel.rectX()):
-            for j in range(self._panel.rectY()):
+        for i in range(nx):
+            for j in range(ny):
                 if i == 0 and j == 0:
                     continue
                 offsets.append((i * stepX, j * stepY, 0.0, 0.0))
@@ -4347,11 +4617,23 @@ class ArrayCommand(CommandInstance):
             self._panel.setXYZ(wp.x, wp.y, wp.z)
 
     def onRightClick(self, wp: Point3D) -> bool:
+        """右键 = 确认执行并结束命令。
+
+        有选中对象时按当前参数生成阵列后结束；**没有任何选中对象时，
+        右键也直接结束命令**（不残留在选取阶段反复提示“选中对象”）。
+        返回 True 使调度中心不再走默认 cancelActive。
+        """
         self._executeArray()
+        if self.isAlive():
+            # 无对象/无面板等 _executeArray 未收尾的情况：右键同样结束命令
+            self.finish()
         return True
 
     def onEnter(self) -> bool:
         self._executeArray()
+        if self.isAlive():
+            # 无对象等未收尾情况：回车也结束命令
+            self.finish()
         return True
 
     # ---------- 拾取 ----------
@@ -4473,9 +4755,10 @@ class OffsetCommand(CommandInstance):
     """偏移命令：将选中曲线沿法线方向偏移一定距离生成平行曲线。
 
     交互流程：
-    1. 选中要偏移的对象（或启动后点击拾取）
+    1. 选中要偏移的对象（或启动后左键点击拾取）
     2. 面板输入偏移距离，鼠标移动决定偏移方向，实时预览
-    3. 点击确认生成偏移对象，右键退出
+    3. 左键 = 确认（生成偏移对象但不退出，可接着偏移下一条）；
+       右键 = 确认并退出；Esc = 取消
     """
 
     def name(self) -> str:
@@ -4507,7 +4790,7 @@ class OffsetCommand(CommandInstance):
             return self._msg
         if not self._selectedObjects:
             return "选择要偏移的对象，或点击拾取"
-        return "移动鼠标定方向，点击确认偏移，右键退出"
+        return "移动鼠标定方向，左键确认（继续偏移），右键确认并退出"
 
     def paramPanel(self):
         if self._panel is None:
@@ -4610,14 +4893,19 @@ class OffsetCommand(CommandInstance):
             if paths is None:
                 self._msg = "pyclipper 未安装，已回退旧偏移（pip install pyclipper）"
             elif paths:
-                from core.vector.poly_curve_object import PolyCurveObject
+                # Clipper 偏移输出本质是折线：用 LineObject(闭合) 承载，
+                # 每个顶点都是可编辑控制点。PolyCurve 无 inputPoints 时只暴露
+                # 首尾两点（闭合时重合→看似只剩 1 个），且拖动会被重拟合为样条，
+                # 不适合承载折线偏移结果。
                 for pts in paths:
-                    poly = PolyCurveObject()
-                    poly.addSegment(
-                        {"points": [[p.x, p.y, p.z] for p in pts]})
-                    poly._color = obj._color
-                    poly._lineWidth = obj._lineWidth
-                    results.append(poly)
+                    vp = list(pts)
+                    if len(vp) >= 2 and vp[0].distanceTo(vp[-1]) < 1e-9:
+                        vp.pop()          # 去重复闭合末点，靠 setClosed 表意
+                    line = LineObject(vp)
+                    line.setClosed(True)
+                    line._color = obj._color
+                    line._lineWidth = obj._lineWidth
+                    results.append(line)
                 return results
 
         # 单侧 / 双侧不加盖：平行偏移线（原有逻辑）
@@ -4878,10 +5166,18 @@ class OffsetCommand(CommandInstance):
             else:
                 self._msg = "未拾取到曲线，请点击要偏移的曲线"
             return
-        # 已有对象：点击确认执行
+        # 左键 = 确认：生成偏移对象但**不退出命令**（可接着拾取下一条继续偏移）；
+        # 右键才是“确认并退出”（见 onRightClick）。无法执行时（距离过小等）
+        # 左键退化为取消，避免命令卡在原地。
         self._cursor = wp
         self._updateLockedSide(wp)
-        self._executeOffset()
+        if not self._executeOffset(keepAlive=True):
+            if self._manager is not None and self._msg:
+                self._manager.notifyResult(self._msg)
+            self.finish()
+            return
+        if self._manager is not None:
+            self._manager.promptChanged.emit(self.prompt())
 
     def onMouseMove(self, wp: Point3D, mods) -> None:
         if self._panel is not None:
@@ -4893,7 +5189,17 @@ class OffsetCommand(CommandInstance):
         self._updatePreview()
 
     def onRightClick(self, wp: Point3D) -> bool:
-        self.finish()
+        """右键 = 确认并退出：按当前方向/距离执行偏移，再结束命令。"""
+        self._cursor = wp
+        if self._selectedObjects:
+            self._updateLockedSide(wp)
+            self._updatePreview()
+        self._executeOffset()
+        if not self.isComplete():
+            # 偏移无法执行（未选中/距离过小）：提示后同样结束，避免命令卡住
+            if self._manager is not None and self._msg:
+                self._manager.notifyResult(self._msg)
+            self.finish()
         return True
 
     def onEnter(self) -> bool:
@@ -4902,23 +5208,38 @@ class OffsetCommand(CommandInstance):
 
     # ---------- 执行 ----------
 
-    def _executeOffset(self) -> None:
+    def _executeOffset(self, keepAlive: bool = False) -> bool:
+        """执行偏移；返回是否真正生成了对象。
+
+        keepAlive=True（左键确认）时命令不结束，并清掉本次选择，下一次左键
+        直接去拾取新曲线；不清文档选择的话，再按右键会走“未拾取→用文档选中集”
+        的兼容分支，把刚偏移过的曲线再偏移一次。
+        """
         if not self._selectedObjects:
             if self._doc is not None:
                 self._selectedObjects = self._doc.selectedObjects()
         if not self._selectedObjects:
             self._msg = "请先选中要偏移的对象"
-            return
+            return False
         dist = self._signedDistance()
         if abs(dist) < 1e-9:
             self._msg = "偏移距离过小"
-            return
+            return False
         for obj in self._selectedObjects:
             for off in self._buildOffsetResults(obj, dist):
                 if self._doc is not None:
                     self._doc.addObject(off)
         self._msg = "偏移完成"
+        if keepAlive:
+            self._selectedObjects = []
+            self._lockedSide = 0
+            self._cursor = None
+            if self._doc is not None:
+                self._doc.clearSelection()
+            self._setPreviewPath(QPainterPath())
+            return True
         self.finish()
+        return True
 
     # ---------- 辅助 ----------
 

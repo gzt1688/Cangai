@@ -363,8 +363,21 @@ class LineCommand(CommandInstance):
                     if len1 > 1e-10 and len2 > 1e-10:
                         cosA = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) /
                                              (len1 * len2)))
-                        # 偏转角 = 180° - 夹角（原版一致）
-                        self._panel.setAngle(180.0 - math.degrees(math.acos(cosA)))
+                        # 读数 = 相对上段前进方向的偏转角（与指定角度输入、
+                        # 角度弧预览同一约定），不再换算成内角
+                        self._panel.setAngle(math.degrees(math.acos(cosA)))
+                elif self._panel.isAngleMode():
+                    # 首段：指定角度以 +X 为基准（见 _constrainedPoint），
+                    # 读数同步显示该偏转角
+                    ax = self._viewAxes()
+                    v2x = self._comp(cursor, ax[0]) - self._comp(last, ax[0])
+                    v2y = self._comp(cursor, ax[1]) - self._comp(last, ax[1])
+                    len2 = math.hypot(v2x, v2y)
+                    if len2 > 1e-10:
+                        cosA = max(-1.0, min(1.0, v2x / len2))
+                        self._panel.setAngle(math.degrees(math.acos(cosA)))
+                    else:
+                        self._panel.setAngle(0.0)
                 else:
                     self._panel.setAngle(0.0)
         self._updatePreviewPath(cursor)
@@ -378,27 +391,34 @@ class LineCommand(CommandInstance):
         # 路径坐标 = 视图平面 (u,v)（顶视/2D 画布即 XY；侧视 XZ/YZ，
         # 由 3D 视口路径分支映射回世界平面）
         path = self._uvPath([pts[-1], cursor])
+        ext = None
         if self._panel is not None and self._panel.isAnglePreviewChecked() \
                 and len(pts) >= 2:
-            self._appendAngleArc(path, *self._planePts(
+            ext = self._appendAngleArc(path, *self._planePts(
                 [pts[-2], pts[-1], cursor]))
         # 预览尾段与已确认段同色（对象色），避免点击落点时青→橙变色闪烁/双线感
         self._setPreviewPath(path, solid=True,
                              color=self._obj.color() if self._obj else None)
+        # 上段延长虚线：把角度弧与上段连起来（否则弧看上去悬空）
+        self._setAuxPreviewPath(ext if ext is not None else QPainterPath())
         # 光标处叠加与点对象同样式的光标点（白底实心圆）
         self._setCursorMarker(cursor)
 
     @staticmethod
     def _appendAngleArc(path: QPainterPath, prev: Point3D, last: Point3D,
-                        cursor: Point3D) -> None:
-        """前段与当前段间的角度弧（原版 updateAngleArcPreview：24 段，
-        半径 = min(两段长, 30) × 0.3，取最短角跨度）。"""
-        v1u, v1v = prev.x - last.x, prev.y - last.y
+                        cursor: Point3D):
+        """角度弧预览：以上段前进方向（延长线）为 0° 基准，画出当前段的
+        偏转角（与"指定角度"输入、面板角度读数同一约定）。半径 =
+        min(两段长, 30) × 0.3，取最短角跨度。
+
+        同时返回"上段延长虚线"路径：从 last 沿上段方向穿过弧起点、再向外
+        延伸一点，避免弧与线段之间看起来悬空。无有效弧时返回 None。"""
+        v1u, v1v = last.x - prev.x, last.y - prev.y
         v2u, v2v = cursor.x - last.x, cursor.y - last.y
         len1 = math.hypot(v1u, v1v)
         len2 = math.hypot(v2u, v2v)
         if len1 < 1e-10 or len2 < 1e-10:
-            return
+            return None
         a1 = math.atan2(v1v, v1u)
         delta = math.atan2(v2v, v2u) - a1
         while delta > math.pi:
@@ -415,6 +435,13 @@ class LineCommand(CommandInstance):
                 path.moveTo(x, y)
             else:
                 path.lineTo(x, y)
+        # 上段延长虚线：到弧起点（半径 r）后再延伸约 40%，让弧“长”在线段上
+        ext = r * 1.4
+        dash = QPainterPath()
+        dash.moveTo(last.x, last.y)
+        dash.lineTo(last.x + ext * math.cos(a1),
+                    last.y + ext * math.sin(a1))
+        return dash
 
     def onRightClick(self, wp: Point3D) -> bool:
         if self._bisectorMode:
@@ -1307,6 +1334,16 @@ class CurveCommand(CommandInstance):
         from core.spline_utils import nurbs_fit_samples
         return nurbs_fit_samples(pts, self._SEG_SAMPLES, closed=closed)
 
+    def _uvSmooth(self, pts) -> QPainterPath:
+        """世界点列→当前视图平面 (u,v) 的平滑预览路径（Catmull-Rom）。
+
+        与固化后文档渲染（item_factory.appendSmooth）同一口径→绘制/预览/确认
+        所见即所得；直线橡皮筋（2 点）自动退化为 lineTo。"""
+        from ui.qt_path import appendSmooth
+        path = QPainterPath()
+        appendSmooth(path, [self._uv(p) for p in pts], move=True)
+        return path
+
     def _incrementalPath(self, cursor: Point3D) -> QPainterPath:
         """预览 = 全局 C2 样条（已放点 + 光标伪点）。
 
@@ -1318,15 +1355,15 @@ class CurveCommand(CommandInstance):
         pts = self._pts
         n = len(pts)
         if n == 0:
-            return self._uvPath([])
+            return self._uvSmooth([])
         if self._closed and n >= 3:
             # 已闭合（按钮/B/吸附回起点）：立即画出闭合腿，与最终固化形状
             # 同一采样口径（周期 C2），所见即所得
-            return self._uvPath(self._c2Samples(list(pts) + [pts[0]],
-                                                closed=True))
+            return self._uvSmooth(self._c2Samples(list(pts) + [pts[0]],
+                                                  closed=True))
         if n == 1:
-            return self._uvPath([pts[0], cursor])   # 直线橡皮筋
-        return self._uvPath(self._c2Samples(list(pts) + [cursor]))
+            return self._uvSmooth([pts[0], cursor])   # 直线橡皮筋
+        return self._uvSmooth(self._c2Samples(list(pts) + [cursor]))
 
     def _updateSnapProxy(self) -> None:
         """同步吸附代理 = 与固化后对象**同类型同几何**的临时对象（不入文档）。

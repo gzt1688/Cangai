@@ -8,7 +8,7 @@ import math
 
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QStackedWidget, QFileDialog, QMessageBox,
-                               QScrollArea, QInputDialog, QSplitter)
+                               QScrollArea, QInputDialog, QSplitter, QMenu)
 from PySide6.QtCore import (Qt, QCoreApplication, QTimer, QEvent, QObject,
                             Signal)
 from PySide6.QtGui import QShowEvent, QKeyEvent, QTransform, QShortcut, QKeySequence, QIcon
@@ -50,7 +50,6 @@ from ui.commands.concrete.cnc_commands import registerAll as registerCnc
 from ui.commands.concrete.revcloud_command import registerAll as registerRevcloud
 
 from ui.commands.concrete.image_command import ImagePlaceCommand
-from ui.commands.concrete.image_trace_command import ImageTraceCommand
 from ui.commands.concrete.plugin_action_command import PluginActionCommand
 from core.api import CangaiAPI
 from core.plugin_manager import PluginManager
@@ -66,11 +65,13 @@ from ui.widgets.left_panel import LeftPanelWidget
 from ui.widgets.layer_panel import LayerPanel
 from ui.widgets.property_panel import PropertyPanel
 from ui.widgets.transform_panel import TransformPanel
+from ui.widgets.material_panel import MaterialPanel
 from ui.widgets.capture_toolbar import CaptureToolbar
 from ui.widgets.view_switch_bar import ViewSwitchBar
 from ui.widgets.canvas_mode_bar import CanvasModeBar
 from ui.widgets.command_param_host import CommandParamHost
 from ui.widgets.file_tab_bar import FileTabBar
+from ui.widgets.ai_chat_panel import AiChatPanel
 from ui.widgets.settings_dialog import SettingsDialog
 from i18n import tr, languageChanged
 
@@ -208,7 +209,8 @@ class MainWindow(QMainWindow):
         registerCnc(self._cm)           # CNC 轮廓铣/口袋/钻孔（复用 pymillcam）
         registerRevcloud(self._cm)      # 修订云线（曲线编辑类目）
         self._cm.register("Image", ImagePlaceCommand)   # 图片放置（参数：路径）
-        self._cm.register("ImageTrace", ImageTraceCommand)   # 图片转线稿
+        # 图片转线稿（ImageTrace）由 ai_lineart 插件注册（含面板与模型权重），
+        # 主程序不再内置；插件未安装时该命令不存在，下面的按钮也不会出现。
         registerDims(self._cm)   # 尺寸标注命令
         self._view.setCommandManager(self._cm)
 
@@ -236,6 +238,8 @@ class MainWindow(QMainWindow):
         self._propertyPanel = PropertyPanel()
         self._transformPanel = TransformPanel()
         self._transformPanel.setDocument(self._doc)
+        self._materialPanel = MaterialPanel()
+        self._materialPanel.setDocument(self._doc)
         self._leftPanel.setCncDocument(self._doc)
         self._captureToolbar = CaptureToolbar()
 
@@ -253,14 +257,24 @@ class MainWindow(QMainWindow):
         self._restartAutosaveTimer()
 
         # 开放平台：API 门面 + 插件装载（UI 就绪后挂宿主，插件按钮/命令即刻生效）
+        from core.api import setApiInstance
         self._api = CangaiAPI()
+        setApiInstance(self._api)          # 全局单例：AI/MCP 工具表取门面
         self._mainThreadInvoker = _MainThreadInvoker(self)
+        # AI 工具主线程调度：桥/工作线程的工具调用据此回主线程执行
+        import core.ai.tools as _aiTools
+        import threading
+        _aiTools.setMainThreadInvoker(
+            self._mainThreadInvoker.post,
+            lambda: threading.current_thread() is threading.main_thread())
         self._plugins = PluginManager(self._api)
         self._api.attachHost(self)
         self._plugins.discover()
         self._plugins.loadAll()
         self._api.events.emit("app.ready", {
             "plugins": [p.pluginId for p in self._plugins.infos() if p.loaded]})
+        # MCP 桥：事件循环就绪后监听本机端口（AI 设置可开关/改端口）
+        QTimer.singleShot(0, self._startAiBridge)
         # 语言变更：级联重绘所有子组件文本
         languageChanged().connect(self.retranslateUi)
         # 注意：重模块预热不在此自动启动，由启动加载页调用
@@ -273,6 +287,15 @@ class MainWindow(QMainWindow):
         刷新加载页进度，避免"启动后直接使用、模块尚未加载导致卡死"。
         """
         self._preloadHeavyModules()
+
+    def _startAiBridge(self) -> None:
+        """启动应用内 MCP 桥（127.0.0.1，供 mcp/cangai_mcp_server.py 连接）。
+        失败静默：不影响软件主功能。"""
+        try:
+            from core.ai.bridge_server import startBridge
+            startBridge()
+        except Exception:
+            pass
 
     def _preloadHeavyModules(self) -> None:
         """全量预热 3D/绘图相关模块（启动加载页期间执行）。
@@ -361,9 +384,17 @@ class MainWindow(QMainWindow):
         self._transformDock.setWindowTitle(tr("变换"))
         self._layerDock.setWindowTitle(tr("图层"))
         self._propDock.setWindowTitle(tr("属性"))
+        if getattr(self, "_materialDock", None) is not None:
+            self._materialDock.setWindowTitle(tr("材质"))
+        # 标题栏"面板"菜单文案跟随对应面板 dock 标题（上面已重设）
+        menu = getattr(self, "_panelsMenu", None)
+        if menu is not None:
+            for act, dock in zip(menu.actions(), self._panelDocks):
+                act.setText(dock.windowTitle())
         # 级联调用各子组件
         for comp in (self._topDock, self._statusBar, self._leftPanel,
                      self._layerPanel, self._transformPanel,
+                     self._materialPanel,
                      self._captureToolbar, self._viewSwitchBar,
                      self._canvasModeBar, self._fileTabBar):
             if hasattr(comp, "retranslateUi"):
@@ -387,6 +418,11 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_dockAdjusted", False):
             self._dockAdjusted = True
             QTimer.singleShot(0, self._adjustDockHeights)
+            # 启动默认焦点：图层树。若不显式指定，Qt 把焦点给到 Tab 链上
+            # 第一个可聚焦控件（材质面板的按钮/数值框）——浮雕快捷键在
+            # 文本控件聚焦时会被主窗口事件过滤器放行不拦截，等于刚启动
+            # 快捷键全部失效。用 0ms 定时器等 dock 布局落定后再设。
+            QTimer.singleShot(0, self._focusLayerPanelOnStart)
             # 注意：不在这里后台预热 build123d/OCC 与 sgl 字体——
             # CPython 导入持 GIL，后台线程导入期间主线程照样冻结
             # （实测 OCP 最长卡 1.7s、sgl 字体持续 220ms×24），
@@ -433,6 +469,18 @@ class MainWindow(QMainWindow):
 
         self._bdPreloader = _Preloader()
         self._bdPreloader.start()
+
+    def _focusLayerPanelOnStart(self) -> None:
+        """启动时把键盘焦点显式给到图层面板的图层树。
+
+        不指定时 Qt 会把焦点给 Tab 链上第一个可聚焦控件（材质面板的
+        预设按钮/数值框）：焦点在文本输入类控件上时全局快捷键（浮雕
+        W/E、B 闭合等）被事件过滤器放行，刚启动就"按键没反应"。
+        图层树是 ClickFocus，吃焦点不碍 Tab 链，快捷键照常派发。
+        此时树若被隐藏（标签未置顶），焦点会在其显示时自动生效。"""
+        tree = getattr(self._layerPanel, "_tree", None)
+        if tree is not None:
+            tree.setFocus(Qt.OtherFocusReason)
 
     def _adjustDockHeights(self) -> None:
         self._leftPanel.setExpandedWidth(240)
@@ -646,6 +694,8 @@ class MainWindow(QMainWindow):
         # 对象与命令预览由视口自行投影绘制；对象变化信号驱动重绘已在视口内连接
         self._viewport3D.setDocument(self._doc)
         self._viewport3D.setCommandManager(self._cm)
+        # 材质面板需触发视口重绘（加载/清除 HDRI 环境图、调环境强度）
+        self._materialPanel.setViewport(self._viewport3D)
         # 活动画布视口探测：命令判断视图方向（3D 前视/右视侧视平面绘制）时
         # 查询 Viewport3D 的 canvasMode/viewMode；上下文 _view 仍是 2D 画布
         self._cm.setViewProbe(self._viewport3D)
@@ -678,6 +728,10 @@ class MainWindow(QMainWindow):
         self._paramHost.hide()
         # 多文件标签栏：画布右下角悬浮（切换/关闭/“＋”新建）
         self._fileTabBar = FileTabBar(canvasContainer)
+        # AI 对话面板（“Ai”按钮弹出）：悬浮在画布右缘，默认隐藏
+        self._aiPanel = AiChatPanel(self, canvasContainer)
+        self._aiPanel.closed.connect(lambda: self._aiPanel.hide())
+        self._aiPanel.hide()
         # 悬浮面板先隐藏，待 _positionViewSwitchBar 首次定位后再显示，
         # 避免主窗口出现时它们在画布左上角闪现一帧。
         self._viewSwitchBar.hide()
@@ -754,6 +808,32 @@ class MainWindow(QMainWindow):
         self._propDock = propDock
         self._dockManager.addDockWidgetTabToArea(propDock, layerDock.dockAreaWidget())
         layerDock.dockAreaWidget().setCurrentIndex(0)
+
+        # 材质面板：独立 dock（与图层/属性同区标签），常驻显示。
+        self._materialPanel.setMinimumWidth(240)
+        self._materialPanel.setMinimumHeight(150)
+        materialDock = CDockWidget(tr("材质"))
+        materialDock.setWidget(self._materialPanel)
+        materialDock.setFeature(F.DockWidgetClosable, False)
+        self._materialDock = materialDock
+        self._dockManager.addDockWidgetTabToArea(materialDock,
+                                                 layerDock.dockAreaWidget())
+        # 属性面板默认隐藏：标题栏"面板"菜单（计算器左边按钮）勾选找回
+        propDock.toggleView(False)
+        # 上面的 setCurrentIndex(0) 在加入材质标签之前执行，而 ADS 加新
+        # 标签会自动切到新标签——启动默认页会变成"材质"。这里重新回到
+        # 图层页（关闭属性后该区标签：图层 / 材质）。
+        layerDock.dockAreaWidget().setCurrentIndex(0)
+
+        # 标题栏"面板"菜单：4 个面板显隐勾选。toggleViewAction 与 dock
+        # 显隐双向同步（勾选即 toggleView，菜单态始终跟手）。
+        self._panelsMenu = QMenu(self)
+        self._panelDocks = (transformDock, layerDock, propDock, materialDock)
+        for _d in self._panelDocks:
+            _act = _d.toggleViewAction()
+            _act.setText(_d.windowTitle())
+            self._panelsMenu.addAction(_act)
+        self._titleBar.setPanelsMenu(self._panelsMenu)
 
         # 初始高度比例：变换在上、图层（含属性 tab）在下，图层面板初始高度加一些
         layerArea = layerDock.dockAreaWidget()
@@ -880,6 +960,7 @@ class MainWindow(QMainWindow):
         self._leftPanel.saveAsRequested.connect(self._onSaveFileAs)
         self._leftPanel.quickSaveRequested.connect(self._onQuickSave)
         self._leftPanel.exportRequested.connect(self._onExport)
+        self._leftPanel.recentOpenRequested.connect(self._onRecentOpen)
         self._leftPanel.calcRequested.connect(self._onCalcCost)
 
         # 多文件标签栏：切换 / 关闭 / ＋新建
@@ -903,6 +984,8 @@ class MainWindow(QMainWindow):
             lambda: self._onPanelXform("PanelRotate"))
         self._transformPanel.scaleRequested.connect(
             lambda: self._onPanelXform("PanelScale"))
+        self._transformPanel.transformCenterModeChanged.connect(
+            self._onTransformCenterModeChanged)
         self._transformPanel.measureRequested.connect(self._onMeasure)
         self._transformPanel.solidDisplayModeRequested.connect(
             self._onSolidDisplayModeRequested)
@@ -917,6 +1000,7 @@ class MainWindow(QMainWindow):
         self._viewSwitchBar.fitAllClicked.connect(self._onFitAll)
         self._viewSwitchBar.viewChanged.connect(self._onViewChanged)
         self._viewSwitchBar.paramPanelClicked.connect(self._onParamBtnClicked)
+        self._viewSwitchBar.mcpPanelClicked.connect(self._onAiPanelToggled)
         # 图片按钮：选图后进入“两点框放”命令
         self._viewSwitchBar.imageSelected.connect(self._onImageSelected)
         self._paramHost.closed.connect(self._paramHost.hide)
@@ -1054,6 +1138,15 @@ class MainWindow(QMainWindow):
         else:
             self._paramHost.hide()
 
+    def _onAiPanelToggled(self) -> None:
+        """画布右侧“Ai”按钮：弹出/收起 AI 对话面板。"""
+        if self._aiPanel.isVisible():
+            self._aiPanel.hide()
+        else:
+            self._aiPanel.refreshModelLabel()
+            self._aiPanel.show()
+        self._positionViewSwitchBar()
+
     def _onViewChanged(self, idx: int) -> None:
         # 用户点击左侧方向栏（透视 / 顶 / 前 / 右）：当前视口切换视角并自动铺满。
         # 同时立即把 {当前画布模式分组} 下的 saved state 更新为 (idx, locked=False)，
@@ -1101,6 +1194,8 @@ class MainWindow(QMainWindow):
 
         # 变换面板浮雕显示区随画布模式切换 2D 预览组 / 浮雕(3D)组
         self._transformPanel.setCanvasMode(mode)
+        # 材质面板：常驻显示；仅按画布模式切换绑定（非浮雕解绑→控件禁用）
+        self._materialPanel.setCanvasMode(mode)
         if mode == "3d" and self._viewport3D is not None:
             self._transformPanel.setSolidDisplayMode(
                 self._viewport3D.solidDisplayMode())
@@ -1157,6 +1252,7 @@ class MainWindow(QMainWindow):
                 # 强制同步面板按钮 + 视图参数：setReliefModel 内部会把 _mode3DButtons
                 # 的 checked 状态改为 model.display3DMode 对应的那一颗（这里是 "map"）。
                 self._transformPanel.setReliefModel(locked)
+                self._materialPanel.setReliefModel(locked)
         elif mode == "cnc":
             # CNC：3D 视口自由查看（与 3D 模式一致），显示 CNC 独立空间的
             # 几何 + 刀路轨迹/刀具。毛坯不自动创建——在“安装几何体”中
@@ -1443,13 +1539,33 @@ class MainWindow(QMainWindow):
         for cid in changed:
             self._doc.notifyObjectChanged(cid)
         self._transformPanel.setReliefModel(obj)
+        self._materialPanel.setReliefModel(obj)
         self._viewport3D.setReliefModel(obj)
+        # 浮雕模型颜色（图层底色）= 底部调色板第 2 色：直接关联、随图层改色刷新
+        self._refreshBaseColorFromModel()
         if obj is not None:
             self._fitReliefOnce(obj)
         try:
             self._viewport3D.update()
         except Exception:
             pass
+
+    def _refreshBaseColorFromModel(self) -> None:
+        """把当前锁定的浮雕模型颜色（图层底色）同步为底部调色板第 2 色。
+
+        无锁定模型时退回“浮雕模型”固定层的颜色。图层改色后由
+        layerChanged 一并触发，使第 2 色始终是模型的基础颜色。
+        """
+        rgb = None
+        model = getattr(self, "_reliefLockedModel", None)
+        if model is not None:
+            rgb = model.color()
+        if rgb is None and self._doc is not None:
+            from core.document import LAYER_MODEL_ID
+            layer = self._doc.layer(LAYER_MODEL_ID)
+            rgb = layer.color if layer is not None else None
+        if rgb is not None:
+            PaintState.instance().setBaseColor(tuple(rgb)[:3])
 
     def _pinReliefModelAsTarget(self, obj) -> None:
         """把 obj 设为浮雕编辑目标：锁定（不可移动）+ 只显示它 + 脱离选中。
@@ -1501,13 +1617,17 @@ class MainWindow(QMainWindow):
         if name in _DRAW2D_COMMANDS and getattr(self, "_cncSimPanel", None) is not None \
                 and self._cncSimPanel.isVisible():
             self._onCncSimPanelClosed()
-        # 图片转线稿是 2D 曲线工具：预览与结果都画在 2D 画布上
+        # 图片转线稿是 2D 曲线工具（由 ai_lineart 插件提供）：预览与结果都画在
+        # 2D 画布上。这里按命令名判断，插件未装载时该分支不会触发。
         if name == "ImageTrace":
             self._ensure2DCanvas()
         # 浮雕类命令（新建/区域浮雕）均在当前画布交互：新建后自动进编辑态并切到
         # 3D 视口，区域浮雕直接在 3D 视口点选曲线，右键用于旋转查看，不切回 2D
         if self._cm.executeCommand(name, *args):
-            self._topDock.appendHistory(f"启动命令: {name}")
+            # 一次性命令（组合/炸开等）在 start() 内即 finish，其结果已写入
+            # 结果行；这里再写“启动命令”会覆盖掉刚显示的操作结果
+            if self._cm.activeInstance() is not None:
+                self._topDock.appendHistory(f"启动命令: {name}")
         else:
             # 被模式门禁拒绝 → 显示拒绝原因；否则为未实现/已有活动命令
             ref = self._cm.lastRefusal()
@@ -1781,35 +1901,52 @@ class MainWindow(QMainWindow):
         self._onSelectionChanged()
 
     def _onDimensionBindToggled(self) -> None:
-        """变换面板“绑定”开关被点击：解除选中 XY/Z 标注与源对象的绑定。
+        """变换面板“绑定”开关被点击：解除标注与物体的绑定。
 
         绑定解除即“脱离关系”：目标记录被清空且不再提供重新绑定入口，
-        之后物体尺寸变化不再影响该标注。
+        之后物体尺寸变化不再影响该标注。同时支持两种选中方式：
+        - 选中了已绑定的 XY/Z/圆标注：解除它（多选/重叠标注时一次全部解除）；
+        - 选中的是曲线/模型等源对象：解除所有绑定到这些源对象的标注
+          （符合“选中原物→解绑”的直觉）。
         """
-        dims = [o for o in self._doc.selectedObjects()
-                if o.type() == ObjectType.DIMENSION and o.kind() in ("xy", "z")
-                and o.boundTargetIds()]
-        if not dims:
+        sel = self._doc.selectedObjects()
+        sel_ids = {o.id() for o in sel}
+        sel_dim_ids = {o.id() for o in sel
+                       if o.type() == ObjectType.DIMENSION}
+        targets = []
+        for o in self._doc.allObjects():
+            if o.type() != ObjectType.DIMENSION or not o.bindable():
+                continue
+            bound = o.boundTargetIds()
+            if not bound:
+                continue
+            # 选中了该标注本身，或选中了它所绑定的某个源对象
+            if o.id() in sel_dim_ids or (sel_ids & set(bound)):
+                targets.append(o)
+        if not targets:
             return
         self._doc.beginEdit()
         try:
-            dims[0].unbind()
-            self._doc.notifyObjectChanged(dims[0].id())
+            for d in targets:
+                d.unbind()
+                self._doc.notifyObjectChanged(d.id())
         finally:
             self._doc.endEdit()
-        self._topDock.appendHistory("已解除标注与物体的绑定")
+        self._topDock.appendHistory(
+            "已解除标注与物体的绑定" if len(targets) == 1
+            else f"已解除 {len(targets)} 个标注与物体的绑定")
         self._notifyTip(
             "已解除标注与物体的绑定：物体改变尺寸不再影响该标注")
         self._onSelectionChanged()
 
     def _onDimensionRequested(self, kind: str) -> None:
-        """变换面板“尺寸标注”区按钮：XY标注 / 对齐标注 / Z标注。"""
+        """变换面板“尺寸标注”区按钮：XY标注 / 对齐标注 / 圆标注。"""
         if kind == "xy":
             self._createXYDimension()
         elif kind == "align":
             self._startAlignDim()
-        elif kind == "z":
-            self._createZDimension()
+        elif kind == "circle":
+            self._createCircleDimension()
 
     def _startAlignDim(self) -> None:
         """对齐标注：2D 模式切 2D 画布，3D 模式留在 3D 视口，进入"点两点"命令。"""
@@ -1865,48 +2002,78 @@ class MainWindow(QMainWindow):
             parts.append(f"Y {h:.2f}")
         self._topDock.appendHistory(f"XY 标注已创建（{'，'.join(parts)}）")
 
-    def _createZDimension(self) -> None:
-        """Z 标注：对选中对象（单个/多个）的联合 3D 包围盒标注 Z 高度。
+    def _createCircleDimension(self) -> None:
+        """圆标注：标注选中对象的直径（读数写成 “Ø50.00”）。
 
-        仅 3D 模式可用——Z 标注是竖直尺寸线，标注被测对象的 Z 范围
-        （顶到底的高度），尺寸线位于对象右侧（XY 平面内）。标注对象自动
-        落入“标注”固定层，并默认与所选源对象绑定——源对象几何变化时
-        标注实时跟随更新。
+        选中单个圆/弧时直接取其真实圆心与半径；椭圆按长短轴均值取等效圆；
+        其余图形（或多选）按联合包围盒取等效圆（中心 = 包围盒中心、
+        半径 = 长宽均值的一半）。与 XY 标注一样自动落入“标注”层并绑定所选
+        源对象（改尺寸实时更新）；直径线默认 45°，创建后拖读数可绕圆转动。
         """
-        if self._canvasModeBar.current() != "3d":
-            self._topDock.appendHistory("Z 标注：仅在 3D 模式下可用")
-            self._notifyTip("Z 标注仅在 3D 模式下可用，请先切换到 3D 模式")
-            return
         meas = [o for o in self._doc.selectedObjects()
                 if o.type() != ObjectType.DIMENSION]
         if not meas:
-            self._topDock.appendHistory("Z 标注：请先选中要标注的对象")
-            self._notifyTip("请先选中要标注高度的对象，再点 Z 标注")
+            self._topDock.appendHistory("圆标注：请先选中要标注的圆或图形")
+            self._notifyTip("请先选中要标注直径的对象（圆/弧/椭圆任意图形），再点圆标注")
             return
-        bb = BoundingBox3D()
-        for obj in meas:
-            b = obj.getBoundingBox()
-            if b.isValid():
-                bb.expand(b.min)
-                bb.expand(b.max)
-        if not bb.isValid():
-            self._topDock.appendHistory("Z 标注：选中对象无有效包围盒")
+        circle = self._measureCircle(meas)
+        if circle is None:
+            self._topDock.appendHistory("圆标注：选中对象无有效几何")
+            self._notifyTip("选中对象没有可标注的尺寸")
             return
-        zh = bb.max.z - bb.min.z
-        if zh < 1e-9:
-            self._topDock.appendHistory("Z 标注：对象 Z 高度过小，无法标注")
-            self._notifyTip("选中对象的 Z 高度为 0，无法创建 Z 标注")
-            return
+        cx, cy, r, aspect = circle
         fs, gap = self._dimStyle()
-        dim = DimensionObject("z")
-        dim.setZRange(bb.min.x, bb.min.y, bb.max.x, bb.max.y,
-                      bb.min.z, bb.max.z, fs, gap)
+        dim = DimensionObject("circle")
+        dim.setCircle(cx, cy, r, fs, gap, aspect=aspect)
         dim.bindTo([o.id() for o in meas])   # 默认绑定所选源对象，随物体实时更新
         self._doc.beginEdit()
         self._doc.addObject(dim)
         self._doc.endEdit()
         self._doc.selectObject(dim.id())
-        self._topDock.appendHistory(f"Z 标注已创建（Z {zh:.2f}）")
+        self._topDock.appendHistory(f"圆标注已创建（Ø {2 * r:.2f}）")
+
+    @staticmethod
+    def _measureCircle(objs) -> tuple | None:
+        """从选中对象取被测圆 (cx, cy, r, aspect)，无有效几何时 None。
+
+        aspect = 对象的长宽比，存进标注作为“是否被单轴缩放压扁”的判定基准：
+        等比缩放时不变（标注继续跟随），单轴缩放时变了（标注作废删除）。
+        优先用对象的真实圆心/半径（圆、弧——弧的包围盒不是整圆，必须走这条）；
+        椭圆取长短轴均值的等效圆；其余按联合包围盒取等效圆。
+        """
+        if len(objs) == 1:
+            o = objs[0]
+            t = o.type()
+            if t in (ObjectType.CIRCLE, ObjectType.ARC):
+                c = o.center()
+                return (c.x, c.y, abs(o.radius()), 1.0)
+            if t == ObjectType.ELLIPSE:
+                c = o.center()
+                ma, mi = abs(o.majorAxis()), abs(o.minorAxis())
+                if ma <= 0.0 or mi <= 0.0:
+                    return None
+                return (c.x, c.y, (ma + mi) * 0.5, ma / mi)
+        bb = BoundingBox3D()
+        for obj in objs:
+            b = obj.getBoundingBox()
+            if b.isValid():
+                bb.expand(b.min)
+                bb.expand(b.max)
+        if not bb.isValid():
+            return None
+        w = bb.max.x - bb.min.x
+        h = bb.max.y - bb.min.y
+        r = (w + h) * 0.25
+        if r < 1e-9 or h < 1e-9:
+            return None
+        return ((bb.min.x + bb.max.x) * 0.5, (bb.min.y + bb.max.y) * 0.5,
+                r, w / h)
+
+    def _onDimensionDropped(self, oid: str) -> None:
+        """绑定标注被文档层自动删除（源对象单轴缩放变形）：说清为什么少了个标注。"""
+        self._topDock.appendHistory("圆标注已自动删除：源对象被单轴缩放，已不是圆")
+        self._notifyTip("圆标注已自动删除：源对象只在单轴上缩放（被压扁了），"
+                        "直径标注不再成立；等比缩放才会跟随")
 
     def _onMirrorRequested(self, axis: str) -> None:
         """镜像快捷操作。
@@ -1990,14 +2157,29 @@ class MainWindow(QMainWindow):
             "PanelScale": "缩放：点基准点 → 点参考起点 → 点目标距离确认"}
         if self._cm.executeCommand(cmdName):
             self._topDock.appendHistory(prompts.get(cmdName, titles.get(cmdName, cmdName)))
+            inst = self._cm.activeInstance()
+            if inst is not None and hasattr(inst, "setCenterMode"):
+                inst.setCenterMode(self._transformPanel.transformCenterMode())
         else:
             self._topDock.appendHistory(f"命令未实现: {cmdName}")
 
+    def _onTransformCenterModeChanged(self, mode: str) -> None:
+        """变换面板“变换中心：整体/各自”：同步操作轴与当前活动的缩放命令。"""
+        self._gizmo.setCenterMode(mode)
+        inst = self._cm.activeInstance()
+        if inst is not None and hasattr(inst, "setCenterMode"):
+            inst.setCenterMode(mode)
+
     def _onMeasure(self) -> None:
-        """变换面板“测量”按钮：切 2D 画布并启动 PanelMeasure。"""
+        """变换面板“测量”按钮：点两个点显示两点距离。
+
+        浮雕模式就地在浮雕视口测量（不切 2D 画布——切过去模型会显示成等高线，
+        也丢掉当前浮雕视图）；其余模式仍切 2D 画布测量。
+        """
         if self._cm.hasActive():
             self._cm.cancelActive()
-        self._ensure2DCanvas()
+        if self._canvasModeBar.current() != "relief":
+            self._ensure2DCanvas()
         if self._cm.executeCommand("PanelMeasure"):
             self._topDock.appendHistory("测量：点两个点，显示两点距离")
         else:
@@ -2176,7 +2358,8 @@ class MainWindow(QMainWindow):
         self._scene.update()
         self._viewport3D.update()
 
-    def _onShowSettings(self) -> None:
+    def _makeSettingsDialog(self) -> SettingsDialog:
+        """创建设置对话框并接好各页变更信号（设置页/直达 AI 页共用）。"""
         dlg = SettingsDialog(self, self._plugins)
         dlg.appearanceChanged.connect(self._refreshStyle)
         dlg.gridVisibleChanged.connect(self._scene.setGridVisible)
@@ -2186,12 +2369,23 @@ class MainWindow(QMainWindow):
         dlg.renderSettingsChanged.connect(self._onRenderSettingsChanged)
         # 标注样式（字体/单位）变化：重绘场景让已有标注立即采用新样式
         dlg.dimensionSettingsChanged.connect(self._scene.update)
+        return dlg
+
+    def _onShowSettings(self) -> None:
+        dlg = self._makeSettingsDialog()
         dlg.exec()
         dlg.deleteLater()   # 用完即弃：避免控件树与信号连接随打开次数累积
         # 键盘页可能改了快捷键：立即重建映射
         self._reloadShortcuts()
         # 文件页设置（自动保存开关/间隔）可能已改变：按新设置重启自动保存定时器
         self._restartAutosaveTimer()
+
+    def openAiSettings(self) -> None:
+        """AI 对话面板 ⚙ 调用：打开设置对话框并直达“AI”页。"""
+        dlg = self._makeSettingsDialog()
+        dlg.showAiTab()
+        dlg.exec()
+        dlg.deleteLater()
 
     def _onSelectionBoxChanged(self, on: bool) -> None:
         """选中物体虚线框开关：写入 app_settings 并刷新 2D/3D 场景。"""
@@ -2209,18 +2403,57 @@ class MainWindow(QMainWindow):
         else:
             self._autosaveTimer.stop()
 
-    def _onAutosaveTimeout(self) -> None:
-        """自动保存：把“有文件路径且未保存”的文档另存恢复副本。
+    # 每个文档在 caibak 目录里保留的自动保存副本上限（超出按时间删除最旧的）
+    AUTOSAVE_KEEP = 20
 
-        副本写到原文件旁的 <文件名>.cai.autosave，不改动文档的未保存标记；
-        原文件保存（_saveTo）成功后删除对应恢复副本。
-        """
+    @staticmethod
+    def _autosave_dir() -> str:
+        """自动保存目录：软件根目录（打包后为 exe 同级）下的 caibak 文件夹。"""
         import os
+        import sys
+        if getattr(sys, "frozen", False):
+            root = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            root = os.path.dirname(os.path.abspath(sys.argv[0]))
+        d = os.path.join(root, "caibak")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _onAutosaveTimeout(self) -> None:
+        """自动保存：为“有文件路径且未保存”的文档在软件目录 caibak 文件夹
+        新建一份独立副本。
+
+        不覆盖、也不改动原文件与文档的未保存标记；每次按时间戳生成
+        caibak/<主名>.autosave.<YYYYMMDD-HHMMSS>.cai（可直接打开恢复），每个文档
+        只保留最近 AUTOSAVE_KEEP 份，超出删除最旧的；顺带清理旧版本留在
+        文档目录的 .autosave 残留。
+        """
+        import glob
+        import os
+        import time
         for d in self._openDocs:
             if not d.isDirty() or not d.filePath():
                 continue
+            path = d.filePath()
             try:
-                d.save(d.filePath() + ".autosave")
+                base, ext = os.path.splitext(os.path.basename(path))
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                bak_dir = self._autosave_dir()
+                d.save(os.path.join(bak_dir, f"{base}.autosave.{ts}{ext}"))
+                # 轻量保留策略：按修改时间只留最近 AUTOSAVE_KEEP 份
+                old = sorted(glob.glob(os.path.join(
+                    bak_dir, f"{base}.autosave.*{ext}")), key=os.path.getmtime)
+                for f in old[:-self.AUTOSAVE_KEEP]:
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                # 清理旧版自动保存在文档目录留下的单文件副本（已改用 caibak）
+                try:
+                    if os.path.exists(path + ".autosave"):
+                        os.remove(path + ".autosave")
+                except OSError:
+                    pass
             except Exception:
                 continue
 
@@ -2249,8 +2482,10 @@ class MainWindow(QMainWindow):
                 old.reliefRedoChanged.disconnect(quickBar.setReliefRedoEnabled)
                 old.selectionChanged.disconnect(self._onSelectionChanged)
                 old.objectRemoved.disconnect(self._onObjectRemoved)
+                old.dimensionDropped.disconnect(self._onDimensionDropped)
                 old.objectAdded.disconnect(self._onObjectAdded)
                 old.layerChanged.disconnect(self._layerPanel.refreshLater)
+                old.layerChanged.disconnect(self._refreshBaseColorFromModel)
                 old.dirtyChanged.disconnect(self._onDocDirtyChanged)
             except (RuntimeError, TypeError):
                 pass
@@ -2261,8 +2496,10 @@ class MainWindow(QMainWindow):
         doc.reliefRedoChanged.connect(quickBar.setReliefRedoEnabled)
         doc.selectionChanged.connect(self._onSelectionChanged)
         doc.objectRemoved.connect(self._onObjectRemoved)
+        doc.dimensionDropped.connect(self._onDimensionDropped)
         doc.objectAdded.connect(self._onObjectAdded)
         doc.layerChanged.connect(self._layerPanel.refreshLater)
+        doc.layerChanged.connect(self._refreshBaseColorFromModel)
         doc.dirtyChanged.connect(self._onDocDirtyChanged)
         quickBar.setUndoEnabled(doc.canCurveUndo())
         quickBar.setRedoEnabled(doc.canCurveRedo())
@@ -2412,6 +2649,12 @@ class MainWindow(QMainWindow):
         """退出前等待后台 QThread 结束：启动后 10 秒内关窗时 OCCT 预热/
         布尔预热线程可能仍在跑，线程随窗口销毁会触发 "QThread: Destroyed
         while thread is still running" 原生崩溃退出。"""
+        # 先停 MCP 桥（监听端口随进程释放）
+        try:
+            from core.ai.bridge_server import stopBridge
+            stopBridge()
+        except Exception:
+            pass
         for name in ("_heavyLoader", "_preloader", "_bdPreloader", "_bdLoader"):
             t = getattr(self, name, None)
             if t is None:
@@ -2427,7 +2670,7 @@ class MainWindow(QMainWindow):
 
     def _renameDocument(self, index: int) -> None:
         """重命名标签文档：未保存文档只改显示标题；已保存文档同步重命名
-        磁盘文件（连同同名 .bak/.autosave 副本），保持标题与文件名一致。"""
+        磁盘文件（连同同名 .bak 备份），保持标题与文件名一致。"""
         import os
         if not (0 <= index < len(self._openDocs)):
             return
@@ -2454,14 +2697,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, tr("重命名失败"),
                                     tr("无法重命名文件:\n%s") % e)
                 return
-            # 顺带迁移同名备份/自动保存副本（缺失或占用则忽略）
-            for ext in (".bak", ".autosave"):
-                try:
-                    if os.path.exists(path + ext) and \
-                            not os.path.exists(new_path + ext):
-                        os.rename(path + ext, new_path + ext)
-                except OSError:
-                    pass
+            # 顺带迁移同名备份（缺失或占用则忽略）；自动保存副本集中在 caibak
+            # 目录、按主名独立命名，不随文档重命名迁移
+            try:
+                if os.path.exists(path + ".bak") and \
+                        not os.path.exists(new_path + ".bak"):
+                    os.rename(path + ".bak", new_path + ".bak")
+            except OSError:
+                pass
             doc.setFilePath(new_path)   # 更新路径与标题（取新文件主名）
         else:
             doc.setTitle(name)
@@ -2770,12 +3013,25 @@ class MainWindow(QMainWindow):
                           if d.filePath() == path), None)
             if exist is not None:
                 self._switchToDocument(self._openDocs.index(exist))
-                return True
-            self._newDocument(path)
+            else:
+                self._newDocument(path)
+            app_settings.add_recent_file(path)
+            if hasattr(self, "_leftPanel"):
+                self._leftPanel.refreshSavePage()   # 最近打开列表刷新
             return True
         except Exception as e:
             QMessageBox.warning(self, "打开失败", f"无法打开文件 {path}:\n{e}")
             return False
+
+    def _onRecentOpen(self, path: str) -> None:
+        """左侧“最近打开”列表单击：存在则打开，已删除则提示并刷新列表。"""
+        import os
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "打开失败",
+                                f"文件不存在或已被移动:\n{path}")
+            self._leftPanel.refreshSavePage()
+            return
+        self._openFileAsDocument(path)
 
     def _placeImagesAt(self, paths: list, worldPt) -> None:
         """把拖入图片直接落到落点（默认宽 100 等比，多张依次错开），
@@ -2872,13 +3128,6 @@ class MainWindow(QMainWindow):
         try:
             self._doc.save(path)
             self._doc.setFilePath(path)
-            # 落盘成功即删除对应的自动保存恢复副本
-            autosave = path + ".autosave"
-            if os.path.exists(autosave):
-                try:
-                    os.remove(autosave)
-                except OSError:
-                    pass
             self._notifyTip(f"已保存: {path}")
             self._updateFileTabs()
         except Exception as e:
@@ -2902,6 +3151,17 @@ class MainWindow(QMainWindow):
     def _onExport(self, fmt: str, filename: str) -> None:
         import os
         ext = fmt.lower()
+        # 所有格式都只导出选中对象：没有选中时直接提示，不导出任何东西
+        selected = self._doc.selectedObjects()
+        if not selected:
+            QMessageBox.information(
+                self, "无法导出", "请先选中要导出的对象，再点击导出。")
+            self._notifyTip("导出：请先选中要导出的对象")
+            return
+        if not filename:
+            # 未填文件名：用已保存的工程文件名；未保存的新文档退回 export.<格式>
+            fp = self._doc.filePath() if self._doc else ""
+            filename = os.path.splitext(os.path.basename(fp))[0] if fp else ""
         if not filename:
             filename = f"export.{ext}"
         # 清理输入框文件名中的非法字符
@@ -2922,55 +3182,74 @@ class MainWindow(QMainWindow):
                 return
         try:
             if fmt == "DXF":
-                from core.export.dxf_exporter import exportDXF
-                exportDXF(self._doc, path)
+                from core.export.dxf_exporter import exportDXF, _EXPORTABLE_TYPES
+                curves = [o for o in selected if o.type() in _EXPORTABLE_TYPES]
+                if not curves:
+                    self._notifyTip("选中的对象中没有可导出的曲线")
+                    return
+                n = exportDXF(self._doc, path, objects=curves)
+                self._notifyTip(f"已导出 {n} 条曲线: {path}")
+                return
             elif fmt == "SVG":
                 # SVG：曲线对象采样为矢量路径（描边轮廓，供看图/雕刻软件用）
-                from core.export.svg_exporter import exportSVG
-                n = exportSVG(self._doc, path)
+                from core.export.svg_exporter import exportSVG, _EXPORTABLE
+                curves = [o for o in selected if o.type() in _EXPORTABLE]
+                if not curves:
+                    self._notifyTip("选中的对象中没有可导出的曲线")
+                    return
+                n = exportSVG(self._doc, path, objects=curves)
                 self._notifyTip(f"已导出 {n} 条曲线: {path}")
                 return
             elif fmt == "STEP":
-                # STEP：3D B-Rep 实体精确导出（挤出/布尔等）。
-                # 优先导出选中的实体；无选中时导出全部实体。
+                # STEP：3D B-Rep 实体精确导出（仅导出选中的实体）
                 from core.export.step_exporter import exportSTEP
-                solids = None
-                if self._doc.space() == "3d":
-                    sel = [o for o in self._doc.selectedObjects()
-                           if o.type() in (ObjectType.SOLID,
-                                            ObjectType.BREP)]
-                    if sel:
-                        solids = sel
-                    else:
-                        all_sol = [o for o in self._doc.allObjects()
-                                   if o.type() in (ObjectType.SOLID,
-                                                    ObjectType.BREP)]
-                        if all_sol:
-                            solids = all_sol
+                solids = [o for o in selected
+                          if o.type() in (ObjectType.SOLID,
+                                           ObjectType.BREP)]
+                if not solids:
+                    self._notifyTip(
+                        "选中的对象中没有可导出的 3D 实体"
+                        "（STEP 仅支持挤出/布尔实体）")
+                    return
                 exportSTEP(self._doc, path, solids=solids)
             elif fmt == "STL":
                 from core.export.stl_exporter import exportSTL
-                # 3D 模式下优先导出选中的挤出实体（闭合网格）；
-                # 无选中或非 3D 模式时回退到导出全部浮雕模型
+                # 只导出选中的网格：3D 下为挤出实体/B-Rep，2D/浮雕下为浮雕网格
                 solids = None
+                surfaces = None
                 if self._doc.space() == "3d":
-                    sel = [o for o in self._doc.selectedObjects()
-                           if o.type() in (ObjectType.SOLID,
-                                            ObjectType.BREP)]
-                    if sel:
-                        solids = sel
-                    else:
-                        # 3D 无选中：导出全部实体（含挤出圆环等），
-                        # 而不是回退浮雕（3D 文档可能没有浮雕模型）
-                        all_sol = [o for o in self._doc.allObjects()
-                                   if o.type() in (ObjectType.SOLID,
-                                                    ObjectType.BREP)]
-                        if all_sol:
-                            solids = all_sol
-                exportSTL(self._doc, path, solids=solids)
+                    solids = [o for o in selected
+                              if o.type() in (ObjectType.SOLID,
+                                               ObjectType.BREP)]
+                    meshes = solids
+                else:
+                    surfaces = [o for o in selected
+                                if o.type() == ObjectType.SURFACE]
+                    meshes = surfaces
+                if not meshes:
+                    self._notifyTip("选中的对象中没有可导出的网格")
+                    return
+                n_tri = exportSTL(self._doc, path, solids=solids,
+                                  surfaces=surfaces, closed=True)
+                # 面数/体积/容差一并提示：文件异常大或切片报错时能看出是不是
+                # 简化容差调小了（设 0 则只合并严格共面区域，零损失）
+                import os
+                tol = float(getattr(app_settings, "stl_merge_tol", 0.0) or 0.0)
+                mb = os.path.getsize(path) / 1e6 if os.path.isfile(path) else 0.0
+                self._notifyTip(
+                    "已导出 STL（%s 个三角面，%.1f MB，%s）: %s"
+                    % (f"{n_tri:,}", mb,
+                       f"简化容差 {tol:g}mm" if tol > 0 else "零损失",
+                       path))
+                return
             self._notifyTip(f"已导出: {path}")
         except ImportError:
             QMessageBox.information(self, "暂未实现", f"{fmt} 导出功能尚未实现")
+        except MemoryError:
+            QMessageBox.warning(
+                self, "导出失败",
+                "内存不足，无法生成导出网格。\n"
+                "请关闭占内存的程序后重试；或在“设置 → 渲染性能”里降低网格精度。")
         except Exception as e:
             QMessageBox.warning(self, "导出失败", f"无法导出文件:\n{e}")
 
@@ -3232,9 +3511,24 @@ class MainWindow(QMainWindow):
         c = self._canvasContainer
         bar = self._viewSwitchBar
         host = self._paramHost
+        # AI 面板占用右缘时，参数面板再往左避开
+        aiW = (self._aiPanel.width() + 2) if self._aiPanel.isVisible() else 0
         # 贴画布右缘：紧挨右侧功能栏（仅留 2px 缝），顶部与功能栏对齐
-        host.move(max(2, c.width() - bar.width() - host.width() - 2), bar.y())
+        host.move(max(2, c.width() - bar.width() - host.width() - aiW - 2),
+                  bar.y())
         host.raise_()
+        self._positionAiPanel()
+
+    def _positionAiPanel(self) -> None:
+        """AI 对话面板：贴画布右缘、视图栏左侧，顶部对齐、高度到画布底部。"""
+        c = self._canvasContainer
+        bar = self._viewSwitchBar
+        ai = self._aiPanel
+        if not ai.isVisible():
+            return
+        ai.resize(ai.width(), max(320, c.height() - bar.y() - 4))
+        ai.move(max(2, c.width() - bar.width() - ai.width() - 2), bar.y())
+        ai.raise_()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key_Escape:
@@ -3244,18 +3538,38 @@ class MainWindow(QMainWindow):
             self._cm.onEnter()
             return
         # 撤销 / 重做（Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y）；先结束活动命令再恢复。
-        # 快捷键作用于“当前模式对应的那套历史”：2D = 曲线历史，浮雕模式 = 浮雕历史。
+        # 2D：只撤“基础操作”——曲线/文字（含 3D 曲线）与浮雕网格的移动/旋转/缩放，
+        #     **不撤浮雕高度场内容**（区域浮雕/雕刻/填色等只在浮雕模式里撤）；
+        # 浮雕：撤最近一次操作（曲线与浮雕内容/移动同一时间线）；
+        # 3D / CNC：同样只走基础操作历史（曲线）。
         if event.modifiers() & Qt.ControlModifier and \
                 event.key() in (Qt.Key_Z, Qt.Key_Y):
             if self._cm.hasActive():
                 self._cm.cancelActive()
             if self._canvasModeBar.current() == "relief":
-                docUndo, docRedo = self._doc.undoRelief, self._doc.redoRelief
+                docUndo, docRedo = self._doc.undo, self._doc.redo
             else:
                 docUndo, docRedo = self._doc.undoCurve, self._doc.redoCurve
             if event.key() == Qt.Key_Z and \
                     not (event.modifiers() & Qt.ShiftModifier):
+                try:
+                    from ui.view_3d._renderdbg import dbg
+                    dbg(f"ctrl+z mode={self._canvasModeBar.current()} "
+                        f"cv={self._doc.canCurveUndo()} "
+                        f"rl={self._doc.canReliefUndo()}")
+                except Exception:
+                    pass
+                try:
+                    from ui.perf_monitor import trace_next
+                    trace_next(10)
+                except Exception:
+                    pass
                 docUndo()
+                try:
+                    from ui.view_3d._renderdbg import dbg
+                    dbg("ctrl+z done")
+                except Exception:
+                    pass
             else:
                 docRedo()
             event.accept()

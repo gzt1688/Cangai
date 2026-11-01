@@ -16,6 +16,8 @@ from typing import List, Optional, Tuple
 
 from .geometry_types import Point3D
 from .poly_curve_object import PolyCurveObject
+from .line_object import LineObject
+from .curve_object import CurveObject
 
 JOIN_TOLERANCE = 1e-4  # 模型单位；吸附对齐的端点通常误差远小于此
 
@@ -24,6 +26,8 @@ def _copySeg(s: dict) -> dict:
     c = {"points": [list(p) for p in s.get("points", [])]}
     if s.get("inputPoints"):
         c["inputPoints"] = [list(p) for p in s["inputPoints"]]
+    if s.get("type"):
+        c["type"] = s["type"]
     return c
 
 
@@ -31,6 +35,8 @@ def _reverseSeg(s: dict) -> dict:
     c = {"points": [list(p) for p in reversed(s.get("points", []))]}
     if s.get("inputPoints"):
         c["inputPoints"] = [list(p) for p in reversed(s["inputPoints"])]
+    if s.get("type"):
+        c["type"] = s["type"]
     return c
 
 
@@ -63,7 +69,8 @@ def _segmentsOf(obj) -> Optional[List[dict]]:
         pts = obj.getSampledPoints()
         if len(pts) < 2:
             return None
-        return [{"points": [[p.x, p.y, p.z] for p in pts]}]
+        # 标记为样条段：炸开时还原成曲线（否则密采样会被当成折线）
+        return [{"type": "Curve", "points": [[p.x, p.y, p.z] for p in pts]}]
     if t == "POLYCURVE":
         segs = [_copySeg(s) for s in obj.segments()]
         if not segs:
@@ -169,3 +176,64 @@ def joinObjects(objects, tolerance: float = JOIN_TOLERANCE):
         poly._layerId = first.layerId()
         results.append((poly, objs))
     return results
+
+
+def _distToLine(p: Point3D, a: Point3D, b: Point3D) -> float:
+    """点到直线 ab 的距离（三维叉积求高）。"""
+    ux, uy, uz = b.x - a.x, b.y - a.y, b.z - a.z
+    L2 = ux * ux + uy * uy + uz * uz
+    if L2 < 1e-24:
+        return p.distanceTo(a)
+    vx, vy, vz = p.x - a.x, p.y - a.y, p.z - a.z
+    cx = uy * vz - uz * vy
+    cy = uz * vx - ux * vz
+    cz = ux * vy - uy * vx
+    return math.sqrt(cx * cx + cy * cy + cz * cz) / math.sqrt(L2)
+
+
+def _isStraight(pts, tol: float) -> bool:
+    """采样折线是否共线（含两点段）。"""
+    if len(pts) < 2:
+        return False
+    a, b = pts[0], pts[-1]
+    L = a.distanceTo(b)
+    if L < 1e-12:
+        return False
+    lim = max(tol, L * 1e-4)
+    return all(_distToLine(p, a, b) <= lim for p in pts[1:-1])
+
+
+def explodeObject(poly) -> List[object]:
+    """组合的逆操作：把 PolyCurve 的每一段拆成独立对象，继承外观与图层。
+
+    - 折线段（无 inputPoints / 无 type 标记，来自直线工具的多段线，如 W 形）
+      → LineObject（保留全部顶点，尖角不变）；
+    - 样条段（有 inputPoints 或 type=="Curve"）：采样点共线 → LineObject
+      （拟合后仍笔直的段），否则 → CurveObject（原采样折线 + 拟合点，形状不变）；
+    - 空段/零长度段跳过。
+    """
+    out = []
+    for seg in poly.segments():
+        raw = seg.get("points") or []
+        if len(raw) < 2:
+            continue
+        pts = _pts(raw)
+        if len(pts) == 2 and pts[0].distanceTo(pts[1]) < 1e-12:
+            continue
+        isCurveSeg = bool(seg.get("inputPoints")) or seg.get("type") == "Curve"
+        if not isCurveSeg:
+            # 折线段：原样返回所有顶点。若只取首尾会丢掉 W 形拐点，
+            # 若转成 CurveObject 又会被平滑显示成弯的。
+            o = LineObject(pts)
+        elif _isStraight(pts, JOIN_TOLERANCE):
+            o = LineObject([pts[0], pts[-1]])
+        else:
+            o = CurveObject()
+            inp = seg.get("inputPoints") or []
+            if not o.buildFromSampled(pts, _pts(inp) if inp else None):
+                continue
+        o._color = poly._color
+        o._lineWidth = poly._lineWidth
+        o.setLayerId(poly.layerId())
+        out.append(o)
+    return out

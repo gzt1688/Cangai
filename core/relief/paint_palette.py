@@ -6,20 +6,26 @@ core/relief/mesh3d.py）都引用同一张表，保证"填色 → 渲染 → 作
 用的索引与 RGB 完全一致。
 
 蒙版取值约定（与 ReliefModelObject 的色号层一致）：
-- ``EMPTY = 0``    未填色；
+- ``EMPTY = 0``    未填色 = **浮雕模型基础色**（模型/图层颜色）；
 - ``idx + 1``      调色板第 idx 个颜色（1..count()）。
 之所以 +1，是让 0 恒定表示"空"，无需额外的掩膜数组。
+
+第 2 个色块（索引 1 / 蒙版值 2）与浮雕模型基础色**直接关联**：
+图层/模型改色时经 :func:`set_base_color` 同步，未填色格（EMPTY）在
+色号裁剪中与基础色同值（见 :func:`equals_value_mask`）。
 
 放在 core 而非 ui/styles/theme：core(mesh3d) 需要它，而 core 不得 import ui。
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
-# 31 色（迁移自 capture_toolbar.py 原硬编码 hex 列表，顺序即调色板顺序）
-PALETTE: Tuple[Tuple[int, int, int], ...] = (
+# 31 色（迁移自 capture_toolbar.py 原硬编码 hex 列表，顺序即调色板顺序）；
+# 可变列表：索引 1（第 2 色）为浮雕模型基础色槽，随图层色动态更新（UI 层
+# 通过 PaintState.setBaseColor 调 :func:`set_base_color` 并重绘）。
+PALETTE: List[Tuple[int, int, int]] = [
     (255,   0,   0),   # #FF0000 红
-    (255, 255,   0),   # #FFFF00 黄
+    (232, 236,  19),   # 基础色槽默认 #e8ec13（浮雕模型/图层默认颜色，set_base_color 同步）
     (  0,   0, 255),   # #0000FF 蓝
     (  0, 204,   0),   # #00CC00 绿
     (255, 136,   0),   # #FF8800 橙
@@ -49,9 +55,49 @@ PALETTE: Tuple[Tuple[int, int, int], ...] = (
     (218, 165,  32),   # #DAA520 金菊
     (192, 192, 192),   # #C0C0C0 银
     (233,  30,  99),   # #E91E63 玫红
-)
+]
 
 EMPTY = 0
+# 基础色槽：调色板第 2 个（索引 1）/ 蒙版值 2，与浮雕模型颜色直接关联
+BASE_INDEX = 1
+BASE_VALUE = BASE_INDEX + 1
+
+
+def base_color() -> Tuple[int, int, int]:
+    """当前基础色（调色板第 2 色，= 浮雕模型/图层颜色）。"""
+    return PALETTE[BASE_INDEX]
+
+
+def set_base_color(rgb) -> bool:
+    """把浮雕模型基础色同步到调色板第 2 色（就地修改 PALETTE）。
+
+    纯数据、零 Qt：返回是否发生变化，由 UI 层（PaintState）据此重绘色块。
+    未填色格（EMPTY）渲染时本就用模型底色，此处让色块本身成为“模型基础色”，
+    与图层改色联动。
+    """
+    if rgb is None:
+        return False
+    target = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    if target == PALETTE[BASE_INDEX]:
+        return False
+    PALETTE[BASE_INDEX] = target
+    return True
+
+
+def equals_value_mask(color_mask, color_value: int):
+    """色号蒙版 == color_value 的 bool 掩膜（EMPTY 与基础色同值）。
+
+    未填色（0）即浮雕模型的基础颜色：当前颜色是基础色槽
+    （``BASE_VALUE``）时未填色格一并命中；反之“颜色外”排除基础色时
+    未填色格也被排除。color_mask 为 None 返回 None（调用方自行回退）。
+    """
+    if color_mask is None:
+        return None
+    v = int(color_value)
+    m = (color_mask == v)
+    if v == BASE_VALUE:
+        m = m | (color_mask == EMPTY)
+    return m
 
 
 def count() -> int:

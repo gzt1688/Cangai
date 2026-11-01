@@ -6,12 +6,14 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                 QRadioButton, QButtonGroup,
                                 QScrollArea, QFrame, QSizePolicy, QPushButton,
                                 QDialog, QFormLayout, QDialogButtonBox)
-from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer
+import time
 from PySide6.QtGui import QMouseEvent
 import numpy as np
 import ui.styles.theme as theme
 from resource_path import resource_path
-from core.vector.geometry_types import ObjectType, Point3D
+from core.vector.geometry_types import ObjectType, Point3D, BoundingBox3D
+from core.vector.transform_geometry import scaleObjectAround
 from i18n import tr, languageChanged
 
 # 浮雕 2D 预览显示模式：(对象存储值, 界面文案中文原文)；默认“等高线”置首
@@ -131,14 +133,15 @@ class TransformPanel(QWidget):
     mirrorRequested = Signal(str)      # "X" / "Y" / "Z"
     zHeightCommitRequested = Signal(float)  # “模型Z”确认：目标 Z 尺寸（最高点-最低点）
     zClipRequested = Signal(float, float)   # “限高保底”：clip 高度场到 [z_min, z_max]
-    dimensionRequested = Signal(str)   # 标注："xy" / "align" / "z"
+    dimensionRequested = Signal(str)   # 标注："xy" / "align" / "circle"
     dimensionTextBiggerRequested = Signal()    # 放大选中标注的读数文字
     dimensionTextSmallerRequested = Signal()   # 缩小选中标注的读数文字
-    dimensionBindToggled = Signal()    # 关闭选中 XY 标注与物体的绑定（永久解除）
+    dimensionBindToggled = Signal()    # 关闭选中 XY/圆标注与物体的绑定（永久解除）
     moveRequested = Signal()           # 面板移动命令：两点平移选中对象
     rotateRequested = Signal()         # 面板旋转命令：两点定轴+拖动旋转
     scaleRequested = Signal()          # 面板缩放命令：两点定参考+拖动缩放
     measureRequested = Signal()        # 测量命令：点两个点，左下角显示两点距离
+    transformCenterModeChanged = Signal(str)  # 变换中心："overall" / "individual"
     solidDisplayModeRequested = Signal(str)   # 3D 实体显示模式："wireframe" / "rendered"
     solidPerspectiveRequested = Signal(bool)  # 3D 线框透视开关：True=显示背面线
     meshHeightColorRequested = Signal(bool)  # 网格 STL 实体高度色开关
@@ -156,6 +159,8 @@ class TransformPanel(QWidget):
         self._reliefObj = None           # 当前选中的浮雕模型（非 SURFACE 为 None）
         self._pinnedRelief = None        # 浮雕模式锁定的编辑目标（与选中解耦）
         self._updatingRelief = False     # 回填期间抑制写回
+        self._zPending = False           # “模型Z”是否已排队一次补刷
+        self._zLastRefresh = 0.0         # 上次扫场回填的时刻
 
         main = QVBoxLayout(self)
         main.setContentsMargins(2, 2, 2, 2)
@@ -181,6 +186,7 @@ class TransformPanel(QWidget):
         self._content = cl
         self._buildSizeControls()
         self._buildOriginControls()
+        self._buildTransformCenterControls()
         # 移动/旋转/缩放快捷行（放在镜像三键上方）
         self._buildXformControls()
         self._content.addSpacing(2)
@@ -231,10 +237,10 @@ class TransformPanel(QWidget):
     def _buildDimensionControls(self) -> None:
         """尺寸标注区：
         - 与上方镜像三键行间隔 2px；
-        - 第一行：XY标注（标选中对象包围盒宽高）/ 对齐标注（两点）/ Z标注（占位）
+        - 第一行：XY标注（标选中对象包围盒宽高）/ 对齐标注（两点）/ 圆标注（直径）
           ——与上方镜像三键同尺寸、行首对齐；
         - 第二行：增大尺寸 / 缩小尺寸（与上面两排按钮同宽）——整体缩放选中
-          标注的读数文字；紧随其后的“绑定”开关显示当前 XY 标注的绑定状态
+          标注的读数文字；紧随其后的“绑定”开关显示当前 XY/圆标注的绑定状态
           （已绑定=可点击解除，已解绑=永久脱离）。
 
         整个标注区用容器 widget 包裹（self._dimBox），CNC 模式下整体隐藏。
@@ -254,7 +260,7 @@ class TransformPanel(QWidget):
         for key, text, tip in (
                 ("xy", "XY标注", "标注选中对象的 X 宽与 Y 高尺寸"),
                 ("align", "对齐标注", "点击两个点标注其间距（任意方向）"),
-                ("z", "Z标注", "Z 标注占位：后续版本用于为模型标注高度")):
+                ("circle", "圆标注", "标注选中圆的直径（Ø），拖读数可绕圆转动箭头")):
             btn = _makeToolButton(tr(text), tr(tip))
             btn.clicked.connect(
                 lambda _, k=key: self.dimensionRequested.emit(k))
@@ -344,10 +350,11 @@ class TransformPanel(QWidget):
             if not objBB.isValid():
                 continue
             if bb is None:
-                bb = objBB
-            else:
-                bb.expand(objBB.min)
-                bb.expand(objBB.max)
+                # 不能直接复用 objBB：曲线/图片等对象的 getBoundingBox 返回的是
+                # 缓存实例，expand 会污染该对象的包围盒缓存（后续尺寸/拾取全错）。
+                bb = BoundingBox3D()
+            bb.expand(objBB.min)
+            bb.expand(objBB.max)
         if bb is None:
             return
         cx = (bb.min.x + bb.max.x) * 0.5
@@ -617,6 +624,60 @@ class TransformPanel(QWidget):
             rl.addStretch()
             self._content.addWidget(row)
 
+    def _buildTransformCenterControls(self) -> None:
+        """多选缩放时的变换中心：整体包围盒 / 各自包围盒。
+
+        仅影响“缩放”类操作（尺寸输入框、操作轴缩放、缩放命令对象模式）：
+        - 整体：所有选中对象绕合并包围盒的基点缩放（原有行为）；
+        - 各自：每个对象绕自身包围盒的基点缩放（对象位置基本不动）。
+        缩放命令“点模式”仍以用户拾取的基准点 P1 为中心（P1 是显式指定）。
+        """
+        self._centerModes = [("overall", "整体"), ("individual", "各自")]
+        self._centerMode = "overall"
+        row = QWidget()
+        row.setFixedHeight(20)
+        row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(6)
+        rl.addWidget(_makeLabel(tr("变换中心"), 56, "font-size: 12px;"))
+        self._centerModeGroup = QButtonGroup(row)
+        self._centerModeButtons = []
+        for i, (key, text) in enumerate(self._centerModes):
+            rb = QRadioButton(tr(text))
+            rb.setFixedHeight(18)
+            rb.setStyleSheet(_radioStyle())
+            rb.setToolTip(tr(
+                "整体：多选时绕整体包围盒缩放（对象间距随比例变化）"
+                if key == "overall" else
+                "各自：多选时每个对象绕自身包围盒缩放（对象位置基本不动）"))
+            self._centerModeGroup.addButton(rb, i)
+            rl.addWidget(rb)
+            self._centerModeButtons.append(rb)
+            if key == self._centerMode:
+                rb.setChecked(True)
+        rl.addStretch()
+        self._centerModeGroup.buttonClicked.connect(
+            self._onTransformCenterModeChanged)
+        self._content.addWidget(row)
+
+    def transformCenterMode(self) -> str:
+        """当前变换中心模式："overall"（整体）/ "individual"（各自）。"""
+        return self._centerMode
+
+    def _onTransformCenterModeChanged(self) -> None:
+        btn = self._centerModeGroup.checkedButton()
+        if btn is None:
+            return
+        idx = self._centerModeGroup.id(btn)
+        if not (0 <= idx < len(self._centerModes)):
+            return
+        mode = self._centerModes[idx][0]
+        if mode == self._centerMode:
+            return
+        self._centerMode = mode
+        self.transformCenterModeChanged.emit(mode)
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.MouseButtonDblClick and isinstance(obj, QRadioButton):
             axis = obj.property("axis")
@@ -651,10 +712,9 @@ class TransformPanel(QWidget):
         for obj in sel:
             objBB = obj.getBoundingBox()
             if bb is None:
-                bb = objBB
-            else:
-                bb.expand(objBB.min)
-                bb.expand(objBB.max)
+                bb = BoundingBox3D()   # 新建而非复用缓存实例（见 _onCncCenter 注释）
+            bb.expand(objBB.min)
+            bb.expand(objBB.max)
         if bb is None:
             return
         if axis == 0:
@@ -724,7 +784,7 @@ class TransformPanel(QWidget):
             self._measureBtn.setToolTip(tr("测量两点间距离：点击两个点后在左下角显示距离"))
         # 绑定按钮（文案由 _updateBindButtonState 按选中态设置）
         if hasattr(self, "_bindBtn"):
-            self._updateBindButtonState(self._selectedObject)
+            self._updateBindButtonState(self._selection)
         # CNC 居中按钮
         if hasattr(self, "_cncCenterBtn"):
             self._cncCenterBtn.setText(tr("居中"))
@@ -768,6 +828,15 @@ class TransformPanel(QWidget):
         # 变换基点标题
         if hasattr(self, "_originLabel"):
             self._originLabel.setText(tr("变换基点"))
+        # 变换中心（整体/各自）
+        for i, btn in enumerate(getattr(self, "_centerModeButtons", [])):
+            if i < len(getattr(self, "_centerModes", [])):
+                btn.setText(tr(self._centerModes[i][1]))
+                key = self._centerModes[i][0]
+                btn.setToolTip(tr(
+                    "整体：多选时绕整体包围盒缩放（对象间距随比例变化）"
+                    if key == "overall" else
+                    "各自：多选时每个对象绕自身包围盒缩放（对象位置基本不动）"))
         # 最小/中间/最大 单选（每 3 个一组）
         _originTexts = ("最小", "中间", "最大")
         for i, rb in enumerate(getattr(self, "_radioButtons", [])):
@@ -787,20 +856,79 @@ class TransformPanel(QWidget):
             doc.objectChanged.connect(self._onDocObjectChanged)
 
     def _onDocObjectChanged(self, oid: str) -> None:
-        """浮雕目标模型高度场变化（雕刻/重建/撤销等）→ 实时刷新“模型Z”。
+        """对象几何变化 → 刷新 XYZ 尺寸；浮雕目标模型高度场变化 → 刷新“模型Z”。
 
-        输入框正在编辑时不打断；目标锁定模型（浮雕模式）优先，否则当前
-        选中的 SURFACE 模型。
+        缩放/移动/旋转（面板命令或操作轴拖动）结束后不再重新选中即可看到新尺寸：
+        选中对象只要几何变了就回填尺寸输入框（曲线包围盒有缓存，拖动期每帧
+        刷新代价很小）。输入框正在编辑时不打断；浮雕目标锁定模型（浮雕模式）
+        优先，否则当前选中的 SURFACE 模型。
         """
-        target = self._pinnedRelief
-        if target is None:
-            sel = self._doc.selectedObjects() if self._doc is not None else []
-            target = self._reliefBoxTarget(sel[0] if sel else None)
+        if not self._updatingSize and \
+                not any(sp.hasFocus() for sp in self._sizeSpins):
+            hit = next((o for o in self._selection
+                        if o is not None and o.id() == oid), None)
+            if hit is not None:
+                # 选中缓存按 id 对齐文档里的最新实例：圆非等比缩放会换成同 id
+                # 的椭圆（操作轴/面板缩放都会走替换），旧实例的包围盒已过期
+                live = self._doc.object(oid) if self._doc is not None else None
+                if live is not None:
+                    if live is not hit:
+                        self._selection = [live if (o is not None and o.id() == oid)
+                                           else o for o in self._selection]
+                        self._selectedObject = live
+                    # 浮雕 SURFACE 的包围盒要扫全量高度场（2048² 每帧 min/max 太贵），
+                    # 其尺寸在选中/命令提交时已回填，拖动期跳过。
+                    if live.type() != ObjectType.SURFACE:
+                        self._syncSizeSpins()
+        target = self._reliefZTarget()
         if target is None or target.id() != oid:
             return
         if self._zHeightSpin.hasFocus():
             return
-        self._refreshZHeightSpin(target)
+        self._scheduleZHeightRefresh()
+
+    def _reliefZTarget(self):
+        """当下该显示“模型Z”的浮雕模型：锁定目标优先，否则选中的 SURFACE。"""
+        target = self._pinnedRelief
+        if target is None:
+            sel = self._doc.selectedObjects() if self._doc is not None else []
+            target = self._reliefBoxTarget(sel[0] if sel else None)
+        return target
+
+    # “模型Z”回填的节流间隔（见 _scheduleZHeightRefresh）
+    _Z_REFRESH_MS = 200
+
+    def _scheduleZHeightRefresh(self) -> None:
+        """合并节流“模型Z”回填。
+
+        浮雕笔刷（磨光/堆料/涂抹）每 33ms 推一次 objectChanged，而回填
+        “模型Z”要扫全量高度场求 max-min（4096² 单趟十几毫秒），旧写法在
+        每个事件里同步扫一遍 + setValue 刷控件，拖动因此跟不上光标。改成
+        待办 + 200ms 合并：拖动中最多 5 次/秒更新，停手后最后一笔一定会
+        落到准确值。
+        """
+        if self._zPending:
+            return        # 已排队，本帧结果归入同一补刷
+        wait = self._Z_REFRESH_MS - (time.monotonic() - self._zLastRefresh) * 1e3
+        if wait <= 0:
+            self._zLastRefresh = time.monotonic()
+            model = self._reliefZTarget()
+            if model is not None:
+                self._refreshZHeightSpin(model)
+            return
+        self._zPending = True
+        QTimer.singleShot(int(wait), self._flushZHeightRefresh)
+
+    def _flushZHeightRefresh(self) -> None:
+        """补刷：重新取当前目标（中途换模型/取消选中则不写旧值）。"""
+        self._zPending = False
+        if self._zHeightSpin.hasFocus():
+            return
+        model = self._reliefZTarget()
+        if model is None:
+            return
+        self._zLastRefresh = time.monotonic()
+        self._refreshZHeightSpin(model)
 
     def setReliefModel(self, model) -> None:
         """浮雕模式锁定的编辑目标（与选中解耦）：面板持续显示其显示参数。
@@ -836,7 +964,7 @@ class TransformPanel(QWidget):
         self._selection = list(objs) if objs else []
         obj = self._selection[0] if self._selection else None
         self._selectedObject = obj
-        self._updateBindButtonState(obj)
+        self._updateBindButtonState(self._selection)
         if obj is None:
             self._selectedObjectId = None
             self._syncSizeSpins()
@@ -873,10 +1001,9 @@ class TransformPanel(QWidget):
             if not objBB.isValid():
                 continue
             if bb is None:
-                bb = objBB
-            else:
-                bb.expand(objBB.min)
-                bb.expand(objBB.max)
+                bb = BoundingBox3D()   # 新建而非复用缓存实例（见 _onCncCenter 注释）
+            bb.expand(objBB.min)
+            bb.expand(objBB.max)
         return bb
 
     def _updateRatioLockState(self) -> None:
@@ -997,49 +1124,89 @@ class TransformPanel(QWidget):
         # 防止零或负值
         sFactors = [max(s, 1e-6) if s > 0 else 1.0 for s in sFactors]
         sx, sy, sz = sFactors
-        # 绕变换基点缩放（多选时整体绕合并包围盒的基点缩放）
-        center = self._computeOriginCenter(oldBB)
+        # 变换中心：整体 → 合并包围盒基点；各自 → 每个对象自身包围盒基点
+        overallCenter = self._computeOriginCenter(oldBB)
+        individual = self._centerMode == "individual"
         self._doc.beginEdit()
         try:
             for obj in targets:
+                center = overallCenter
+                if individual:
+                    try:
+                        objBB = obj.getBoundingBox()
+                    except Exception:
+                        objBB = None
+                    if objBB is not None and objBB.isValid():
+                        center = self._computeOriginCenter(objBB)
                 if obj.type() == ObjectType.SURFACE:
                     obj.scaleAround(sx, sy, 1.0, center)   # 浮雕 Z 不变
                 else:
-                    obj.scaleAround(sx, sy, sz, center)
+                    # 圆单轴缩放变椭圆（其他对象等价于直接 scaleAround）
+                    scaleObjectAround(obj, sx, sy, sz, center, self._doc)
                 self._doc.notifyObjectChanged(obj.id())
         finally:
             self._doc.endEdit()
         # 回填 sizeSpins 反映缩放后真实尺寸（防止用户输入的值与等比/锁定结果不一致）
         self._syncSizeSpins()
 
-    def _updateBindButtonState(self, obj) -> None:
+    def _updateBindButtonState(self, objs) -> None:
         """同步“绑定”开关：状态一目了然，不出现“无缘由的灰色”。
 
-        - 选中「已绑定」的 XY/Z 标注：可用 + 按下高亮，文案“已绑定”，点击解除；
-        - 选中「已解绑」的 XY/Z 标注：禁用，文案“已解绑”（脱离关系后不可重绑）；
-        - 其余情况（无选中 / 普通对象 / 其他标注）：禁用，文案“绑定”。
+        按**当前选中集**聚合判定“与选中相关且仍绑定”的 XY/Z/圆标注：
+        - 选中了已绑定的标注，或选中的是某绑定标注的源对象（曲线/模型）：
+          可用 + 按下高亮，文案“已绑定”（多个显示 ×N），点击一次全部解除；
+        - 只选中了已解绑的标注：禁用，文案“已解绑”（不可重绑）；
+        - 其余（无选中 / 普通且未被绑定对象）：禁用，文案“绑定”。
         """
         btn = getattr(self, "_bindBtn", None)
         if btn is None:
             return
-        if obj is None or obj.type() != ObjectType.DIMENSION or obj.kind() not in ("xy", "z"):
-            btn.setEnabled(False)
-            btn.setChecked(False)
-            btn.setText(tr("绑定"))
-            btn.setToolTip(tr("绑定：让标注跟随被标注的物体，物体改变尺寸时"
-                              "标注实时更新（选中 XY/Z 标注后可查看或解除绑定）"))
-            return
-        if obj.boundTargetIds():
+        if objs is None:
+            objs = []
+        elif not isinstance(objs, (list, tuple)):
+            objs = [objs]      # 兼容单对象调用
+        objs = [o for o in objs if o is not None]
+        dims_sel = [o for o in objs
+                    if o.type() == ObjectType.DIMENSION and o.bindable()]
+        # 收集“与选中相关且仍绑定”的标注（去重）
+        bound, seen = [], set()
+
+        def _add(d):
+            if d.id() not in seen:
+                seen.add(d.id())
+                bound.append(d)
+        for d in dims_sel:
+            if d.boundTargetIds():
+                _add(d)
+        doc = getattr(self, "_doc", None)
+        src_ids = {o.id() for o in objs if o.type() != ObjectType.DIMENSION}
+        if doc is not None and src_ids:
+            for d in doc.allObjects():
+                if d.type() == ObjectType.DIMENSION and d.bindable():
+                    bt = d.boundTargetIds()
+                    if bt and (src_ids & set(bt)):
+                        _add(d)
+        if bound:
             btn.setEnabled(True)
             btn.setChecked(True)
-            btn.setText(tr("已绑定"))
+            btn.setText(tr("已绑定") if len(bound) == 1
+                        else tr("已绑定") + f" ×{len(bound)}")
             btn.setToolTip(tr("该标注已与物体绑定：物体改变尺寸时标注实时更新。"
-                              "点击可解除绑定（解除后脱离关系，无法重新绑定）"))
-        else:
+                              "点击可解除绑定（解除后脱离关系，无法重新绑定）")
+                           if len(bound) == 1 else
+                           tr("选中的多个标注已绑定物体，点击可一次全部解除"
+                              "（解除后脱离关系，无法重新绑定）"))
+        elif dims_sel:
             btn.setEnabled(False)
             btn.setChecked(False)
             btn.setText(tr("已解绑"))
             btn.setToolTip(tr("该标注已解除绑定：不再跟随物体，且不可重新绑定"))
+        else:
+            btn.setEnabled(False)
+            btn.setChecked(False)
+            btn.setText(tr("绑定"))
+            btn.setToolTip(tr("绑定：让标注跟随被标注的物体，物体改变尺寸时"
+                              "标注实时更新（选中 XY/圆标注或其源对象后可查看或解除绑定）"))
 
     # ---------------- 浮雕显示参数（仅 SURFACE） ----------------
 

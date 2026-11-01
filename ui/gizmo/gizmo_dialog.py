@@ -3,7 +3,8 @@
 样式与交互：
 - 无边框 / 无标题栏的紧凑 Tool 小窗：移动/旋转主行布局为
   「标签 | (±按钮+数值输入框，间距 0 贴合为一个整体，较高) | (复制按钮+数量输入框，
-  垂直两格，两格总高与左侧输入组一致)」；缩放模式再多一行“数值含义/作用范围”下拉；
+  垂直两格，两格总高与左侧输入组一致)」；缩放模式再多两行“数值含义/作用范围”选项
+  （选项只有两三个，做成等宽等长的分段按钮组，不用下拉、弹层不会被截断，且两行左右齐平）；
   没有确定/取消按钮；
 - 弹出位置在鼠标右下方（靠近屏幕边缘时自动翻转到鼠标另一侧，避免超出屏幕）；
 - 确认/取消：输入框内按 Enter = 确认；Esc = 取消；单击弹框外空白 = 取消；
@@ -17,9 +18,11 @@
   复制数量不记忆，始终默认 1。
 """
 from __future__ import annotations
+from math import lcm
+
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QGuiApplication, QMouseEvent
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox,
+from PySide6.QtGui import QFont, QGuiApplication, QMouseEvent
+from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
                                QDialog, QDoubleSpinBox, QHBoxLayout, QLabel,
                                QPushButton, QSpinBox, QVBoxLayout)
 
@@ -42,8 +45,7 @@ GizmoInputDialog#gizmoInput QLabel {{
     background: transparent;
 }}
 GizmoInputDialog#gizmoInput QDoubleSpinBox,
-GizmoInputDialog#gizmoInput QSpinBox,
-GizmoInputDialog#gizmoInput QComboBox {{
+GizmoInputDialog#gizmoInput QSpinBox {{
     background: #ffffff;
     border: 1px solid #c3cad6;
     border-radius: 5px;
@@ -51,8 +53,7 @@ GizmoInputDialog#gizmoInput QComboBox {{
     padding: 0 4px;
 }}
 GizmoInputDialog#gizmoInput QDoubleSpinBox:focus,
-GizmoInputDialog#gizmoInput QSpinBox:focus,
-GizmoInputDialog#gizmoInput QComboBox:focus {{
+GizmoInputDialog#gizmoInput QSpinBox:focus {{
     border: 1px solid #15b6c9;
 }}
 GizmoInputDialog#gizmoInput QDoubleSpinBox:disabled,
@@ -126,7 +127,79 @@ GizmoInputDialog#gizmoInput QPushButton#titleBtn:checked {{
     color: #15b6c9;
     font-weight: 700;
 }}
+/* 缩放选项：分段按钮组（等宽等长、左右边缘齐平，不用下拉） */
+GizmoInputDialog#gizmoInput QPushButton#optBtn {{
+    background: #f1f5f9;
+    color: #334155;
+    border: 1px solid #c3cad6;
+    border-left: none;
+    border-radius: 0;
+    padding: 0;
+}}
+GizmoInputDialog#gizmoInput QPushButton#optBtn[seg="first"] {{
+    border-left: 1px solid #c3cad6;
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
+}}
+GizmoInputDialog#gizmoInput QPushButton#optBtn[seg="last"] {{
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}}
+GizmoInputDialog#gizmoInput QPushButton#optBtn:hover {{
+    background: #e2e8f0;
+}}
+GizmoInputDialog#gizmoInput QPushButton#optBtn:checked {{
+    background: #15b6c9;
+    color: #ffffff;
+    border-color: #15b6c9;
+}}
 """
+
+
+def _optionRows(parent, itemsList: list[list[str]]):
+    """把少量选项平铺成互斥分段按钮组，替代下拉菜单（选项完整可见）。
+
+    各行按钮数量可不同（3 个 / 2 个），但整行总宽相同、单元格等宽，
+    因此两行左右边缘严格对齐；行高固定 24，间距 0 呈连续分段条。
+    """
+    font = QFont(parent.font())
+    font.setPixelSize(13)          # 按钮统一字号
+    pad = 12                       # 每个单元格文字左右余量合计
+
+    rows = []
+    for items in itemsList:
+        rowLayout = QHBoxLayout()
+        rowLayout.setContentsMargins(0, 0, 0, 0)
+        rowLayout.setSpacing(0)
+        group = QButtonGroup(parent)
+        group.setExclusive(True)
+        buttons = []
+        for idx, text in enumerate(items):
+            btn = QPushButton(text)
+            btn.setObjectName("optBtn")
+            btn.setCheckable(True)
+            btn.setFont(font)
+            btn.setCursor(Qt.PointingHandCursor)
+            # 用按钮自己的字体度量（与实际渲染一致）算文字宽度
+            need = btn.fontMetrics().horizontalAdvance(text) + pad
+            btn.setProperty("seg", "first" if idx == 0 else
+                            ("last" if idx == len(items) - 1 else "mid"))
+            group.addButton(btn, idx)
+            rowLayout.addWidget(btn)
+            buttons.append((btn, need))
+        group.button(0).setChecked(True)
+        rows.append((rowLayout, group, buttons))
+
+    # 两行总宽取同一值：每行按“最宽文字 × 格数”算需求，再取各格数的最小公倍数
+    # 向上取整，保证两行都能整除、按钮等宽且左右边缘齐平
+    total = max(len(row[2]) * max(n for _b, n in row[2]) for row in rows)
+    step = lcm(*(len(row[2]) for row in rows))
+    total = max(step, ((total + step - 1) // step) * step)
+    for rowLayout, _group, buttons in rows:
+        cell = total // len(buttons)
+        for btn, _n in buttons:
+            btn.setFixedSize(cell, 24)
+    return [(layout, group) for layout, group, _b in rows], total
 
 
 class GizmoInputDialog(QDialog):
@@ -154,8 +227,8 @@ class GizmoInputDialog(QDialog):
         self.setObjectName("gizmoInput")
         self.setStyleSheet(_QSS)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
-        self._modeCombo = None
-        self._axisCombo = None
+        self._modeGroup = None
+        self._axisGroup = None
         self._titleBtn = None
         self._persistKey = persistKey
         # 上次确认的数值（含正负）；没有记忆时用默认 initial
@@ -166,12 +239,20 @@ class GizmoInputDialog(QDialog):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
 
+        # 缩放选项行先建好：它决定弹框内容宽度，主行数值框据此加宽、贴紧复制列
+        optRows = None
+        optTotal = 0
+        if scaleModes:
+            optRows, optTotal = _optionRows(self, [["绝对尺寸", "增量", "缩放比例"],
+                                                   ["单轴", "所有轴"]])
+
         # ---- 主行：标签 | 输入组(±+数值) | 复制/数量 ----
         row = QHBoxLayout()
         row.setSpacing(6)
 
         # 左缘标题文字竖排（“距离”等两字排成两行），贴合高挑输入组。
         # 移动模式：标题本身就是“距离/间距”切换钮，点击在两种连续复制步距含义间切换
+        labelW = 0
         if spacingTitle:
             self._titleBtn = QPushButton("\n".join(label))
             self._titleBtn.setObjectName("titleBtn")
@@ -184,9 +265,13 @@ class GizmoInputDialog(QDialog):
                                       "      （步距 = 输入值 + 物体在该轴尺寸）")
             self._titleBtn.toggled.connect(self._updateTitleText)
             row.addWidget(self._titleBtn, 0, Qt.AlignVCenter)
+            labelW = _SIGN_W
         else:
             lab = QLabel("\n".join(label))
             lab.setAlignment(Qt.AlignCenter)
+            labelW = lab.sizeHint().width()
+            if scaleModes:
+                lab.setFixedWidth(labelW)   # 宽度固定，剩余宽度全部给数值框
             row.addWidget(lab, 0, Qt.AlignVCenter)
 
         # 左侧输入组：± 按钮与数值输入框间距 0、同高，视觉上贴合为一个整体
@@ -211,7 +296,13 @@ class GizmoInputDialog(QDialog):
         self._spin.setValue(abs(last) if last is not None else initial)
         if suffix:
             self._spin.setSuffix(suffix)
-        self._spin.setFixedSize(_VALUE_W, _GROUP_H)
+        if scaleModes:
+            # 内容宽度由下方选项行决定：数值框吃掉标签/±/复制列之外的全部宽度，
+            # 与复制按钮之间只留行内 6px 间距
+            spinW = optTotal - labelW - _SIGN_W - _COPY_W - 12
+            self._spin.setFixedSize(max(_VALUE_W, spinW), _GROUP_H)
+        else:
+            self._spin.setFixedSize(_VALUE_W, _GROUP_H)
         left.addWidget(self._spin)
         row.addLayout(left)
 
@@ -236,24 +327,18 @@ class GizmoInputDialog(QDialog):
                                    "连续复制 N 份，每份相对前一份偏移/旋转一次")
         right.addWidget(self._copyBtn)
         right.addWidget(self._countSpin)
+        # 复制列贴右缘：与下方选项行右边缘对齐（窄弹框下与原先视觉一致）
+        row.addStretch()
         row.addLayout(right)
 
-        row.addStretch()
         layout.addLayout(row)
 
-        # ---- 缩放附加行：数值含义 / 作用范围 ----
-        if scaleModes:
-            opt = QHBoxLayout()
-            opt.setSpacing(6)
-            self._modeCombo = QComboBox()
-            self._modeCombo.addItems(["绝对尺寸", "增量", "缩放比例"])
-            self._axisCombo = QComboBox()
-            self._axisCombo.addItems(["单轴", "所有轴"])
-            for cb in (self._modeCombo, self._axisCombo):
-                cb.setFixedHeight(22)
-                opt.addWidget(cb)
-            opt.addStretch()
-            layout.addLayout(opt)
+        # ---- 缩放附加行：数值含义 / 作用范围（分段按钮，等宽等长、边缘齐平）----
+        if optRows:
+            self._modeGroup = optRows[0][1]
+            self._axisGroup = optRows[1][1]
+            for rowLayout, _group in optRows:
+                layout.addLayout(rowLayout)
 
         # 输入框内回车即确认
         self._spin.lineEdit().returnPressed.connect(self.accept)
@@ -365,8 +450,8 @@ class GizmoInputDialog(QDialog):
 
     def scaleMode(self) -> int:
         """0=绝对尺寸 1=增量 2=缩放比例（非缩放对话框返回 0）。"""
-        return self._modeCombo.currentIndex() if self._modeCombo else 0
+        return self._modeGroup.checkedId() if self._modeGroup else 0
 
     def uniformAxis(self) -> bool:
         """True=所有轴（等比）。"""
-        return bool(self._axisCombo and self._axisCombo.currentIndex() == 1)
+        return bool(self._axisGroup and self._axisGroup.checkedId() == 1)

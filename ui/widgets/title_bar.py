@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton, QTabBar
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal, QSize, QPoint
 from PySide6.QtGui import QIcon, QFont
 
 import ui.styles.theme as theme
@@ -129,7 +129,10 @@ class TitleBar(QWidget):
 
         lay.addStretch(1)
 
-        # 工具按钮：成本计算器 / 设置（Win11 扁平图标按钮）
+        # 工具按钮：面板菜单 / 成本计算器 / 设置（Win11 扁平图标按钮）
+        self._panelBtn = self._makeToolBtn("icons/panels.svg", tr("面板"))
+        self._panelBtn.clicked.connect(self._showPanelsMenu)
+        self._panelsMenu = None   # 主窗口注入（4 面板显隐勾选）
         self._calcBtn = self._makeToolBtn("icons/calculator.svg", tr("材料成本计算器"))
         self._calcBtn.clicked.connect(self.calcRequested.emit)
         self._settingsBtn = self._makeToolBtn("icons/settings.svg", tr("设置"))
@@ -153,6 +156,7 @@ class TitleBar(QWidget):
         self._minBtn.clicked.connect(self._win.showMinimized)
         self._maxBtn.clicked.connect(self._toggleMaximize)
         self._closeBtn.clicked.connect(self._win.close)
+        lay.addWidget(self._panelBtn)
         lay.addWidget(self._calcBtn)
         lay.addWidget(self._settingsBtn)
         lay.addWidget(self._minBtn)
@@ -165,8 +169,9 @@ class TitleBar(QWidget):
 
     def _chromeWidth(self) -> int:
         """标题栏除标签/标题外的固定占用：图标 + 右侧按钮组 + 间距余量。"""
-        return (20 + 4 + 4 + 8 * 3 +
-                self._calcBtn.width() + self._settingsBtn.width() +
+        return (20 + 4 + 4 + 8 * 4 +
+                self._panelBtn.width() + self._calcBtn.width() +
+                self._settingsBtn.width() +
                 self._minBtn.width() + self._maxBtn.width() +
                 self._closeBtn.width() + 10)
 
@@ -188,6 +193,18 @@ class TitleBar(QWidget):
         need = (self._chromeWidth() +
                 self._navBar.minimumSizeHint().width() + 60)
         self._titleLabel.setVisible(self.width() >= need)
+
+    def setPanelsMenu(self, menu) -> None:
+        """主窗口注入面板显隐菜单（变换/图层/属性/材质 勾选项）。"""
+        self._panelsMenu = menu
+
+    def _showPanelsMenu(self) -> None:
+        """在面板按钮下方弹出菜单（右缘与按钮对齐，贴近标题栏风格）。"""
+        if self._panelsMenu is None:
+            return
+        x = self._panelBtn.width() - self._panelsMenu.sizeHint().width()
+        pos = self._panelBtn.mapToGlobal(QPoint(x, self._panelBtn.height() + 2))
+        self._panelsMenu.exec(pos)
 
     def _makeToolBtn(self, iconPath: str, tip: str) -> QPushButton:
         """标题栏扁平图标工具按钮（计算器/设置），悬停浅灰。"""
@@ -213,6 +230,7 @@ class TitleBar(QWidget):
         self._minBtn.setToolTip(tr("最小化"))
         self._maxBtn.setToolTip(tr("还原" if self._isMaximized() else "最大化"))
         self._closeBtn.setToolTip(tr("关闭"))
+        self._panelBtn.setToolTip(tr("面板"))
         self._calcBtn.setToolTip(tr("材料成本计算器"))
         self._settingsBtn.setToolTip(tr("设置"))
 

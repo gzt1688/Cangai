@@ -88,7 +88,8 @@ class RegionReliefParams:
 
 # ==================== 曲线采样 ====================
 
-def sample_curve_points(obj, sample_count: int = SAMPLE_COUNT) -> np.ndarray:
+def sample_curve_points(obj, sample_count: int = SAMPLE_COUNT,
+                        preserve_vertices: bool = False) -> np.ndarray:
     """取曲线对象的世界 XY 采样点，返回 (N, 2) float64。
 
     统一处理各类曲线：带 ``getSampledPoints`` 的直接取；圆/椭圆/弧等参数对象只有
@@ -96,6 +97,11 @@ def sample_curve_points(obj, sample_count: int = SAMPLE_COUNT) -> np.ndarray:
     矩形/多边形）只有 ``points()``，直接取顶点。点数不足时按弧长加密到
     ``sample_count``，保证扫描线与距离场的精度（插件对每段至少采样 64 点）。
     闭合对象（``isClosed``）若采样首尾未重合，补首点使闭合边被正确采样。
+
+    ``preserve_vertices=True``：点数不足时**不**等弧长重采样，原样返回顶点链。
+    等弧长重采样的取样点一般不含折线拐点（矩形角、倒角、偏移轮廓），会把尖角
+    沿弦线削掉（实测 0.8mm，远大于小偏移带宽）；需要自己按栅格精度加密的调用方
+    （如自动分色的 ``_densify``）应保留顶点，直接由加密函数插值。
     """
     pts = None
     getter = getattr(obj, "getSampledPoints", None)
@@ -135,7 +141,7 @@ def sample_curve_points(obj, sample_count: int = SAMPLE_COUNT) -> np.ndarray:
             is_closed = False
         if is_closed and float(np.linalg.norm(arr[0] - arr[-1])) > 1e-9:
             arr = np.vstack([arr, arr[0:1]])
-    if arr.shape[0] < sample_count:
+    if arr.shape[0] < sample_count and not preserve_vertices:
         arr = resample_polyline(arr, sample_count)
     return arr
 
@@ -345,14 +351,45 @@ def compute_polygon_sd(poly: np.ndarray, grid: Grid,
             out[ri] = np.where((cnt % 2) == 1, out[ri], -out[ri])
         return out
 
-    # ---- 粗网格全域解析 ----
+    def _coarse_dist(pxv: np.ndarray, pyv: np.ndarray) -> np.ndarray:
+        """粗网格到边界的近似距离：边界采样点集 cKDTree 最近距离。
+
+        粗网格只供穹顶内部（距离场光滑区）双线性插值，无需逐边精确；
+        真边界的亚像素精度由后面的全分辨率解析带（_exact_dist）覆盖。
+        采样密度使点距 ≤ 半个粗网格步长 → 点集距 vs 线段距误差 ≤ 该量级
+        且仅出现在紧贴边界处（已被带覆盖）。相比逐边暴力 O(粗网格×边数)
+        （大网格 500ms 级），KD 树查询快一个数量级（~60ms）。
+        返回距离（无符号），scipy 不可用时回退暴力线段距离。
+        """
+        try:
+            from scipy.spatial import cKDTree
+        except Exception:
+            return _exact_dist(pxv, pyv)
+        cell = step * spacing
+        pts = []
+        for r in rings:
+            # 闭合环：collapse_collinear 去掉首尾重合点，若不补回闭合段，
+            # 按弧长重采样/周长会漏掉末点→首点那条边（矩形丢一整条侧边，
+            # 邻近点距离错到对侧）。圆/椭圆只丢一个狭长段，误差可忽。
+            rc = np.vstack([r, r[0:1]]) if float(
+                np.hypot(*(r[0] - r[-1]))) > 1e-9 else r
+            seg = np.diff(rc, axis=0)
+            per = float(np.sum(np.hypot(seg[:, 0], seg[:, 1])))
+            m = int(np.clip(round(per / (cell * 0.5)), 64, 8192))
+            pts.append(resample_polyline(rc, m) if rc.shape[0] < m else rc)
+        bound = np.concatenate(pts, axis=0)
+        tree = cKDTree(bound)
+        d, _ = tree.query(np.column_stack((pxv, pyv)), k=1)
+        return d
+
+    # ---- 粗网格全域近似（KD 树）----
     step = max(1, int(math.ceil(max(nx, ny) / 256.0)))
     sub_iy = np.arange(0, ny, step, dtype=np.int64)
     sub_ix = np.arange(0, nx, step, dtype=np.int64)
     gy = min_y + sub_iy * spacing
     gx = min_x + sub_ix * spacing
     PY, PX = np.meshgrid(gy, gx, indexing="ij")
-    sd_sub = _exact_dist(PX.ravel(), PY.ravel()).reshape(len(gy), len(gx))
+    sd_sub = _coarse_dist(PX.ravel(), PY.ravel()).reshape(len(gy), len(gx))
     sd_sub = _sign_rows(sd_sub, gy, gx)
     if step > 1:
         from scipy.ndimage import map_coordinates
@@ -367,7 +404,12 @@ def compute_polygon_sd(poly: np.ndarray, grid: Grid,
         band_mask = inside if inside is not None else build_inside_mask(poly, grid)
         if band_mask.any():
             from scipy.ndimage import binary_dilation
-            band = binary_dilation(band_mask, structure=np.ones((5, 5), dtype=bool))
+            # 只在真实边界附近取全分辨率精确值：内部距离场光滑（Lipschitz 1），
+            # 粗网格双线性插值误差可忽略。若把整块 inside 当带膨胀，等于对
+            # 整个填充区域再跑一遍全分辨率解析距离（面积×边数），是除椭圆
+            # （走泊松粗网格）外各穹顶/倒角截面的主要卡顿源。
+            edge_seed = _boundary_seed(band_mask)
+            band = binary_dilation(edge_seed, structure=np.ones((5, 5), dtype=bool))
             rr_, cc_ = np.nonzero(band)
             d_band = _exact_dist(min_x + cc_ * spacing, min_y + rr_ * spacing)
             # band 内像素的符号：逐行射线（只对出现的行）
@@ -846,8 +888,10 @@ def apply_region_relief(hf, poly: np.ndarray,
     # 作用区域裁剪：按当前颜色把起浮雕范围限定在色号蒙版的内/外
     scope = getattr(params, "color_scope", "ignore")
     if scope in ("inside", "outside"):
+        from core.relief import paint_palette
         if color_mask is not None and color_mask.shape == mask.shape:
-            inside_cur = (color_mask == int(color_value))
+            # 未填色（EMPTY）= 浮雕模型基础色：当前颜色为基础色时一并命中
+            inside_cur = paint_palette.equals_value_mask(color_mask, color_value)
         else:
             inside_cur = np.zeros(mask.shape, dtype=bool)   # 未填色 = 无当前颜色区
         mask = (mask & inside_cur) if scope == "inside" else (mask & ~inside_cur)

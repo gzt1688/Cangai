@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtGui import QColor
 import ui.styles.theme as theme
 from ui.widgets.paint_state import PaintState
+from core.relief import paint_palette
 from i18n import tr, languageChanged
 
 
@@ -113,7 +114,11 @@ class CaptureToolbar(QToolBar):
             box = QLabel()
             box.setFixedWidth(18)
             box.setSizePolicy(QLabel().sizePolicy().horizontalPolicy(), QSizePolicy.Expanding)
-            box.setToolTip(f"{PaintState.hexAt(i)}（点击设为当前颜色）")
+            if i == paint_palette.BASE_INDEX:
+                # 第 2 色 = 浮雕模型基础色（图层颜色），随图层改色联动
+                box.setToolTip(tr("浮雕模型基础色（图层颜色）（点击设为当前颜色）"))
+            else:
+                box.setToolTip(f"{PaintState.hexAt(i)}（点击设为当前颜色）")
             box.setCursor(Qt.PointingHandCursor)
             box.installEventFilter(self)
             self.addWidget(box)
@@ -122,6 +127,9 @@ class CaptureToolbar(QToolBar):
         # 当前颜色以 PaintState 为唯一真相源：切换时刷新当前色块 + 调色板高亮
         self._paint = PaintState.instance()
         self._paint.currentChanged.connect(self._applyCurrentColor)
+        # 基础色（第 2 色）变化：重绘整个调色板（从 palette 重取 RGB）
+        self._paint.baseColorChanged.connect(
+            lambda: self._applyCurrentColor(self._paint.currentIndex()))
         self._applyCurrentColor(self._paint.currentIndex())
         languageChanged().connect(self.retranslateUi)
 

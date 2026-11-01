@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 
 binaries = []
-hiddenimports = ['pymillcam', 'shapely', 'pydantic', 'PySide6', 'PySide6.QtWidgets', 'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtOpenGL', 'numpy', 'moderngl', 'glcontext', 'fontTools', 'ezdxf']
+hiddenimports = ['pymillcam', 'shapely', 'pydantic', 'PySide6', 'PySide6.QtWidgets', 'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtOpenGL', 'PySide6.QtNetwork', 'numpy', 'moderngl', 'glcontext', 'fontTools', 'ezdxf', 'vtracer']
 binaries += collect_dynamic_libs('shapely')
 hiddenimports += collect_submodules('build123d')
 hiddenimports += collect_submodules('pydantic')
@@ -13,12 +13,12 @@ a = Analysis(
     ['main.py'],
     pathex=['deps/pymillcam-main/src', 'deps/build123d-0.11.1/src'],
     binaries=binaries,
-    datas=[('icons', 'icons'), ('resources', 'resources'), ('deps/pymillcam-main/src/pymillcam', 'pymillcam'), ('deps/build123d-0.11.1/src/build123d/data', 'build123d/data'), ('.venv/Lib/site-packages/lib3mf/lib3mf.dll', 'lib3mf')],
+    datas=[('icons', 'icons'), ('resources/fonts', 'resources/fonts'), ('resources/donate_qr.png', 'resources'), ('resources/splash_dragonfly.png', 'resources'), ('resources/envmaps/studio_default.hdr', 'resources/envmaps'), ('core/ai/models.json', 'core/ai'), ('deps/pymillcam-main/src/pymillcam', 'pymillcam'), ('deps/build123d-0.11.1/src/build123d/data', 'build123d/data'), ('.venv/Lib/site-packages/lib3mf/lib3mf.dll', 'lib3mf')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['pytest', 'tkinter', 'test', 'tests', '__pycache__'],
+    excludes=['pytest', 'tkinter', 'test', 'tests', '__pycache__', 'torch', 'torchvision', 'torchaudio', 'functorch', 'controlnet_aux', 'timm', 'einops', 'huggingface_hub', 'transformers', 'safetensors', 'onnxruntime', 'onnx', 'skimage', 'scikit-image'],
     noarchive=False,
     optimize=0,
 )

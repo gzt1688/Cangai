@@ -31,6 +31,7 @@ class LayerPanel(QWidget):
         self._doc = None
         self._refreshing = False
         self._pendingRefresh = False
+        self._objLayers = {}      # oid -> 上次看到的 layerId（对象几何变化不刷树）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -119,15 +120,33 @@ class LayerPanel(QWidget):
             try:
                 self._doc.objectAdded.disconnect(self.refreshLater)
                 self._doc.objectRemoved.disconnect(self.refreshLater)
-                self._doc.objectChanged.disconnect(self.refreshLater)
+                self._doc.objectChanged.disconnect(self._onObjectChanged)
             except RuntimeError:
                 pass
         self._doc = doc
+        self._objLayers = {}
         if doc is not None:
             doc.objectAdded.connect(self.refreshLater)
             doc.objectRemoved.connect(self.refreshLater)
-            doc.objectChanged.connect(self.refreshLater)
+            doc.objectChanged.connect(self._onObjectChanged)
         self._refreshLayerUI()
+
+    def _onObjectChanged(self, oid: str) -> None:
+        """对象变化只在“换层”时才需要重建图层树。
+
+        浮雕笔刷（磨光/堆料/涂抹）每 33ms 推一次 objectChanged，旧写法把它
+        直接接到 refreshLater → 每帧 clear() 整棵树并重建每行的 4 个嵌入控件
+        （数量/灯泡/锁/颜色按钮 + 样式表 + 布局），是拖动卡顿的大头。对象
+        几何变化不影响层名称/显隐/锁定/行数，故只在 layerId 真的变了时才刷。
+        """
+        obj = self._doc.object(oid) if self._doc is not None else None
+        if obj is None:
+            return
+        lid = obj.layerId()
+        prev = self._objLayers.get(oid, lid)
+        self._objLayers[oid] = lid
+        if prev != lid:
+            self.refreshLater()
 
     def refreshLater(self) -> None:
         """延迟刷新：合并多次 layerChanged，避免在信号处理中重建控件。"""

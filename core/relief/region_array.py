@@ -157,11 +157,14 @@ def array_region_rectangular(hf, stamp, stamp_mask, src_bbox, center,
                              count_x: int, count_y: int,
                              gap_x: float, gap_y: float,
                              brush_type: str, thin_frac: float,
-                             z_scale: float) -> int:
+                             z_scale: float,
+                             reverse_x: bool = False,
+                             reverse_y: bool = False) -> int:
     """矩形阵列：以区域中心为基准，按 X/Y 图形边缘间距网格分布副本。
 
     gap_x/gap_y 为图形与图形之间的边缘距离（非中心间距），
     步距 = 印章尺寸 + 间距。跳过 (0,0) 原始位置。
+    reverse_x/reverse_y：该轴副本改向负方向排布（间隔/渐变顺序不变）。
     """
     if stamp is None or count_x < 1 or count_y < 1:
         return 0
@@ -171,6 +174,8 @@ def array_region_rectangular(hf, stamp, stamp_mask, src_bbox, center,
     stamp_h = (src_bbox[3] - src_bbox[1]) * sp
     step_x = stamp_w + gap_x
     step_y = stamp_h + gap_y
+    sx = -1.0 if reverse_x else 1.0
+    sy = -1.0 if reverse_y else 1.0
     total = max(count_x * count_y - 1, 1)
     moved = 0
     idx = 0
@@ -184,8 +189,8 @@ def array_region_rectangular(hf, stamp, stamp_mask, src_bbox, center,
             if w < 1e-3:
                 idx += 1
                 continue
-            tx = cx + i * step_x
-            ty = cy + j * step_y
+            tx = cx + sx * i * step_x
+            ty = cy + sy * j * step_y
             M = _make_M(cx, cy, tx, ty, 0.0, w)
             moved += _stamp_to_field(hf, stamp, stamp_mask, M, src_bbox,
                                      z_scale * w)
@@ -308,7 +313,8 @@ def preview_array(hf, source: np.ndarray, stamp, stamp_mask, src_bbox,
         return array_region_rectangular(
             hf, stamp, stamp_mask, src_bbox, center,
             params["count_x"], params["count_y"],
-            params["gap_x"], params["gap_y"], bt, tf, zs)
+            params["gap_x"], params["gap_y"], bt, tf, zs,
+            params.get("reverse_x", False), params.get("reverse_y", False))
     if mode == 1:
         return array_region_circular(
             hf, stamp, stamp_mask, src_bbox, center,

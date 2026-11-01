@@ -1,8 +1,10 @@
 """左侧面板：文件页、最近记录与设置入口。"""
 from __future__ import annotations
-from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
-                                QStackedWidget, QListWidget, QLabel, QFrame,
-                                QLineEdit)
+import os
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
+                                QPushButton, QStackedWidget, QListWidget,
+                                QListWidgetItem, QLabel, QFrame, QLineEdit,
+                                QAbstractItemView)
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QShortcut, QKeySequence, QIcon
 from resource_path import resource_path
@@ -29,6 +31,7 @@ class LeftPanelWidget(QWidget):
     saveAsRequested = Signal()
     quickSaveRequested = Signal(int, str)
     exportRequested = Signal(str, str)
+    recentOpenRequested = Signal(str)   # 最近打开列表点击 → 打开该文件
     calcRequested = Signal()        # 材料成本计算器
     cncStepRequested = Signal(str)   # CNC 向导步骤点击
     cncEditPathRequested = Signal(object)  # 单击路径标题 → 编辑该条目
@@ -158,6 +161,18 @@ class LeftPanelWidget(QWidget):
         self._refreshSavePage()
         return page
 
+    def _fileEdit(self, text: str = "") -> QLineEdit:
+        """保存页/导出行的文件名输入框：最小 60px，随面板宽度自动拉宽。
+
+        行用网格排版：输入框列吃满剩余宽度，「保存」按钮固定在面板右侧；
+        面板不拉宽时也不会把行最小宽度顶出面板（按钮始终可见）。
+        """
+        edit = QLineEdit()
+        edit.setPlaceholderText(tr("文件名"))
+        edit.setText(text)
+        edit.setMinimumWidth(60)
+        return edit
+
     def _refreshSavePage(self) -> None:
         layout = self._savePage.layout()
         while layout.count():
@@ -169,58 +184,99 @@ class LeftPanelWidget(QWidget):
                 self._clearSubLayout(item.layout())
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        hasAny = False
-        for i, slot in enumerate(app_settings.file_save_slots):
-            if not slot["enabled"]:
-                continue
-            hasAny = True
-            row = QHBoxLayout()
-            row.setSpacing(0)
-            lbl = QLabel(slot["name"])
-            row.addWidget(lbl)
-            edit = QLineEdit()
-            edit.setPlaceholderText(tr("文件名"))
-            edit.setText(slot.get("filename", ""))
-            row.addWidget(edit, 1)
-            row.addSpacing(4)
+
+        # 先收集行：文件槽 + 导出格式；用网格排版，使 7 个「保存」按钮严格对齐
+        slot_rows = [(slot["name"], slot.get("filename", ""), i)
+                     for i, slot in enumerate(app_settings.file_save_slots)
+                     if slot["enabled"]]
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(6)
+        r = 0
+        lblW = 0
+        for name, text, idx in slot_rows:
+            lbl = QLabel(name)
+            lblW = max(lblW, lbl.sizeHint().width())
+            grid.addWidget(lbl, r, 0)
+            edit = self._fileEdit(text)
+            grid.addWidget(edit, r, 1)
             btn = QPushButton(tr("保存"))
             btn.setFixedWidth(50)
-            idx = i
-            editRef = edit
             btn.clicked.connect(
-                lambda _, ix=idx, e=editRef: self.quickSaveRequested.emit(ix, e.text()))
-            row.addWidget(btn)
-            layout.addLayout(row)
-        if not hasAny:
+                lambda _, ix=idx, e=edit: self.quickSaveRequested.emit(ix, e.text()))
+            grid.addWidget(btn, r, 2)
+            r += 1
+        if not slot_rows:
             hint = QLabel(tr("（请在设置中勾选文件保存项）"))
             hint.setStyleSheet("color: #999;")
-            layout.addWidget(hint)
+            grid.addWidget(hint, r, 0, 1, 3)
+            r += 1
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setFixedHeight(1)
         sep.setStyleSheet("QFrame { background: #c8c8c8; border: none; }")
-        layout.addWidget(sep)
+        grid.addWidget(sep, r, 0, 1, 3)
+        r += 1
 
         for fmt in ("DXF", "SVG", "STEP", "STL"):
-            row = QHBoxLayout()
-            row.setSpacing(0)
             lbl = QLabel(fmt)
-            row.addWidget(lbl)
-            edit = QLineEdit()
-            edit.setPlaceholderText(tr("文件名"))
-            row.addWidget(edit, 1)
-            row.addSpacing(4)
+            lblW = max(lblW, lbl.sizeHint().width())
+            grid.addWidget(lbl, r, 0)
+            edit = self._fileEdit("")
+            grid.addWidget(edit, r, 1)
             btn = QPushButton(tr("保存"))
             btn.setFixedWidth(50)
-            editRef = edit
-            fmtRef = fmt
             btn.clicked.connect(
-                lambda _, f=fmtRef, e=editRef: self.exportRequested.emit(f, e.text()))
-            row.addWidget(btn)
-            layout.addLayout(row)
+                lambda _, f=fmt, e=edit: self.exportRequested.emit(f, e.text()))
+            grid.addWidget(btn, r, 2)
+            r += 1
 
-        layout.addStretch()
+        grid.setColumnMinimumWidth(0, lblW)
+        grid.setColumnStretch(1, 1)     # 输入框吃满剩余宽度（面板拉宽 → 输入框跟随）
+        grid.setColumnStretch(2, 0)     # 按钮列固定宽度 → 始终贴面板右侧
+        layout.addLayout(grid)
+
+        # ---- 最近打开的文件（分割线下方，单击快捷打开）----
+        layout.addWidget(self._makeHLine())
+        title = QLabel(tr("最近打开"))
+        title.setStyleSheet("color: #888;")
+        layout.addWidget(title)
+
+        recent = [p for p in getattr(app_settings, "recent_files", [])
+                  if os.path.exists(p)]
+        if recent:
+            lst = QListWidget()
+            lst.setFrameShape(QFrame.NoFrame)
+            lst.setStyleSheet(
+                "QListWidget { background: transparent; border: none; }"
+                # 每项底部一条分割线，便于区分相邻文件
+                "QListWidget::item { padding: 4px 4px; border-bottom: 1px solid #d9d9d9; }"
+                "QListWidget::item:hover { background: #e8e8e8; }"
+                "QListWidget::item:selected { background: #dcdcdc; color: #222; }")
+            lst.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            lst.setTextElideMode(Qt.ElideMiddle)
+            lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            for path in recent[:app_settings.RECENT_MAX]:
+                it = QListWidgetItem(os.path.basename(path))
+                it.setToolTip(path)
+                it.setData(Qt.UserRole, path)
+                lst.addItem(it)
+            lst.itemClicked.connect(self._onRecentItemClicked)
+            layout.addWidget(lst, 1)
+        else:
+            hint = QLabel(tr("（暂无最近打开的文件）"))
+            hint.setStyleSheet("color: #999;")
+            layout.addWidget(hint)
+            layout.addStretch()
+
+    def _onRecentItemClicked(self, item) -> None:
+        """单击最近打开列表项 → 请求主窗口打开该文件。"""
+        path = item.data(Qt.UserRole)
+        if path:
+            self.recentOpenRequested.emit(str(path))
 
     def _clearSubLayout(self, lay) -> None:
         while lay.count():
