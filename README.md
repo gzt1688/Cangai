@@ -16,6 +16,15 @@
   <img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green" alt="License: MIT OR Apache-2.0"/>
 </p>
 
+<p align="center">
+  <b>Open-source CAD for relief carving &amp; CNC machining.</b><br/>
+  2D vector drawing → 3D relief modeling → CNC toolpath &amp; G-code export, all in one desktop app. Free &amp; open source.
+</p>
+
+<p align="center">
+  <b>Like Cangai? Please ⭐ Star this repo!</b>
+</p>
+
 ---
 <img width="1417" height="832" alt="001" src="https://github.com/user-attachments/assets/21a7ad36-e70c-458a-b3e9-4ce8539f27cb" />
 
