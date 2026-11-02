@@ -1,0 +1,6 @@
+# Mark vendored third-party sources so GitHub linguist excludes them from language stats.
+# Fixes language detection: main language should be Python (PySide6), not Rust.
+deps/** linguist-vendored=true
+
+# Common overrides (uncomment as needed)
+# *.py linguist-language=Python
